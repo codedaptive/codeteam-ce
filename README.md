@@ -1,6 +1,6 @@
 # codeteam gamma preview
 
-codeteam runs a git repository as a team of standing Claude Code sessions: an orchestrator, a designer, one
+codeteam runs a git repository as a team of standing Claude Code sessions: an orchestrator, a designer (Skippy), one
 coordinator per lane (a lane owns a set of packages or crates), and assistants such as Kong (reviews every change
 before it lands) and Nagatha (integration tests and promotion). Each session works in its own git worktree, inside
 walls that hooks enforce; messages between sessions go through a store and are delivered only when the recipient is
