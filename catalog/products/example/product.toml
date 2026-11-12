@@ -1,0 +1,25 @@
+# Product: acme-widgets (team-acme-widgets, teams/example.toml), an example Rust workspace. Catalog v4.
+# Models come from the catalog roster (rosters/<name>.csv, default claude). Entries under [models] here are overrides
+# for roles the roster does not carry, or product exceptions, and are reported at build.
+roles = ["repo-orchestrator", "repo-designer", "zone-coordinator", "request-lead", "preflight-checker", "test-writer", "mechanical-coder", "test-runner", "comment-integrity", "change-reviewer", "root-cause-investigator", "spec-guard", "security-reviewer", "integration-builder", "test-scout", "test-mover"]
+
+# On-demand skills installed for the team (loaded through the Skill tool by roles that have it).
+on_demand = []
+
+[models]
+
+[skills]
+integration-builder = ["refocus"]
+zone-coordinator = ["refocus"]
+spec-guard = ["refocus"]
+security-reviewer = ["refocus"]
+repo-designer = ["refocus"]
+repo-orchestrator = ["small-files", "refocus"]
+request-lead = ["small-files"]
+test-writer = ["small-files", "rust-cargo"]
+mechanical-coder = ["small-files", "rust-cargo"]
+test-mover = ["small-files", "rust-cargo"]
+change-reviewer = ["small-files", "rust-cargo"]
+
+# Tools a role gets beyond its own, e.g. an MCP server's tools: role = "mcp__<server>__<tool>, ...".
+[tools]

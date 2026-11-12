@@ -1,0 +1,37 @@
+#!/bin/bash
+# codeteam-statusline QUESTIONS_FILE
+# Status line for every codeteam session. Keeps the metrics line from the
+# project's .claude/hooks/capture-metrics.sh, or, when the project has none,
+# from codeteam's own share/claude-hooks/capture-metrics.sh (a copy of
+# a team hook), so every team gets it. Then adds "Effort: LEVEL", the session's current
+# effort (Claude Code's effort.level, so it follows /effort changes), and
+# "Questions: N", exactly the number of questions the user owes an answer to
+# (the status bar must be exact). Those are the lines of
+# QUESTIONS_FILE (the team's questions.md) that codeteam-question wrote
+# ("- ID | ..."): a problem, options and a pick. Any other "- " line is not a
+# question and is not counted; it is shown as "+M not in question form" until
+# the team's designer takes it out (codeteam-question MANIFEST check).
+# Runs as a script: no tokens.
+q="${1:-}"
+input="$(cat)"
+line=""
+hook="${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/capture-metrics.sh"
+# The project's copy wins; teams run this script by its absolute path in
+# codeteam's bin/, so share/ sits beside it.
+[ -x "$hook" ] || hook="$(dirname "$0")/../share/claude-hooks/capture-metrics.sh"
+if [ -x "$hook" ]; then
+    line="$(printf '%s' "$input" | "$hook" 2>/dev/null)"
+fi
+effort="$(printf '%s' "$input" | jq -r '.effort.level // empty' 2>/dev/null)"
+if [ -n "$effort" ]; then
+    line="${line:+$line  }Effort: ${effort}"
+fi
+if [ -n "$q" ] && [ -f "$q" ]; then
+    count="$(grep -c -E '^- [A-Za-z0-9._-]+ \| ' "$q")"
+    other=$(( $(grep -c '^- ' "$q") - count ))
+    if [ "$count" -gt 0 ] || [ "$other" -gt 0 ]; then
+        line="${line:+$line  }Questions: ${count}"
+        [ "$other" -gt 0 ] && line="$line (+${other} not in question form)"
+    fi
+fi
+printf '%s\n' "$line"

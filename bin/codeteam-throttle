@@ -1,0 +1,16 @@
+#!/bin/bash
+# Cron, every minute. Lower the priority of build and test processes so the
+# terminal, tmux and the Claude sessions keep the performance cores.
+# Only priority changes; no process is stopped. On a machine with spare
+# cores (1-minute load below the core count) it does nothing, so builds
+# run at full speed when nothing competes with them.
+# cron runs with a short PATH and sysctl lives in /usr/sbin. Homebrew
+# comes before the system folders ; none of the tools below is in
+# /opt/homebrew/bin, so each resolves to the system copy.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:/sbin
+CORES=$(sysctl -n hw.logicalcpu)
+LOAD=$(sysctl -n vm.loadavg | awk '{printf "%d", $2}')
+[ "$LOAD" -lt "$CORES" ] && exit 0
+NAMES='swift-frontend|swift-build|swift-test|swift-package|swift-driver|swiftpm|/pm$|rustc|cargo|clang|ld$|cc1'
+ps -axo pid=,ni=,uid=,comm= | awk -v me="$(id -u)" -v re="$NAMES" '$3==me && $2<15 && $4 ~ re {print $1}' |
+  while read p; do renice -n 15 -p "$p" >/dev/null 2>&1; done

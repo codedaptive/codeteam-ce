@@ -1,0 +1,291 @@
+{
+  "alerts": [],
+  "at": 1793653200.0,
+  "builds": {
+    "largest": [],
+    "procs": {
+      "<root>/team-tessa/workcrews/a/tessa-exchange-a": [],
+      "<root>/wt-a": []
+    },
+    "queue": {
+      "classes": [
+        {
+          "broken": 0,
+          "ceiling": 1,
+          "class": "full",
+          "guaranteed": 1,
+          "held": {
+            "load": 0,
+            "swap": 0,
+            "warm": 0
+          },
+          "queued": [],
+          "running": [],
+          "waits": {
+            "max_s": null,
+            "median_s": null,
+            "n": 0,
+            "window_h": 24.0
+          }
+        },
+        {
+          "broken": 0,
+          "ceiling": 2,
+          "class": "post",
+          "guaranteed": 1,
+          "held": {
+            "load": 0,
+            "swap": 0,
+            "warm": 0
+          },
+          "queued": [],
+          "running": [],
+          "waits": {
+            "max_s": null,
+            "median_s": null,
+            "n": 0,
+            "window_h": 24.0
+          }
+        },
+        {
+          "broken": 0,
+          "ceiling": 2,
+          "class": "pre",
+          "guaranteed": 1,
+          "held": {
+            "load": 0,
+            "swap": 0,
+            "warm": 0
+          },
+          "queued": [],
+          "running": [],
+          "waits": {
+            "max_s": null,
+            "median_s": null,
+            "n": 0,
+            "window_h": 24.0
+          }
+        },
+        {
+          "broken": 0,
+          "ceiling": 0,
+          "class": "dev",
+          "guaranteed": 1,
+          "held": {
+            "load": 0,
+            "swap": 0,
+            "warm": 0
+          },
+          "queued": [],
+          "running": [],
+          "waits": {
+            "max_s": null,
+            "median_s": null,
+            "n": 0,
+            "window_h": 24.0
+          }
+        }
+      ],
+      "runner": {
+        "beat_age_s": null,
+        "budget": null,
+        "load": null,
+        "load_hold": null,
+        "load_max": null,
+        "pid": null,
+        "state": "none",
+        "swap": null,
+        "swap_hold": null,
+        "swap_max": null,
+        "used": null
+      },
+      "state": "ok",
+      "unknown": 0
+    },
+    "warms": []
+  },
+  "disk_at": null,
+  "errors": [],
+  "teams": [
+    {
+      "broadcasts_waiting": 0,
+      "cap": 16,
+      "disk": null,
+      "free_gb": null,
+      "heartbeat_age_s": null,
+      "home": "<root>/team-tessa/team",
+      "lanes_running": 1,
+      "mail_waiting": 1,
+      "manifest": "<root>/teams/tessa.toml",
+      "messages": {
+        "broadcasts_today": 0,
+        "broadcasts_waiting": 0,
+        "by_target": {
+          "a": {
+            "broadcasts": 0,
+            "delivered_today": 0,
+            "held": 0,
+            "oldest_mail_ts": "2026-11-02T14:59:00-06:00",
+            "oldest_waiting_ts": "2026-11-02T14:59:00-06:00",
+            "waiting": 1
+          }
+        },
+        "delivered_today": 0,
+        "held": 0,
+        "hourly": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "last": [
+          {
+            "id": 1,
+            "kind": "REQUEST",
+            "recipient": "Coord-a",
+            "sender": "Orc-Tessa",
+            "target": "a",
+            "text": "check the dialog",
+            "ts": "2026-11-02T14:59:00-06:00"
+          }
+        ],
+        "last_hour": 1,
+        "max_id": 1,
+        "queued": 1,
+        "top_recipients": [
+          [
+            "Coord-a",
+            1
+          ]
+        ],
+        "top_senders": [
+          [
+            "Orc-Tessa",
+            1
+          ]
+        ]
+      },
+      "msgs_last_hour": 1,
+      "name": "tessa",
+      "root": "<root>/team-tessa",
+      "running": 1,
+      "sessions": [
+        {
+          "agent": "tessa-a",
+          "agents": [
+            {
+              "depth": 1,
+              "description": "port the parser",
+              "finished": false,
+              "flags": {
+                "orphan": false,
+                "stalled": false,
+                "waiting_on_finished_child": false
+              },
+              "id": "s1",
+              "last_state": "in-turn",
+              "last_write": 1793653180.0,
+              "parent": null,
+              "started": null,
+              "tokens": null,
+              "type": "coder",
+              "worktree": "<root>/wt-a"
+            }
+          ],
+          "api_error": null,
+          "cache": {
+            "expires_in_s": null,
+            "hit_ratio": null,
+            "warm": null
+          },
+          "context": {
+            "compactions": 0,
+            "compactions_partial": false,
+            "used_pct": null,
+            "window": null
+          },
+          "cost": {
+            "seat_today_partial": false,
+            "seat_today_usd": 1.25,
+            "session_usd": 1.25
+          },
+          "cwd": "<root>/team-tessa/workcrews/a/tessa-exchange-a",
+          "draft_since": null,
+          "effort": null,
+          "flags": {
+            "api_error": false,
+            "between_turns": false,
+            "blocked": false,
+            "blocked_for_s": null,
+            "held": false,
+            "typing": false,
+            "waiting_on_finished_child": false
+          },
+          "herdr": {
+            "since": 1793652600.0,
+            "status": "working"
+          },
+          "idle_exit_in_s": null,
+          "key": "a",
+          "mail": {
+            "broadcasts": 0,
+            "delivered_today": 0,
+            "held": 0,
+            "oldest_mail_s": 60.0,
+            "oldest_waiting_s": 60.0,
+            "waiting": 1
+          },
+          "model": null,
+          "name": "Coord-a",
+          "recent": {
+            "messages": [
+              {
+                "dir": "in",
+                "kind": "REQUEST",
+                "peer": "Orc-Tessa",
+                "text": "check the dialog",
+                "ts": "2026-11-02T14:59:00-06:00"
+              }
+            ],
+            "tools": [],
+            "trace": []
+          },
+          "role": "lane",
+          "sid": "sid-a",
+          "team": "tessa",
+          "transcript_mtime": 1793653190.0,
+          "transcript_state": "in-turn",
+          "turns": [],
+          "turns_left": null,
+          "worktree": null
+        }
+      ],
+      "state": "?"
+    }
+  ],
+  "took_s": 0,
+  "version": 1,
+  "volume": {
+    "free_gb": null
+  }
+}

@@ -1,0 +1,81 @@
+# codeteam v2 as a herdr plugin: a thin layer over codeteam2 (the core runs without it).
+# Link for development:  herdr plugin link <codeteam checkout>/v2/plugin
+# Teams it manages:      $(herdr plugin config-dir codeteam.v2)/teams.toml
+id = "codeteam.v2"
+name = "codeteam"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Run codeteam teams on herdr: team board, messages, wake and sleep, and teams back after a restart"
+platforms = ["macos"]
+
+# When herdr's server starts, try to bring back autostart teams that were up.
+[[startup]]
+command = ["/bin/sh", "run.sh", "startup"]
+
+[[actions]]
+id = "board"
+title = "codeteam: team board"
+contexts = ["workspace"]
+command = ["/bin/sh", "run.sh", "open", "board"]
+
+[[actions]]
+id = "say"
+title = "codeteam: message the team"
+contexts = ["workspace"]
+command = ["/bin/sh", "run.sh", "open", "say"]
+
+[[actions]]
+id = "tail"
+title = "codeteam: follow the team's messages"
+contexts = ["workspace"]
+command = ["/bin/sh", "run.sh", "open", "tail"]
+
+[[actions]]
+id = "questions"
+title = "codeteam: open questions"
+contexts = ["workspace"]
+command = ["/bin/sh", "run.sh", "open", "questions"]
+
+[[actions]]
+id = "wake"
+title = "codeteam: wake this session"
+contexts = ["workspace"]
+command = ["/bin/sh", "run.sh", "wake"]
+
+[[actions]]
+id = "sleep"
+title = "codeteam: put this session to sleep"
+contexts = ["workspace"]
+command = ["/bin/sh", "run.sh", "sleep"]
+
+[[panes]]
+id = "board"
+title = "codeteam board"
+placement = "popup"
+width = "90%"
+height = "85%"
+command = ["/bin/sh", "run.sh", "board"]
+
+[[panes]]
+id = "say"
+title = "codeteam: message"
+placement = "popup"
+width = "80%"
+height = 14
+command = ["/bin/sh", "run.sh", "say"]
+
+[[panes]]
+id = "tail"
+title = "codeteam messages"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["/bin/sh", "run.sh", "tail"]
+
+[[panes]]
+id = "questions"
+title = "codeteam questions"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["/bin/sh", "run.sh", "questions"]

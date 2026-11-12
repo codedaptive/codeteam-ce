@@ -1,0 +1,3 @@
+#!/bin/sh
+# Builds and test runs wait for a turn in the build queue, like swift and cargo (otherwise xcodebuild goes around them).
+exec "$(dirname "$0")/codeteam-slot" xcodebuild "$@"

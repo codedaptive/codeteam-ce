@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""codeteam-watchdog: outside every loop, so a dead or stuck loop is seen (a loop once hung 4 h at an
+ssh prompt and the patrol, which runs inside the loop, saw nothing). Run by launchd every 5 minutes
+(`codeteam-watchdog install`, which polls after bootout before reinstalling and exits non-zero on failure).
+For each team that is up (team/v2/up, no team/v2/down, no team/HALTED): a loop heartbeat
+older than 10 minutes, or a landing queue, recheck or validation runner that launchd shows as not running, is told
+to the owner once per episode (a herdr notice), and a missing loop is started again (codeteam2 ensure-loop)."""
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+# Prefer this checkout's shared module over one in the working directory.
+sys.path.insert(0, str(HERE.parent / "share"))
+import codeteam_launchd
+
+TEAMS = HERE.parent / "teams"
+STATE = HERE.parent / "run" / "watchdog.json"
+STALE_S = 600
+# Disk (the disk once reached 99% full: work order trees held 18-28 GB of build output each, and
+# a gate died with "No space left on device"). Below DISK_MIN_GB free, the build output of work order trees idle
+# DISK_IDLE_S is removed, oldest first; it is rebuilt (through sccache and the compile caches) when its lead returns.
+DISK_MIN_GB = 150
+DISK_IDLE_S = 1800
+BUILD_DIRS = ("target", "cargo-target", ".build", "DerivedData")
+LAUNCHD_PREFIX = os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam"
+WORKSPACE = Path(os.environ.get("CODETEAM_WORKSPACE") or Path.home() / "codeteam-work")
+LABEL = f"{LAUNCHD_PREFIX}.codeteam-watchdog"
+
+
+def notify(title, body):
+    env = dict(os.environ, HERDR_SESSION="codeteam")
+    subprocess.Popen(["/opt/homebrew/bin/herdr", "notification", "show", title, "--body", body, "--sound", "request"],
+                     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def runs(job):
+    """The job's process is alive and is still its tool (the build queue runner's own check, codeteam-buildq): a job
+    file outlives its process, and the pid may since belong to something else."""
+    if not alive(job.get("pid")) or not job.get("tool"):
+        return False
+    r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(int(job["pid"]))], capture_output=True, text=True)
+    return job["tool"] in r.stdout
+
+
+def sweep_queue(q=None):
+    """The build queue's duplicates and orphans (four repeats of one
+    cargo check were once seen in a morning, 30 minutes apart). A queued build job whose own process is gone is cancelled
+    (zone-tool job cancel); of the same build running more than once in one tree, all but the newest are stopped.
+    Test jobs are left alone: an identical one is joined at submit, and its record answers the next run. Returns the
+    lines it logged."""
+    q = Path(q or os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
+    jobs = []
+    for f in q.glob("*.json"):
+        if time.time() - f.stat().st_mtime > 86400:
+            continue
+        try:
+            j = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if j.get("kind") == "slot" and j.get("state") in ("queued", "running"):
+            jobs.append(j)
+    done = []
+    for j in jobs:
+        if j["state"] == "queued" and not alive(j.get("pid")):
+            r = subprocess.run([str(HERE / "zone-tool"), "job", "cancel", j["ticket"]], capture_output=True, text=True,
+                               env=dict(os.environ, CODETEAM_QUEUE_DIR=str(q)))
+            if "cancelled" in r.stdout:
+                done.append(f"cancelled {j['ticket']}: queued {' '.join(j.get('command') or [])} whose process is gone "
+                            f"({j.get('worktree')})")
+    same = {}
+    for j in jobs:
+        if j["state"] == "running" and runs(j):
+            same.setdefault((j.get("worktree"), tuple(j.get("command") or [])), []).append(j)
+    for (wt, cmd), group in same.items():
+        group.sort(key=lambda x: x.get("submitted") or 0)
+        for j in group[:-1]:
+            try:
+                os.kill(int(j["pid"]), signal.SIGTERM)
+                done.append(f"stopped {j['ticket']}: {' '.join(cmd)} also running as {group[-1]['ticket']} in {wt}")
+            except (OSError, ValueError):
+                pass
+    for line in done:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} queue: {line}", flush=True)
+    if len(done) > 3:
+        notify("codeteam watchdog: build queue", f"{len(done)} duplicate or orphaned build jobs removed; see run/watchdog.log")
+    return done
+
+
+def warm_held(lock):
+    """True while someone holds the flock on a warm lock file."""
+    import fcntl
+    try:
+        fd = os.open(str(lock), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def free_gb(path=None):
+    st = os.statvfs(str(path or Path.home()))
+    return st.f_bavail * st.f_frsize / 1e9
+
+
+def last_active(tree, dirs):
+    """The newest of: the last commit, the index (git add, checkout), the files git sees as changed (as the idle sweep's
+    check), and each build folder and its top entries (a build writes there). Never a walk of the tree. A held warm
+    lock (the worktree hook's detached warm build) counts as now."""
+    times = []
+    st = subprocess.run(["git", "-C", str(tree), "status", "--porcelain", "--untracked-files=all"], capture_output=True,
+                        text=True)
+    for line in st.stdout.splitlines()[:5000]:
+        try:
+            times.append((tree / line[3:].split(" -> ")[-1].strip('"')).stat().st_mtime)
+        except OSError:
+            pass
+    r = subprocess.run(["git", "-C", str(tree), "log", "-1", "--format=%ct"], capture_output=True, text=True)
+    if r.stdout.strip():
+        times.append(float(r.stdout.strip()))
+    gd = subprocess.run(["git", "-C", str(tree), "rev-parse", "--path-format=absolute", "--git-dir"],
+                        capture_output=True, text=True).stdout.strip()
+    for p in [Path(gd) / "index"] if gd else []:
+        try:
+            times.append(p.stat().st_mtime)
+        except OSError:
+            pass
+    if gd and warm_held(Path(gd) / "codeteam-warm.lock"):
+        times.append(time.time())
+    for d in dirs:
+        for p in [d, *list(d.iterdir())[:200]]:
+            try:
+                times.append(p.lstat().st_mtime)
+            except OSError:
+                pass
+    return max(times or [0])
+
+
+def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None):
+    """When free disk is below min_gb: the build output of every work order tree with no queued or running build and
+    nothing touched for idle_s is moved to its team's .trash and removed in the background, oldest tree first.
+    Returns the lines it logged."""
+    min_gb = float(os.environ.get("CODETEAM_DISK_MIN_GB", DISK_MIN_GB)) if min_gb is None else min_gb
+    idle_s = DISK_IDLE_S if idle_s is None else idle_s
+    have = (free or free_gb)()
+    if have >= min_gb:
+        return []
+    q = Path(q or os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
+    busy = set()
+    for f in q.glob("*.json"):
+        try:
+            j = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if j.get("state") in ("queued", "running") and j.get("worktree"):
+            busy.add(os.path.realpath(j["worktree"]))
+    found = []
+    for m in sorted(Path(teams or TEAMS).glob("*.toml")):
+        try:
+            cfg = tomllib.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        root = Path(os.path.expanduser(cfg.get("worktree_root") or str(WORKSPACE / f"team-{m.stem}")))
+        trees = set()
+        for f in (root / "land" / "wo").glob("*.json"):
+            if f.name.endswith((".landed.json", ".retired.json")):
+                continue
+            try:
+                trees.add(Path(json.loads(f.read_text())["tree"]))
+            except (OSError, ValueError, KeyError):
+                continue
+        # and trees with no record: cancelled WorktreeCreate starts (19-27 GB each were seen)
+        trees |= {p for p in (root / "wo").glob("*/*") if p.is_dir() and (p / ".git").exists()}
+        for tree in sorted(trees):
+            dirs = [tree / d for d in BUILD_DIRS if (tree / d).is_dir() and not (tree / d).is_symlink()]
+            if not dirs or os.path.realpath(tree) in busy:
+                continue
+            last = last_active(tree, dirs)
+            if time.time() - last >= idle_s:
+                found.append((last, root, tree, dirs))
+    done = []
+    for last, root, tree, dirs in sorted(found, key=lambda x: x[0]):
+        trash = root / ".trash"
+        trash.mkdir(exist_ok=True)
+        for d in dirs:
+            dest = trash / f"{time.strftime('%Y%m%d-%H%M%S')}-{tree.name}-{d.name.lstrip('.')}"
+            try:
+                d.rename(dest)
+            except OSError:
+                continue
+            done.append(f"removed {d} (idle {(time.time() - last) / 3600:.1f} h)")
+    for root in {x[1] for x in found}:
+        if (root / ".trash").is_dir():
+            subprocess.Popen(["sh", "-c", f"rm -rf {shlex.quote(str(root / '.trash'))}/*"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    for line in done:
+        print(f"{stamp} disk ({have:.0f} GB free): {line}", flush=True)
+    if have < min_gb / 3:
+        notify("codeteam watchdog: disk", f"{have:.0f} GB free; {len(done)} idle build folders removed")
+    return done
+
+
+def runner_problems(stem: str, run=subprocess.run, uid: int | None = None) -> list[str]:
+    uid = os.getuid() if uid is None else uid
+    problems = []
+    for runner, problem in (("land", "landing queue runner not running"),
+                            ("recheck", "recheck runner not running"),
+                            ("validate", "validation runner not running")):
+        r = run(["launchctl", "print", f"gui/{uid}/{LAUNCHD_PREFIX}.codeteam-{runner}.{stem}"],
+                capture_output=True, text=True)
+        if r.returncode or "state = running" not in r.stdout:
+            problems.append(problem)
+    return problems
+
+
+def check():
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    now, seen = time.time(), {}
+    for m in sorted(TEAMS.glob("*.toml")):
+        try:
+            cfg = tomllib.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        root = Path(os.path.expanduser(cfg.get("worktree_root") or str(WORKSPACE / f"team-{m.stem}")))
+        v2 = root / "team" / "v2"
+        if not (v2 / "up").exists() or (v2 / "down").exists() or (root / "team" / "HALTED").exists():
+            continue
+        problems = []
+        hb = v2 / "heartbeat"
+        age = now - hb.stat().st_mtime if hb.exists() else None
+        if age is None or age > STALE_S:
+            problems.append(f"loop heartbeat {'missing' if age is None else f'{age / 60:.0f} min old'}")
+            subprocess.run([str(HERE.parent / "v2" / "bin" / "codeteam2"), "ensure-loop", str(m)],
+                           capture_output=True, timeout=120, env=dict(os.environ, HERDR_SESSION="codeteam"))
+        if (cfg.get("land") or {}).get("enabled"):
+            problems.extend(runner_problems(m.stem))
+        for p in problems:
+            key = f"{m.stem}: {p.split(' ')[0]} {p.split(' ')[1]}"
+            seen[key] = state.get(key, now)
+            if key not in state:
+                notify(f"codeteam watchdog: {m.stem}", p)
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {m.stem}: {p}", flush=True)
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(seen))
+    sweep_queue()
+    sweep_disk()
+
+
+def launchd_reinstall(label: str, plist: Path, uid: int, run=None, sleep=None,
+                      wait_s: float = 20.0, poll_s: float = 0.2, retry_s: float = 2.0) -> str | None:
+    return codeteam_launchd.reinstall(label, plist, uid, run=run, sleep=sleep, wait_s=wait_s, poll_s=poll_s, retry_s=retry_s).reason
+
+
+def install():
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    log = HERE.parent / "run" / "watchdog.log"
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{LABEL}</string>
+<key>ProgramArguments</key><array><string>{Path(__file__).resolve()}</string></array>
+<key>StartInterval</key><integer>300</integer>
+<key>RunAtLoad</key><true/>
+<key>ProcessType</key><string>Interactive</string>
+<key>StandardOutPath</key><string>{log}</string><key>StandardErrorPath</key><string>{log}</string>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+</dict></plist>
+""")
+    reason = launchd_reinstall(LABEL, plist, os.getuid())
+    if reason is not None:
+        print(f"{LABEL} not installed: {reason}", file=sys.stderr)
+        sys.exit(1)
+    print(f"installed {LABEL}")
+
+
+if __name__ == "__main__":
+    install() if sys.argv[1:] == ["install"] else check()

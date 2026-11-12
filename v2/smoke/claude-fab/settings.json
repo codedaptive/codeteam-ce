@@ -1,0 +1,63 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CODETEAM_HOME/share/claude-hooks/zone-guard.py\" start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CODETEAM_HOME/share/claude-hooks/zone-guard.py\" subagent",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CODETEAM_HOME/share/claude-hooks/zone-guard.py\" pretool",
+            "timeout": 10
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CODETEAM_HOME/share/claude-hooks/zone-guard.py\" stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CODETEAM_HOME/share/claude-hooks/zone-guard.py\" context",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  }
+}

@@ -1,0 +1,35 @@
+#!/bin/sh
+# codeteam-seed-index <worktree>...: give a worktree a CodeGraph index now, by seeding it from its nearest sibling
+# worktree that has one (CodeGraph's own seedFromSibling: a safe copy-on-write clone of a checkpointed index), then
+# registering it as seeded and pinning it. Exit 0 when it has an index afterwards (seeded now, or already had one).
+#
+# Why: CodeGraph seeds a worktree only on the first MCP query in it, and a project pinned before it
+# had an index is skipped ("pinned project skipped: no index"), so most of one team's lane worktrees never got one and
+# their agents fell back to grep. codeteam runs this when it makes a standing worktree (init) and from the worktree
+# hook for request worktrees, so every worktree has an index from the start.
+CG_DIR=${CODEGRAPH_DIST:-$(dirname "$(readlink -f /opt/homebrew/bin/codegraph)")/../dist}
+[ -d "$CG_DIR/extensions/host/worktree-lifecycle" ] || CG_DIR=/opt/homebrew/lib/node_modules/@colbymchenry/codegraph/dist
+rc=0
+for wt in "$@"; do
+  /opt/homebrew/bin/node -e '
+    const path = require("path"), fs = require("fs");
+    const D = process.argv[1], wt = path.resolve(process.argv[2]);
+    const seed = require(D + "/extensions/host/worktree-lifecycle/seed.js");
+    const reg = require(D + "/extensions/host/worktree-lifecycle/project-registry.js");
+    const { execFileSync } = require("child_process");
+    if (fs.existsSync(path.join(wt, ".codegraph", "codegraph.db"))) { console.log(`${wt}: has an index`); process.exit(0); }
+    (async () => {
+      const src = await seed.pickSeedSource(wt);
+      if (!src) { console.log(`${wt}: no sibling with an index; it is built on its first query`); process.exit(3); }
+      const { method, nonce } = await seed.seedFromSibling(wt, src);
+      const commonDir = execFileSync("git", ["-C", wt, "rev-parse", "--path-format=absolute", "--git-common-dir"]).toString().trim();
+      reg.registerProject(wt, { seeded: true, commonDir, seedNonce: nonce });
+      console.log(`${wt}: seeded from ${src} (${method})`);
+    })().catch(e => { console.log(`${wt}: seed failed: ${e.message}`); process.exit(1); });
+  ' "$CG_DIR" "$wt" || rc=1
+  /opt/homebrew/bin/codegraph project pin "$wt" >/dev/null 2>&1 || true
+  # The index is rebuilt from a sibling in a second: keep it out of Time Machine (220 indexes of
+  # ~800 MB each were being copied in full on every change).
+  [ -d "$wt/.codegraph" ] && /usr/bin/tmutil addexclusion "$wt/.codegraph" >/dev/null 2>&1 || true
+done
+exit $rc

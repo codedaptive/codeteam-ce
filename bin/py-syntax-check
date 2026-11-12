@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""py-syntax-check [paths...]: compile every tracked .py file (or those under the paths) without writing anything;
+exit 1 with each error. codeteam's type-check for Python teams (ZONE_CHECK_CMD)."""
+import subprocess, sys
+files = subprocess.run(["git", "ls-files", "-z", "--", *(sys.argv[1:] or ["."])], capture_output=True,
+                       text=True).stdout.split("\0")
+bad = 0
+for f in (f for f in files if f.endswith(".py")):
+    try:
+        compile(open(f, encoding="utf-8", errors="replace").read(), f, "exec")
+    except SyntaxError as e:
+        bad += 1
+        print(f"{f}:{e.lineno}:{e.offset}: {e.msg}")
+sys.exit(1 if bad else 0)

@@ -1,0 +1,106 @@
+# codeteam manifest: team-acme-widgets, an example team for a small Rust workspace.
+# acme-widgets is made up: a Cargo workspace with three crates under crates/ (widget-core, widget-store, widget-cli).
+# Each lane owns its crates; the orchestrator owns the workspace root (Cargo.toml, Cargo.lock, Makefile).
+# Copy this file to teams/<your-product>.toml and change the product, repo and lanes. Paths may start with ~.
+product = "acme-widgets"
+repo = "~/codeteam-work/acme-widgets"          # your clone of the product repo (base branch below)
+base = "main"
+guard = "Kong"                                 # the assistant that reviews exchange pushes
+exchange = "exchange"
+integration = "integration"
+lane_branch_prefix = "lane/"
+worktree_root = "~/codeteam-work/team-acme-widgets"
+# The team's own claude home: the agents, skills and rules the catalog built and installed
+# (python3 -I catalog/generate.py example --install ~/codeteam-work/team-acme-widgets), plus codeteam's hooks.
+claude_source = "~/codeteam-work/team-acme-widgets/team/claude"
+orc_agent = "repo-orchestrator"
+lane_agent = "zone-coordinator"
+lane_coder = "zone-coordinator"
+model = "claude-sonnet-5-5"
+orc_model = "claude-opus-5-5"
+effort = "medium"
+lane_model = "claude-opus-5-5"
+lane_effort = "medium"
+lane_permission_mode = "bypassPermissions"
+orc_permission_mode = "bypassPermissions"
+max_awake_lanes = 2
+backup = true
+branch_allow = ["unit/*"]
+# Every landing: the workspace type-checks (through codeteam's cargo slots).
+gate = "test ! -f Cargo.toml || cargo check --all-targets"
+
+[env]
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "52"
+# Rust build output per worktree: codeteam's cargo wrapper sets CARGO_TARGET_DIR to <worktree>/cargo-target, and a new
+# worktree gets a copy-on-write clone of its lane's cargo-target (make warm, run by the worktree hook).
+CODETEAM_CARGO_TARGET = "1"
+CODETEAM_WARM = "1"
+CARGO_INCREMENTAL = "1"
+CARGO_PROFILE_DEV_DEBUG = "0"
+CARGO_PROFILE_TEST_DEBUG = "0"
+# Optional: share compiled crates machine-wide through sccache (brew install sccache). Point it at this checkout:
+# RUSTC_WRAPPER = "~/codeteam-gamma-preview/bin/sccache-wt/sccache"
+# SCCACHE_CACHE_SIZE = "20G"
+
+[[lanes]]
+name = "core"
+path = "."
+owns = ["crates/widget-core"]
+job = "Core: the widget model and its rules: types, validation, and the pure functions every other crate calls."
+
+[[lanes]]
+name = "store"
+path = "."
+owns = ["crates/widget-store"]
+job = "Store: saving and loading widgets in SQLite: the schema, migrations and queries."
+
+[[lanes]]
+name = "cli"
+path = "."
+owns = ["crates/widget-cli"]
+job = "CLI: the acme-widgets command: argument parsing, output formats, and the commands that call core and store."
+
+[[assistants]]
+name = "Nagatha"
+agent = "integration-builder"
+model = "claude-opus-5-5"
+effort = "medium"
+job = "Builder: owns the shared build files and the integration tests, reviews each feature after it lands, and promotes when the orchestrator asks"
+tier = "integration"
+permission_mode = "bypassPermissions"
+
+[[assistants]]
+name = "Kong"
+agent = "spec-guard"
+model = "claude-opus-5-5"
+effort = "medium"
+job = "Guard and auditor: reviews exchange pushes against the mission, spec and rulings"
+tier = "exchange"
+permission_mode = "bypassPermissions"
+
+[[assistants]]
+name = "Designer-Acme"
+role = "designer"
+agent = "repo-designer"
+model = "claude-opus-5-5"
+effort = "low"
+job = "Designer: works with the owner on acme-widgets' design, the mission, spec and rulings; hands decisions to the orchestrator in writing"
+tier = "design"
+permission_mode = "bypassPermissions"
+
+# codeteam v2 runs the team's sessions on herdr.
+[v2]
+herdr_session = "codeteam"
+
+# Branch flow v5.4 (docs/SPEC-branch-flow-v5.4.md): every change lands through codeteam-land.
+[land]
+enabled = true
+# The landing check runs each crate's unit tests; a crate's tests/ folder holds integration targets, which are not
+# run at landing.
+test = "/usr/bin/lockf -k .cargo-gate.lock make --no-print-directory zone-test-one DIR={dir} CLASS={cls}"
+skip_tests = ["crates/*/tests", "crates/*/tests/*"]
+
+# Contract files: a change to one also runs its consumer zones' tests.
+[land.contracts]
+"crates/widget-core/src/model/**" = ["store", "cli"]
+"crates/widget-store/src/schema/**" = ["cli"]

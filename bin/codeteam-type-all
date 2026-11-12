@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""codeteam-type-all: type one command into every running codeteam session.
+
+    codeteam-type-all "/mcp reconnect codegraph"            every team that is up and not HALTED
+    codeteam-type-all --teams acme,widgets "/mcp reconnect codegraph"
+    codeteam-type-all --wait 30 "..."                        keep trying busy sessions for up to 30 min (default 20)
+    codeteam-type-all --dry-run "..."                        say who would get it, type nothing
+
+Made for CodeGraph installs: a running session's codegraph helper keeps the old version until it reconnects, and
+`/mcp reconnect codegraph` (checked on a scratch session: "Successfully reconnected to codegraph") does that without
+restarting the session. Subagents share their session's MCP connection, so the standing sessions are all of them.
+
+A session gets the command only when its own turn has ended (herdr idle or done, or working only because of a
+background agent: v2's between-turns test), its input box is empty, and it isn't on a dialog. A busy session is
+tried again every 20 s until --wait runs out; whoever is left is listed. Each session gets it once.
+"""
+import argparse
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HOME / "v2"))
+from codeteam2 import screen as screen_mod         # noqa: E402
+from codeteam2.herdr import HerdrError           # noqa: E402
+from codeteam2.scheduler import READY, Runtime    # noqa: E402
+from codeteam2.team import Team                   # noqa: E402
+
+
+def team_list(names):
+    out = []
+    for m in sorted((HOME / "teams").glob("*.toml")):
+        if names and m.stem not in names:
+            continue
+        try:
+            t = Team(str(m))
+        except SystemExit:
+            continue
+        if not (t.dir / "up").exists() or (t.dir / "down").exists() or t.halted():
+            continue
+        out.append(t)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command")
+    ap.add_argument("--teams", default="")
+    ap.add_argument("--wait", type=float, default=20, help="minutes to keep trying busy sessions")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--idle-only", action="store_true",
+                    help="skip sessions with background agents running (for commands that relaunch, like /tui)")
+    a = ap.parse_args()
+    names = {x.strip() for x in a.teams.split(",") if x.strip()}
+    teams = team_list(names)
+    if not teams:
+        sys.exit("no team is up (or every one named is down or HALTED)")
+    done, todo = set(), None
+    deadline = time.time() + a.wait * 60
+    while True:
+        left = []
+        for t in teams:
+            rt = Runtime(t, log=lambda *_: None)
+            ws = rt.workspace(create=False)
+            if not ws:
+                continue
+            obs = rt.observe(ws)
+            st = t.load_state()
+            for s in t.sessions():
+                key = (t.product, s.key)
+                status = obs.get(s.key, ("absent",))[0]
+                if status == "absent" or key in done:
+                    continue
+                rec = st.get(s.key, {})
+                ready = status in READY or (not a.idle_only and status == "working"
+                                            and rt.between_turns(s.key, dict(rec), time.time()))
+                text = rt.screen(s) if ready else None
+                hold = text and (screen_mod.agent_view(text) or screen_mod.draft(text))   # a subagent's view, or typing
+                if not ready or hold:
+                    left.append(f"{t.product}/{s.display} ({status})")
+                    continue
+                if a.dry_run:
+                    print(f"would type into {t.product}/{s.display}")
+                    done.add(key)
+                    continue
+                try:
+                    rt.herdr.agent_prompt(s.agent, a.command)
+                    done.add(key)
+                    print(f"typed into {t.product}/{s.display}")
+                except HerdrError as e:
+                    left.append(f"{t.product}/{s.display} (refused: {e})")
+        if a.dry_run or not left or time.time() >= deadline:
+            break
+        if left != todo:
+            print(f"waiting on {len(left)} busy session(s): {', '.join(left)}")
+            todo = left
+        time.sleep(20)
+    print(f"done: {len(done)} session(s)" + (f"; not reached: {', '.join(left)}" if left else ""))
+    sys.exit(1 if left and not a.dry_run else 0)
+
+
+if __name__ == "__main__":
+    main()

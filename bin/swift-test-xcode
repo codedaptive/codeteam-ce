@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""swift-test-xcode <package dir> [swift test arguments]
+
+codeteam's copy, one for every team. Runs one Swift package's tests
+through xcodebuild with Xcode's compilation cache, in place of `swift test`, so a library
+compiled in any worktree, for any package, is reused by all, and nothing builds into the
+package's .build. A team's zone tests call it (make zone-test, through ZONE_TEST).
+
+Arguments, translated from swift test's:
+  --filter X / --filter=X   regex over test identifiers; matches run with -only-testing
+  --skip X / --skip=X       the same, run with -skip-testing
+  --traits a,b              non-default traits: the names they define, per target, from the
+                            manifest; a trait that links targets or passes traits on: exit 87
+  --no-parallel / --parallel
+  --build-only              compile the package and its tests, run nothing (make warm)
+  --list                    compile, then print every test identifier
+  --sanitize=address        AddressSanitizer, in its own build folder
+Anything else exits 87 with a loud message: it never falls back to swift test.
+
+Build output: <worktree>/DerivedData/swift-test (git-ignored by the repo's DerivedData/ rule).
+The compile cache is shared by every team: ~/Library/Developer/codeteam-compilation-cache (40G cap).
+Tests see the caller's environment (passed as TEST_RUNNER_ variables). Exit status:
+xcodebuild's (0 pass); 1 when a filter matches no test.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+FALLBACK = 87
+CAS = os.environ.get("CODETEAM_SWIFT_CAS") or str(Path.home() / "Library/Developer/codeteam-compilation-cache")
+# Xcode's COMPILATION_CACHE_LIMIT_SIZE (measured 2026-10-23): once the cache passes the limit,
+# new output goes to a fresh generation; the old one stays readable (what is still used is
+# copied forward) and is deleted when the new one reaches the limit too. So the cache holds
+# up to about twice the limit on disk. 40G keeps it under ~80 GB,
+# and one generation holds several full Swift builds (4.3 GB measured for two large packages
+# and the libraries they use).
+CAS_LIMIT = os.environ.get("CODETEAM_SWIFT_CAS_LIMIT", "40G")
+LIB_TYPES = ("staticlib", "mh_object", "mh_dylib", "mh_execute")
+SKIP_ENV = {"PWD", "OLDPWD", "SHLVL", "_", "PS1", "PS2", "PROMPT_COMMAND"}
+
+
+def say(msg):
+    print(f"swift-test-xcode: {msg}", file=sys.stderr, flush=True)
+
+
+BUILD_ONLY = False
+NO_TESTS = False      # a package with no test target: --build-only builds it (a root package of executables only)
+ASAN = False
+
+
+def parse(args):
+    global BUILD_ONLY, ASAN
+    filters, skips, traits, parallel = [], [], [], None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if a in ("--filter", "--skip", "--traits") and nxt is not None:
+            {"--filter": filters, "--skip": skips, "--traits": traits}[a].append(nxt)
+            i += 2
+            continue
+        m = re.fullmatch(r"--(filter|skip|traits)=(.*)", a)
+        if m:
+            {"filter": filters, "skip": skips, "traits": traits}[m.group(1)].append(m.group(2))
+        elif a == "--build-only":       # make warm: compile the tests, run nothing
+            BUILD_ONLY = True
+        elif a == "--list":             # compile, then print every test identifier
+            BUILD_ONLY = "list"
+        elif a == "--sanitize=address":  # make test-asan
+            ASAN = True
+        elif a == "--no-parallel":
+            parallel = "NO"
+        elif a == "--parallel":
+            parallel = "YES"
+        else:
+            say(f"no xcodebuild form for {a!r}")
+            sys.exit(FALLBACK)
+        i += 1
+    extra = [t for spec in traits for t in spec.split(",") if t and t != "default"]
+    return filters, skips, extra, parallel
+
+
+def trait_defines(pkg, extra):
+    """{target: [names]} that the requested non-default traits define, read from the
+    package's own manifest, so xcodebuild compiles exactly what swift test --traits would.
+    xcodebuild applies a package's default traits itself (in one large package, 1,911 of 1,918
+    tests, every migration target), but has no option for any other trait. A trait that
+    does more than define names (links a target or product, passes traits to a dependency,
+    sets other settings) has no xcodebuild form: exit 87, swift test runs."""
+    r = subprocess.run(["swift", "package", "dump-package"], cwd=pkg, capture_output=True, text=True)
+    if r.returncode:
+        say("swift package dump-package failed")
+        sys.exit(FALLBACK)
+    d = json.loads(r.stdout)
+    enables = {t["name"]: t.get("enabledTraits") or [] for t in d.get("traits", [])}
+    on, todo = set(), list(extra)
+    while todo:                                   # a trait can enable others
+        t = todo.pop()
+        if t not in on:
+            if t not in enables:
+                say(f"trait {t!r} is not declared by {pkg.name}")
+                sys.exit(FALLBACK)
+            on.add(t)
+            todo += enables[t]
+    hit = lambda cond: bool(set((cond or {}).get("traits") or []) & on)
+    defs = {}
+    for tgt in d.get("targets", []):
+        for dep in tgt.get("dependencies", []):
+            if "traits" in json.dumps(dep) and any(t in json.dumps(dep) for t in on):
+                say(f"trait {sorted(on)} links a dependency of target {tgt['name']}")
+                sys.exit(FALLBACK)
+        for st in tgt.get("settings", []):
+            if not hit(st.get("condition")):
+                continue
+            kind = st.get("kind", {})
+            if st.get("tool") == "swift" and "define" in kind:
+                defs.setdefault(tgt["name"], []).append(kind["define"]["_0"])
+            else:
+                say(f"trait {sorted(on)} sets {list(kind)} on {tgt['name']}")
+                sys.exit(FALLBACK)
+    for dep in d.get("dependencies", []):
+        if any(t in json.dumps(dep.get("traits", "")) for t in on):
+            say(f"trait {sorted(on)} passes traits to a dependency")
+            sys.exit(FALLBACK)
+    return defs
+
+
+SCHEME_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion = "2700" version = "1.7">
+   <BuildAction parallelizeBuildables = "YES" buildImplicitDependencies = "YES">
+      <BuildActionEntries>
+{builds}
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "" selectedLauncherIdentifier = "Xcode.IDEFoundation.Launcher.PosixSpawn" shouldUseLaunchSchemeArgsEnv = "NO">
+      <EnvironmentVariables>
+         <EnvironmentVariable key = "OS_ACTIVITY_DT_MODE" value = "NO" isEnabled = "YES">
+         </EnvironmentVariable>
+      </EnvironmentVariables>
+      <Testables>
+{tests}
+      </Testables>
+   </TestAction>
+</Scheme>
+"""
+REF = 'BuildableIdentifier = "primary" BlueprintIdentifier = "{n}" BuildableName = "{n}" BlueprintName = "{n}" ReferencedContainer = "container:"'
+
+
+def xcode_scheme(pkg, dd):
+    """Our own scheme for the package, in its git-ignored .swiftpm folder: it builds every
+    target (as Xcode's automatic <Name>-Package scheme does, so executables the tests run
+    sit beside the test bundles) and runs every test target with OS_ACTIVITY_DT_MODE unset,
+    as swift test runs them. xcodebuild's automatic scheme sets it to YES, which mirrors
+    system log lines into the test process's stderr (a test checking stderr then fails).
+    Written only when it changes; `make clean` removes .swiftpm and it is written again."""
+    manifest = pkg / "Package.swift"
+    cache = dd / "codeteam-schemes.json"
+    key = f"{pkg}:{manifest.stat().st_mtime_ns}:v2"
+    try:
+        known = json.loads(cache.read_text())
+    except (OSError, ValueError):
+        known = {}
+    global NO_TESTS
+    name = known.get(key)
+    path = pkg / ".swiftpm" / "xcode" / "xcshareddata" / "xcschemes"
+    if name and (path / f"{name}.xcscheme").exists():
+        NO_TESTS = known.get(key + ":no-tests", False)
+        if NO_TESTS and BUILD_ONLY is not True:
+            say(f"{pkg.name} has no test target")
+            sys.exit(FALLBACK)
+        return name
+    r = subprocess.run(["swift", "package", "dump-package"], cwd=pkg, capture_output=True, text=True)
+    if r.returncode:
+        say(f"swift package dump-package failed in {pkg}")
+        sys.exit(FALLBACK)
+    d = json.loads(r.stdout)
+    targets = [t for t in d.get("targets", []) if t.get("type") in ("regular", "executable", "test")]
+    tests = [t["name"] for t in targets if t["type"] == "test"]
+    if not tests and BUILD_ONLY is not True:
+        say(f"{pkg.name} has no test target")
+        sys.exit(FALLBACK)
+    NO_TESTS = not tests      # --build-only on a package of executables (2026-11-08): a plain build
+    name = f"CodeteamTest-{d.get('name', pkg.name)}"
+    builds = "\n".join(
+        f'         <BuildActionEntry buildForTesting = "YES" buildForRunning = "{"NO" if t["type"] == "test" else "YES"}" '
+        f'buildForProfiling = "NO" buildForArchiving = "NO" buildForAnalyzing = "NO">\n'
+        f'            <BuildableReference {REF.format(n=t["name"])}>\n            </BuildableReference>\n'
+        f'         </BuildActionEntry>' for t in targets)
+    testables = "\n".join(
+        f'         <TestableReference skipped = "NO">\n            <BuildableReference {REF.format(n=n)}>\n'
+        f'            </BuildableReference>\n         </TestableReference>' for n in tests)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / f"{name}.xcscheme").write_text(SCHEME_XML.format(builds=builds, tests=testables))
+    known[key] = name
+    known[key + ":no-tests"] = NO_TESTS
+    dd.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(known))
+    return name
+
+
+def scheme_of(pkg, dd):
+    """The scheme that builds every test target: <Name>-Package when there is one."""
+    cache = dd / "codeteam-schemes.json"
+    key = f"{pkg}:{(pkg / 'Package.swift').stat().st_mtime_ns}"
+    try:
+        known = json.loads(cache.read_text())
+    except (OSError, ValueError):
+        known = {}
+    if key in known:
+        return known[key]
+    r = subprocess.run(["xcodebuild", "-list", "-json"], cwd=pkg, capture_output=True, text=True)
+    try:
+        d = json.loads(r.stdout)
+        schemes = (d.get("workspace") or d.get("project") or {}).get("schemes", [])
+    except ValueError:
+        schemes = []
+    if not schemes:
+        say(f"no scheme found in {pkg}")
+        sys.exit(FALLBACK)
+    pick = next((s for s in schemes if s.endswith("-Package")), schemes[0])
+    known[key] = pick
+    dd.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(known))
+    return pick
+
+
+def main():
+    if len(sys.argv) < 2:
+        say("usage: swift-test-xcode <package dir> [swift test arguments]")
+        return 2
+    pkg = Path(sys.argv[1]).resolve()
+    filters, skips, conds, parallel = parse(sys.argv[2:])
+    root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=pkg, capture_output=True,
+                               text=True).stdout.strip() or pkg)
+    dd = root / "DerivedData" / ("swift-test-asan" if ASAN else "swift-test")   # this worktree's own build output
+    wd = pkg / ".swiftpm" / "xcode"                   # the folder xcodebuild compiles from
+    Path(CAS).mkdir(parents=True, exist_ok=True)
+    scheme = xcode_scheme(pkg, dd)
+    # Three path mappings beside Xcode's own (which covers only Xcode, the SDK and the
+    # toolchain): the top package's folder, the build output and the worktree. Without
+    # them the compile commands differ by folder and nothing is reused.
+    maps = [(wd, "/^wd"), (dd, "/^dd"), (root, "/^src")]
+    swift_maps = " ".join(f"-scanner-prefix-map {p}={to}" for p, to in maps)
+    clang_maps = " ".join(f"-fdepscan-prefix-map={p}={to}" for p, to in maps)
+    settings = [
+        "COMPILATION_CACHE_ENABLE_CACHING=YES", f"COMPILATION_CACHE_CAS_PATH={CAS}",
+        f"COMPILATION_CACHE_LIMIT_SIZE={CAS_LIMIT}",
+        "SWIFT_ENABLE_PREFIX_MAPPING=YES", "CLANG_ENABLE_PREFIX_MAPPING=YES",
+        "SWIFT_ENABLE_EXPLICIT_MODULES=YES",
+        # Plain DWARF: no dSYM bundle per test bundle ; debug info is the same, the extra step goes.
+        "DEBUG_INFORMATION_FORMAT=dwarf",
+        # Library code gets the mappings; test bundles do not. A test that finds a fixture
+        # beside its own source (URL(fileURLWithPath: #filePath), 206 test files) needs its
+        # real path, and the mapping would compile in /^src/... instead. So each zone's own
+        # test code compiles once per worktree, and every library comes from the cache.
+        # MACH_O_TYPE is mh_bundle for test bundles, so CT_MAP_mh_bundle stays unset.
+        "OTHER_SWIFT_FLAGS=$(inherited) $(CT_SWIFT_MAP_$(MACH_O_TYPE))",
+        "OTHER_CFLAGS=$(inherited) $(CT_CLANG_MAP_$(MACH_O_TYPE))",
+    ] + [f"CT_SWIFT_MAP_{t}={swift_maps}" for t in LIB_TYPES] + [f"CT_CLANG_MAP_{t}={clang_maps}" for t in LIB_TYPES]
+    if conds:
+        defs = trait_defines(pkg, conds)
+        ident = lambda n: re.sub(r"[^A-Za-z0-9_]", "_", n)
+        settings.append("SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) $(CT_TRAIT_DEFS_$(TARGET_NAME:c99extidentifier))")
+        for tgt, names in defs.items():
+            for xt in (tgt, f"{tgt}-product"):
+                settings.append(f"CT_TRAIT_DEFS_{ident(xt)}=" + " ".join(names))
+        say("traits " + ", ".join(conds) + ": " + "; ".join(f"{t} defines {' '.join(n)}" for t, n in defs.items()))
+    # The committed Package.resolved, exactly: xcodebuild never resolves to other versions
+    # (a resolution that drifted would rewrite Package.resolved in the tree) and stops with an
+    # error when the file does not cover the package's dependencies.
+    base = ["xcodebuild", "-scheme", scheme, "-destination", "platform=macOS", "-derivedDataPath", str(dd),
+            "-skipPackagePluginValidation", "-onlyUsePackageVersionsFromResolvedFile"]
+    if parallel:
+        base += ["-parallel-testing-enabled", parallel]
+    # Compile threads: the build queue's share for this job (codeteam-buildq sets CODETEAM_BUILD_JOBS), so builds
+    # running together do not each take every core.
+    if os.environ.get("CODETEAM_BUILD_JOBS", "").isdigit():
+        base += ["-jobs", os.environ["CODETEAM_BUILD_JOBS"]]
+    if ASAN:
+        base += ["-enableAddressSanitizer", "YES"]
+    env = dict(os.environ)
+    for k, v in os.environ.items():
+        if not k.startswith("TEST_RUNNER_") and k not in SKIP_ENV:
+            env["TEST_RUNNER_" + k] = v
+    # xcodebuild sets OS_ACTIVITY_DT_MODE=YES in test processes, which sends system log
+    # lines to stderr (child processes inherit it), and a test that checks a child's stderr
+    # exactly then fails. swift test leaves it unset; this turns it off the same way.
+    # (OS_ACTIVITY_DT_MODE: the scheme below unsets it; a TEST_RUNNER_ value, even NO or
+    # empty, leaves it set, and turning logging off instead broke a test that counts children.)
+    say(f"xcodebuild test, scheme {scheme}, compile cache {CAS}" + (f", traits {' '.join(conds)}" if conds else ""))
+    if BUILD_ONLY:
+        # --list keeps stdout for the identifiers alone; the build's own output goes to stderr.
+        rc = subprocess.run(base + ["build" if NO_TESTS else "build-for-testing"] + settings, cwd=pkg, env=env,
+                            stdout=sys.stderr if BUILD_ONLY == "list" else None).returncode
+        if rc or BUILD_ONLY != "list":
+            return rc
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "tests.json"
+            subprocess.run(base + ["test-without-building", "-enumerate-tests", "-test-enumeration-style", "flat",
+                                   "-test-enumeration-format", "json", "-test-enumeration-output-path", str(out)]
+                           + settings, cwd=pkg, env=env, capture_output=True)
+            ids = [t["identifier"] for v in json.loads(out.read_text()).get("values", []) for t in v.get("enabledTests", [])]
+        print("\n".join(ids))
+        say(f"{len(ids)} tests")
+        return 0
+    if not filters and not skips:
+        return subprocess.run(base + ["test"] + settings, cwd=pkg, env=env).returncode
+
+    # A filtered run: build, list the tests, match the patterns, run the matches.
+    rc = subprocess.run(base + ["build-for-testing"] + settings, cwd=pkg, env=env).returncode
+    if rc:
+        return rc
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "tests.json"
+        rc = subprocess.run(base + ["test-without-building", "-enumerate-tests", "-test-enumeration-style", "flat",
+                                    "-test-enumeration-format", "json", "-test-enumeration-output-path", str(out)]
+                            + settings, cwd=pkg, env=env, capture_output=True, text=True).returncode
+        try:
+            data = json.loads(out.read_text())
+        except (OSError, ValueError):
+            say(f"could not list the tests (xcodebuild exit {rc})")
+            return rc or 1
+        ids = [t["identifier"] for v in data.get("values", []) for t in v.get("enabledTests", [])]
+
+        def forms(i):   # Target/Suite/test as written, and as swift test names it (Target.Suite/test)
+            parts = i.split("/")
+            return {i, ".".join(parts[:-1]) + "/" + parts[-1] if len(parts) > 1 else i, i.replace("()", "")}
+
+        def hit(i, pats):
+            return any(re.search(p, f) for p in pats for f in forms(i))
+        chosen = [i for i in ids if (not filters or hit(i, filters)) and not (skips and hit(i, skips))]
+        if not chosen:
+            say(f"filter matched none of {len(ids)} tests: " + " ".join(filters + [f'skip:{s}' for s in skips]))
+            return 1
+        only = Path(td) / "only.txt"
+        only.write_text("\n".join(chosen) + "\n")
+        say(f"running {len(chosen)} of {len(ids)} tests")
+        return subprocess.run(base + ["test-without-building", f"-only-testing", f"@{only}"] + settings,
+                              cwd=pkg, env=env).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

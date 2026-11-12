@@ -1,0 +1,3 @@
+{
+  "_doc": "docs/reference files whose name matches no zone, and the zone that owns them (the zone guard lets that lane edit them in docs/reference, docs/_public/reference and docs/internal/reference). Key: the file name up to its first _SPEC/_INTERFACE etc., normalised to capitals and digits. Keys starting with _ are ignored. Example entry: \"INSTALLER\": \"apps/installer\"."
+}

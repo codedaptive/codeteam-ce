@@ -1,0 +1,19 @@
+#!/bin/sh
+# RUSTC_WRAPPER for team sessions (2026-10-23). sccache hashes CARGO_* environment
+# variables, and the Makefile exports a per-worktree CARGO_TARGET_DIR, so no compile
+# ever hit across worktrees (0 hits in 16,000 requests). rustc does not read
+# CARGO_TARGET_DIR (cargo passes --out-dir), so it is dropped here. Named sccache so
+# cc-rs also routes C compiles through it.
+unset CARGO_TARGET_DIR
+# An incremental compile (cargo passes -C incremental=<dir> for the workspace's own crates and path dependencies
+# when CARGO_INCREMENTAL=1) goes straight to rustc: sccache refuses those ("incremental compilation is prohibited",
+# 2026-11-04), and incremental is what makes a small edit cheap. Registry crates still go through sccache.
+for a in "$@"; do
+  case "$a" in
+    incremental=*|-Cincremental=*) exec "$@" ;;
+  esac
+done
+# Everything else (registry crates, probes) is not incremental; sccache refuses any call while CARGO_INCREMENTAL is
+# set, so it is dropped for it.
+unset CARGO_INCREMENTAL
+exec /opt/homebrew/bin/sccache "$@"

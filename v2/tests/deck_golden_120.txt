@@ -1,0 +1,52 @@
+                         CODETEAM DECK · 1 UP · 2 HALTED · 1 LANES WORKING · ▲ 2 ALERTS · 15:00                         
+       ■ orc   ■ designer   ■ guard   ■ lane   ■ crew   ● working   ◐ between turns   ○ idle   ✓ done   ■ blocked       
+                                                                                                                        
+╭─ FLEET · 3 teams ──────────────────────────────────────────────────────────────────── 300G free · loops all beating ─╮
+│ ● alpha                               ■ beta                                ■ gamma                                  │
+│ ▰▰▰▱▱▱ 1/2                            down                                  halted                                   │
+│ ✉2 7/h                                loop off                              ✉3                                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ alpha · 3 sessions ────────────────────────── ● up · loop 5s ─╮ ╭─ Opus 5.5 · Orc-Alpha ──────────── ◐ between 10m ─╮
+│ ▰▰▰▰▰▱▱▱▱▱ 1/2 lanes  ·  ✉ 2  ·  $9.60 today                   │ │ effort ▮▮▮▯▯ high   role orc · alpha              │
+│ 24h ·▂▄▆█·▂▄▆█·▂▄▆█·▂▄▆█·▂▄▆  7/h                              │ │ ctx ▕████▎     ▏ 42% 420k/1.0M  ⟲2                │
+│ ▸◐ Orc-Alpha               10m  ▕██▌   ▏ 42%   $3.20           │ │ $3.20 session   $10.10 seat today                 │
+│  ■ Coord-a                  3m  ▕█████▏▏ 85%   $3.20 blocked   │ │ cache ◆ warm 20m left · hit 90%                   │
+│  ○ Coord-b                  1m  ▕███▋  ▏ 60%   $3.20 typing    │ │ tools read                                        │
+╰────────────────────────────────────────────────────────────────╯ │ turns ?                                           │
+╭─ beta · 1 session ────────────────────────────────────── down ─╮ │ mail ✉ 0 waiting · ↓4 today · oldest –            │
+│ ? 0/? lanes  ·  ✉ ?  ·  $? today                               │ │ flags none                                        │
+│ 24h ?                                                          │ ╰───────────────────────────────────────────────────╯
+│  ? Kong                      ?  ?  ?%      $?                  │                                                      
+╰────────────────────────────────────────────────────────────────╯ ╭─ BUILDS · queue ───────────────────────── 6 jobs ─╮
+╭─ halted ───────────────────────────────────────────────────────╮ │ ██████                                            │
+│ ■ beta       down · loop off never started                     │ │ ■ 3 running   ■ 3 queued                          │
+│ ■ gamma      halted · loop off 2h14m · ✉ 3 waiting             │ │ budget ▕███   ▏ 3/6   swap ▕██▌  ▏ 50%            │
+╰────────────────────────────────────────────────────────────────╯ │ full 1/1  post 0/2  pre 0/2  dev 2/∞              │
+                                                                   │ ● alpha · Coord-a  10:00  run  cost 4.0  f-run    │
+                                                                   │ ● alpha · Coord-c  5:00  run  cost ?  d-run2      │
+                                                                   │ ● alpha · Coord-b  pid gone  1:00  slot  cost 1.0 │
+                                                                   │ #1 alpha · Coord-b  held warm  wait 3m  d-q1      │
+                                                                   │ #2 alpha · Orc-Alpha  wait 1m  start ?  d-q2      │
+                                                                   │ #? alpha · Coord-c  wait 50s  start ?  d-q3       │
+                                                                   │ waits 24h · full · 3 · med 2m · max 10m           │
+                                                                   │ warm held 1m wt2                                  │
+                                                                   ╰───────────────────────────────────────────────────╯
+                                                                   ╭─ log · alpha ──────── ↓9 held 2 queued 2 bcast 1 ─╮
+                                                                   │ 14:59:00 Orc-Alpha   → Coord-a     REQUEST check… │
+                                                                   │ 14:58:00 Stranger    → all         NOTE    a bro… │
+                                                                   │ from Orc-Alpha 5  Coord-a 3                       │
+                                                                   │ to Coord-a 4                                      │
+                                                                   ╰───────────────────────────────────────────────────╯
+                                                                   ╭─ DISK ────────────────────── 300G free · 10m ago ─╮
+                                                                   │ gamma      ▕████████████▏   95.0G                 │
+                                                                   │ alpha      ▕██████████▏ ▏   80.0G                 │
+                                                                   │   wt 40.0G  cargo-target 12.0G                    │
+                                                                   │   wt2 6.0G  target 2.0G                           │
+                                                                   │ beta       not measured yet                       │
+                                                                   │ largest 12.0G cargo-target wt                     │
+                                                                   ╰───────────────────────────────────────────────────╯
+╭─ ALERTS ────────────────────────────────────────────────────────────────────────────────────────────── newest first ─╮
+│ ▲ 14:59 alpha      /t/alpha/wt build output 12.0 GB                                                                  │
+│ ▲ 14:57 alpha      Coord-a blocked for 3 min: a dialog is waiting on its screen, answer it or tell the owner, now    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                          ↑↓ j k move   ⏎ expand   a all agents   t team   d disk now   q quit                          

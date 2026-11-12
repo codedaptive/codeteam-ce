@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Block until a dispatched agent finishes or genuinely stalls.
+
+The point is arithmetic. A coordinator that polls -- one shell command per
+turn, "still running, waiting" -- pays a full context re-read every turn. On
+a 1M-window model that is about 450k cache tokens per poll; one measured
+wait cost 5.8M across 13 turns of doing nothing.
+
+This blocks INSIDE one tool call. One call for the whole wait, one context
+re-read instead of thirteen.
+
+    watch-agent.py <agent-id> [--stall 12] [--max SECONDS]   (default: the Bash limit less a minute)
+
+Exit codes, so the caller can branch without parsing:
+
+    0   DONE     the agent finished normally
+    3   STALLED  no transcript write for --stall minutes AND no build
+                 process running in its worktree
+    4   TIMEOUT  --max reached with the agent still alive and working;
+                 call again, it is not a problem
+
+TIMEOUT exists because the Bash tool has its own ceiling. Set --max just
+under it. A 45-minute gate becomes a handful of calls rather than ninety
+polls, and each TIMEOUT is a turn that says "still working" for the price
+of one re-read.
+
+On STALL it does not guess. Three signals have to agree, because the
+expensive error here is a false stall: a coordinator that believes a live
+agent died dispatches a duplicate onto the same files, and that has
+happened three times in one wave. A quiet agent is almost never a dead one
+-- it is usually thinking or waiting on a build.
+"""
+
+import argparse
+import json
+import re
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+
+# An end_turn is not always the end. An agent that dispatched its own
+# sub-agents or background work ends its turn to wait for them, and the
+# harness wakes it when they return. Measured over 400 real runs: 29
+# contained more than one end_turn, and the parked ones read "Six readers
+# dispatched in parallel. Waiting for returns." / "Five still running;
+# holding for the rest." Returning DONE there hands the caller a unit that
+# is mid-task. This matters more on Opus 5.5, which ends turns on progress
+# reports during long multi-part work.
+PARKED = re.compile(
+    r"(waiting (for|on)\b|holding for|still running|will resume|"
+    r"resum(e|ing) (once|when)|until (it|they|the \w+) (return|finish))",
+    re.I)
+
+# A true final return that still names unfinished work. Advisory only:
+# over 388 real finals this fired 3 times and all three were legitimate
+# stops ("Still open, needs your ruling"), so it annotates DONE rather than
+# failing it. After-completion offers ("let me know if...") are fine and
+# deliberately not matched.
+INCOMPLETE = re.compile(
+    r"(\bnext,? i('| wi)ll\b|\bi('| wi)ll now\b|\bshall i\b|"
+    r"\bnot yet (done|finished|complete)|\bstill (need|to do|open)\b)",
+    re.I)
+
+
+def find_transcript(agent_id):
+    """Newest transcript matching the id. Accepts a full or partial id."""
+    hits = sorted(PROJECTS.glob(f"*/*/subagents/agent-{agent_id}*.jsonl"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    if not hits:
+        hits = sorted(PROJECTS.glob(f"*/*/subagents/*{agent_id}*.jsonl"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    return hits[0] if hits else None
+
+
+def tail_record(path):
+    """Last parseable JSON record, reading only the end of the file."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - 65536))
+            lines = fh.read().decode("utf-8", "ignore").splitlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def finished(rec):
+    """A completed agent's last record carries stop_reason: end_turn."""
+    if not rec:
+        return False
+    m = rec.get("message") or {}
+    return m.get("stop_reason") == "end_turn"
+
+
+def text_of(rec):
+    m = (rec or {}).get("message") or {}
+    return " ".join(b.get("text", "") for b in (m.get("content") or [])
+                    if isinstance(b, dict) and b.get("type") == "text")
+
+
+def handed_back(path):
+    """Finished by handing its report back, not by ending a turn. Claude Code 2.1.307 ends a subagent with a
+    SubagentHandback tool call, so its transcript's last record is that tool's result and no end_turn ever comes
+    (2026-10-29: a reviewer done in 2 minutes was waited on for the full --max). The agent's
+    meta.json beside the transcript says "finished": true once Claude Code has closed it."""
+    meta = path.with_name(path.name[:-len(".jsonl")] + ".meta.json")
+    try:
+        return bool(json.loads(meta.read_text()).get("finished"))
+    except Exception:
+        return False
+
+
+def parked(rec):
+    """end_turn, but waiting on its own dispatched work -- not done."""
+    return finished(rec) and bool(PARKED.search(text_of(rec)[-600:]))
+
+
+def newest_activity(path):
+    """Seconds since the agent OR any of its sibling sub-agents last wrote.
+
+    A parked agent's own transcript is silent while its sub-agents work, so
+    judging liveness on its file alone would call a busy wave stalled.
+    Sub-agent transcripts land in the same subagents/ directory.
+    """
+    try:
+        return min(time.time() - f.stat().st_mtime
+                   for f in path.parent.glob("agent-*.jsonl"))
+    except Exception:
+        return time.time() - path.stat().st_mtime
+
+
+def worktree_of(rec):
+    return (rec or {}).get("cwd") or ""
+
+
+def build_running(cwd):
+    """Is a compiler working for this worktree?
+
+    The signal that matters, because a transcript can be silent for twenty
+    minutes while swift or cargo grinds. Matching on the worktree path keeps
+    a sibling wave's build from counting as this one's.
+    """
+    if not cwd:
+        return False
+    try:
+        out = subprocess.run(["ps", "-axo", "args="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return True          # cannot tell -> assume alive, never false-stall
+    base = os.path.basename(cwd.rstrip("/"))
+    for line in out.splitlines():
+        if base and base in line and any(
+                t in line for t in ("swift-frontend", "swift-build", "swiftc",
+                                    "cargo", "rustc", "make", "xctest",
+                                    "swift-test")):
+            return True
+    return False
+
+
+def default_max():
+    """Seconds --max blocks by default: the session's Bash limit less a minute (codeteam sets 30 minutes since
+    2026-11-02), at least 30; 540 s, under Claude Code's old 10-minute ceiling, when no limit is set (fewer
+    re-waits, and each re-wait is a turn that re-reads the waiting agent's context)."""
+    try:
+        return max(30, int(os.environ["BASH_DEFAULT_TIMEOUT_MS"]) // 1000 - 60)
+    except (KeyError, ValueError):
+        return 540
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("agent_id")
+    ap.add_argument("--stall", type=int, default=12,
+                    help="minutes of transcript silence before considering a stall")
+    ap.add_argument("--max", type=int, default=default_max(),
+                    help="seconds to block before returning TIMEOUT (default: the Bash "
+                         "limit less a minute, else 540)")
+    ap.add_argument("--interval", type=int, default=20)
+    a = ap.parse_args()
+
+    t = find_transcript(a.agent_id)
+    if not t:
+        print(f"UNKNOWN: no transcript for {a.agent_id}. It may not have "
+              f"started yet — do not treat this as a stall.")
+        sys.exit(4)
+
+    started = time.time()
+    while True:
+        rec = tail_record(t)
+        if (finished(rec) and not parked(rec)) or handed_back(t):
+            mins = (time.time() - started) / 60
+            note = ""
+            if INCOMPLETE.search(text_of(rec)[-600:]):
+                note = ("\nNOTE: its final message names open work. Read it "
+                        "before merging -- it may be a ruling request, or a unit "
+                        "that returned before finishing.")
+            print(f"DONE: {t.name} finished (waited {mins:.1f} min). "
+                  f"Read its return and continue.{note}")
+            sys.exit(0)
+
+        # Parked or still working. Judge liveness on the agent AND its
+        # sub-agents, since a parked agent is silent while its children run.
+        idle = newest_activity(t) / 60
+        if idle >= a.stall:
+            cwd = worktree_of(rec)
+            if build_running(cwd):
+                # Silent but compiling. This is the case that produced three
+                # false death calls in one wave.
+                pass
+            else:
+                print(f"STALLED: {t.name} — no transcript write for "
+                      f"{idle:.0f} min and no build process in {cwd or '?'}.\n"
+                      f"Before acting: check whether it already committed "
+                      f"(`git -C {cwd or '<worktree>'} log --oneline -3`), "
+                      f"because a finished agent looks the same from here.\n"
+                      f"Do NOT dispatch onto the same files — report it.")
+                sys.exit(3)
+
+        if time.time() - started >= a.max:
+            print(f"TIMEOUT: still working — last write {idle:.1f} min ago"
+                  f"{', build running' if build_running(worktree_of(rec)) else ''}"
+                  f". Not a problem; call again to keep waiting.")
+            sys.exit(4)
+
+        time.sleep(a.interval)
+
+
+if __name__ == "__main__":   # importable, so tests/wait-defaults.sh can read default_max()
+    main()

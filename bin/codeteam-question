@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""codeteam-question: the one way a question for the owner enters or leaves a team's questions.md.
+
+  codeteam-question MANIFEST ask --id ID --problem TEXT --option TEXT --option TEXT [--option TEXT ...] --pick TEXT
+                                 [--detail PATH]
+  codeteam-question MANIFEST answered ID "the owner's answer"
+  codeteam-question MANIFEST withdraw ID --reason TEXT
+  codeteam-question MANIFEST list
+  codeteam-question MANIFEST check
+
+The rule: the status bar must always show exactly the number of questions the owner owes answers for.
+The status bar (codeteam-statusline) counts the lines this tool writes and nothing else. A question is a problem, at
+least two options and the asker's pick, one line, short. A notice, a report, a thing that waits on something else, and
+a question already answered are not questions: they do not go in, and `answered` or `withdraw` takes a line out the
+moment it stops being one (it is kept in questions-closed.md beside the file, so nothing is lost).
+Who may write: the team's designers; the orchestrator in a team with no designer; a person at a terminal.
+Exit codes: 0 done; 1 check found lines that are not questions; 2 refused.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import os
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+FORM = re.compile(r"^- ([A-Za-z0-9._-]+) \| ")
+LIMITS = {"problem": 400, "option": 200, "pick": 200}
+
+
+def die(msg):
+    print(f"codeteam-question: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def one_line(text, what):
+    t = " ".join(str(text).split())
+    if not t:
+        die(f"{what} is empty")
+    if "|" in t:
+        die(f"{what} must not contain '|'")
+    if len(t) > LIMITS[what]:
+        die(f"{what} is {len(t)} characters; the limit is {LIMITS[what]}. Put the detail in a report and name it with --detail")
+    return t
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="codeteam-question", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("manifest")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("ask")
+    p.add_argument("--id", required=True); p.add_argument("--problem", required=True)
+    p.add_argument("--option", action="append", default=[]); p.add_argument("--pick", required=True)
+    p.add_argument("--detail")
+    p = sub.add_parser("answered"); p.add_argument("id"); p.add_argument("answer")
+    p = sub.add_parser("withdraw"); p.add_argument("id"); p.add_argument("--reason", required=True)
+    sub.add_parser("list"); sub.add_parser("check")
+    a = ap.parse_args(argv)
+    mpath = Path(a.manifest)
+    if not mpath.exists() and not mpath.suffix:
+        mpath = Path(__file__).resolve().parents[1] / "teams" / f"{a.manifest}.toml"
+    m = tomllib.loads(mpath.read_text())
+    root = Path(os.path.expanduser(m.get("worktree_root") or str(Path(os.environ.get("CODETEAM_WORKSPACE") or Path.home() / "codeteam-work") / f"team-{mpath.stem}")))
+    qf, closed = root / "team" / "questions.md", root / "team" / "questions-closed.md"
+    me = os.environ.get("CODETEAM_SESSION", "")
+    designers = [x.get("name") for x in m.get("assistants", []) if x.get("role") == "designer"]
+    lines = qf.read_text().splitlines() if qf.exists() else ["# Open questions for the user", ""]
+    entries = [(i, FORM.match(l).group(1)) for i, l in enumerate(lines) if FORM.match(l)]
+    other = [l for l in lines if l.startswith("- ") and not FORM.match(l)]
+    if a.cmd == "list":
+        for i, _ in entries:
+            print(lines[i])
+        print(f"{len(entries)} open question{'s' if len(entries) != 1 else ''} for the user"
+              + (f"; {len(other)} other line(s) not in question form (codeteam-question {a.manifest} check)" if other else ""))
+        return 0
+    if a.cmd == "check":
+        for l in other:
+            print(f"not a question in form: {l[:160]}")
+        print(f"{len(entries)} in form, {len(other)} not")
+        return 1 if other else 0
+    if me and me not in designers and not (not designers and me in ("orc", m.get("orc_name", ""))) and me != "codeteam":
+        die(f"{me} does not keep the questions file; send the question to {' or '.join(designers) or 'the orchestrator'}")
+    qf.parent.mkdir(parents=True, exist_ok=True)
+    with open(qf.with_suffix(".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        lines = qf.read_text().splitlines() if qf.exists() else ["# Open questions for the user", ""]
+        ids = {FORM.match(l).group(1): i for i, l in enumerate(lines) if FORM.match(l)}
+        today = dt.date.today().isoformat()
+        if a.cmd == "ask":
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", a.id):
+                die("the id is letters, digits, '.', '_' and '-' only")
+            if a.id in ids or (closed.exists() and re.search(rf"^- {re.escape(a.id)} \| ", closed.read_text(), re.M)):
+                die(f"{a.id} is already used")
+            if len(a.option) < 2:
+                die("a question gives at least two options (--option twice or more)")
+            prob = one_line(a.problem, "problem")
+            if not prob.endswith("?"):
+                die("the problem ends with the question itself, and a question mark")
+            opts = "; ".join(f"({chr(97 + n)}) {one_line(o, 'option')}" for n, o in enumerate(a.option))
+            line = f"- {a.id} | {today} {me or os.environ.get('CODETEAM_OWNER') or 'Owner'} | {prob} | Options: {opts} | Recommend: {one_line(a.pick, 'pick')}"
+            if a.detail:
+                line += f" | Detail: {' '.join(a.detail.split())}"
+            lines.append(line)
+            print(f"{a.id}: asked; the status bar now shows {len(ids) + 1}")
+        else:
+            if a.id not in ids:
+                die(f"no open question {a.id}")
+            line = lines.pop(ids[a.id])
+            how = f"answered: {' '.join(a.answer.split())}" if a.cmd == "answered" else f"withdrawn: {' '.join(a.reason.split())}"
+            with open(closed, "a") as f:
+                f.write(f"{line} | {today} {how}\n")
+            print(f"{a.id}: {a.cmd}; the status bar now shows {len(ids) - 1}")
+        tmp = qf.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines).rstrip("\n") + "\n")
+        os.replace(tmp, qf)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

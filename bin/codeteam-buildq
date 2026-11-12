@@ -1,0 +1,734 @@
+#!/usr/bin/env python3
+"""codeteam-buildq: the build queue's runner (zone/docs/build-queue.md).
+
+One runner per queue folder (Q, default <codeteam>/run/queue). It decides which queued job file starts, starts
+`zone-tool test` for run jobs as detached children, marks slot jobs (codeteam-slot's builds) running so their
+waiting process execs its tool, and settles every job from the files alone, so it can die and come back at any
+time. Every read-modify-write of a job file holds flock(Q/.lock) and replaces the file atomically; the deck and the
+clients read only Q/*.json, so everything else in Q is a dot-file. A run job carries the submitter's environment
+(`env`) for its whole life, and the runner hands it to the child it starts. The runner's heartbeat is
+Q/../queue-runner.json. A decision lists and reads Q once.
+
+  codeteam-buildq [--once | --standby]
+    --once     one decision, then exit.
+    --standby  wait for the runner lock instead of exiting when another runner holds it (launchd's copy).
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import math
+import os
+import re
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    # tomllib needs Python 3.11+, and the system python3 is 3.9. Re-run under the first 3.11+
+    # found, before the runner lock is taken (the lock belongs to the process that keeps running).
+    import shutil as _sh
+    import subprocess
+    for _cand in (os.environ.get("CODETEAM_PYTHON") or "python3", "python3.14", "python3.13", "python3.12", "python3.11",
+                  "/usr/local/bin/python3"):
+        _exe = _sh.which(_cand) or (_cand if Path(_cand).is_file() else None)
+        if _exe and os.path.realpath(_exe) != os.path.realpath(sys.executable):
+            _ok = subprocess.run([_exe, "-c", "import sys; sys.exit(sys.version_info < (3, 11))"]).returncode == 0
+            if _ok:
+                os.execv(_exe, [_exe, __file__, *sys.argv[1:]])
+    sys.exit("codeteam-buildq needs Python 3.11+, and none was found")
+
+import tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "share"))
+import codeteam_hang
+
+# "land": the landing gate's tests (codeteam-land, spec v5 §4): offered a start before every other class, with a
+# guaranteed share; leads' own runs wait behind it.
+CLASSES = ("land", "full", "post", "pre", "dev")  # start order: a class earlier here is offered a start first
+SHARES = {"land": (2, 0), "full": (1, 1), "post": (1, 2), "pre": (1, 2), "dev": (1, 0)}   # (guaranteed, ceiling); 0 = none
+DEFAULT_BUDGET = 6
+# Scheduling priority by class (nice): the gate first, leads' own builds last (2026-11-09).
+CLASS_NICE = {"land": 0, "full": 2, "post": 5, "pre": 5, "dev": 10}
+# A hung run job gets SIGKILL this many seconds after TERM, on a later decision; the runner never sleeps for it.
+KILL_AFTER = 10
+# What `zone-tool test --cached/--single` prints when it answers from an existing record instead of running (an exact
+# hit, or a hit that restamped the record). It is zone-tool's first non-wait line after any leading --single wait
+# lines; the same words after any other output are the test's own (a crashed run that printed them, or a nested
+# `zone-tool job submit --cached`), and prove nothing about this job.
+ANSWERED = re.compile(r"zone-test: (PASS|FAIL|TIMEOUT) at \d\d:\d\d already recorded")
+SINGLE_WAIT = "zone-test: a run is already going in this worktree; waiting for its result"
+LINE_BYTES = 512
+
+
+def median(values) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def num(value, default: float) -> float:
+    """A config or flag value as a finite number; anything else (a non-numeric string, a table, nan, inf, an integer
+    too big for a float) is the default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def output(*cmd: str) -> str:
+    """A command's stdout. subprocess is imported here and in the start path, not at the top: it is the slowest
+    import, and a runner's first decision (is the job it adopted still alive?) needs none of it."""
+    import subprocess
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def ps_command(pid: int) -> str:
+    return output("ps", "-ww", "-o", "command=", "-p", str(pid)).strip()
+
+
+def kill_tree(pid: int, sig: int) -> None:
+    """Signals a job's process and everything below it, children first, never the runner. A build the runner
+    is stopping may be the very process that once started it, so the walk skips the runner and its ancestors and
+    does not descend through the runner. The job's own pid is signaled even when it is such an ancestor: it is the
+    process being stopped, and a signal to a parent does not reach its children."""
+    me = os.getpid()
+    if pid == me:
+        return
+    parent_of = {}
+    for line in output("ps", "-A", "-o", "pid=,ppid=").splitlines():
+        child, parent = line.split()
+        parent_of[int(child)] = int(parent)
+    ancestors, p = set(), me
+    while parent_of.get(p, 0) > 0 and parent_of[p] not in ancestors:
+        p = parent_of[p]
+        ancestors.add(p)
+    kids: dict[int, list[int]] = {}
+    for child, parent in parent_of.items():
+        kids.setdefault(parent, []).append(child)
+    below, stack = [], [pid]
+    while stack:
+        for child in kids.get(stack.pop(), []):
+            if child != me:
+                stack.append(child)
+                if child not in ancestors:
+                    below.append(child)
+    for target in [*reversed(below), pid]:
+        try:
+            os.kill(target, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def atomic_write(path: Path, obj, mode: int) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def warm_held(path) -> bool:
+    """True while another process holds flock on the worktree's warm lock: its warm is still running."""
+    if not path:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)                                      # closing releases a lock this probe just took
+    return False
+
+
+def hkey(job: dict) -> str:
+    return job["key"] or "suite " + " ".join(job["command"])
+
+
+def record_mtime(path) -> float | None:
+    try:
+        return os.stat(path).st_mtime
+    except (OSError, TypeError):
+        return None
+
+
+_PORTS: dict = {}  # Cache only Cargo.toml/Package.swift walk results; recheck misses as folders and packages can appear.
+
+
+def job_port(j: dict) -> str | None:
+    """Return the port for a zone-test-one job (key "one <DIR> ..."), or None for other jobs.
+
+    A DIR containing "/rust" is rust; otherwise a missing worktree or DIR falls back to swift. For an existing DIR,
+    walk up to the worktree root for Cargo.toml or Package.swift; return rust or swift for the first found, else None.
+    Jobs with the same port in the same worktree wait for each other to avoid sharing a build database or target folder.
+    """
+    key = j.get("key") or ""
+    if not key.startswith("one "):
+        return None
+    d = key.split()[1] if len(key.split()) > 1 else ""
+    if "/rust" in d:
+        return "rust"
+    wt = j.get("worktree")
+    if not wt:
+        return "swift"
+    at = (wt, d)
+    if at not in _PORTS:
+        root = Path(wt)
+        p = root / d
+        port = "swift" if not p.exists() else None      # a DIR that is not there: the old answer
+        while p.exists() and port is None:
+            if (p / "Cargo.toml").exists():
+                port = "rust"
+                _PORTS[at] = port
+            elif (p / "Package.swift").exists():
+                port = "swift"
+                _PORTS[at] = port
+            if p == root or root not in p.parents:
+                break
+            p = p.parent
+        return port
+    return _PORTS[at]
+
+
+def round_robin(queued: list[dict], last_start: dict) -> list[dict]:
+    """The queued jobs of one class in start order: each pick is the oldest job of the team whose last start in the
+    class is least recent (a team with none is least recent; ties go to the team with the oldest submission), and
+    counts as that team's newest start for the picks after it."""
+    pending: dict = {}
+    for job in sorted(queued, key=lambda j: j["submitted"]):
+        pending.setdefault(job.get("team"), []).append(job)
+    last = dict(last_start)
+    virtual = max(last.values(), default=0)
+    order = []
+    while pending:
+        team = min(pending, key=lambda t: (last.get(t, -math.inf), pending[t][0]["submitted"]))
+        order.append(pending[team].pop(0))
+        if not pending[team]:
+            del pending[team]
+        virtual += 1
+        last[team] = virtual
+    return order
+
+
+@dataclass
+class Config:
+    budget: float
+    swap_max: float
+    retention_hours: float
+    slot_cost: float
+    shares: dict
+    land_jobs: float = 6
+
+
+def load_config(path: Path) -> Config:
+    """queue.toml, each key on its own: a missing file, bad TOML, or a value of the wrong type gives that key its
+    default, so a typo in the config never stops the queue."""
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    table = data.get("classes") if isinstance(data.get("classes"), dict) else {}
+    entries = {name: table.get(name) if isinstance(table.get(name), dict) else {} for name in SHARES}
+    shares = {name: (int(num(entries[name].get("guaranteed"), guaranteed)),
+                     int(num(entries[name].get("ceiling"), ceiling)))
+              for name, (guaranteed, ceiling) in SHARES.items()}
+    return Config(budget=num(data.get("budget"), num(os.environ.get("CODETEAM_BUILD_BUDGET"), DEFAULT_BUDGET)),
+                  swap_max=num(data.get("swap_max"), 0.9),
+                  retention_hours=num(data.get("retention_hours"), 24),
+                  slot_cost=num(data.get("slot_cost"), 1),
+                  shares=shares,
+                  land_jobs=num(data.get("land_jobs"), 6))
+
+
+UNITS = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+
+
+def swap_fraction() -> float:
+    """How much of memory is in real use, 0 to 1: 1 less macOS's free percentage (kern.memorystatus_level), which counts
+    file cache and other memory the system takes back at once as free. Swap used is no signal (the
+    guard once held dev at 90% swap used while 90% of RAM was free, mostly cached files; swap stays allocated after the
+    pressure is gone). The name stays for the queue file and the deck."""
+    try:
+        level = float(output("/usr/sbin/sysctl", "-n", "kern.memorystatus_level").strip())
+    except (OSError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, 1 - level / 100))
+
+
+def read_swap() -> float:
+    """The swap used fraction. CODETEAM_BUILDQ_LOAD_FILE stands in for the machine: its second whitespace-separated
+    word is the fraction, 0.0 when absent; its first word is ignored. An unreadable file or a fraction that is not a
+    number falls back to swap_fraction()."""
+    path = os.environ.get("CODETEAM_BUILDQ_LOAD_FILE")
+    if path:
+        try:
+            words = Path(path).read_text().split()
+            return float(words[1]) if len(words) > 1 else 0.0
+        except (OSError, ValueError):
+            pass
+    return swap_fraction()
+
+
+@dataclass
+class Guard:
+    swap: float
+    swap_max: float
+
+    @property
+    def swap_hold(self) -> bool:
+        return self.swap > self.swap_max
+
+    def hold(self, cls: str) -> str | None:
+        """Why a class may start nothing at all: swap stops dev."""
+        return "swap" if cls == "dev" and self.swap_hold else None
+
+
+REQUIRED = ("ticket", "kind", "class", "state", "key", "command", "submitted")
+
+
+def well_formed(job, name: str) -> bool:
+    """Whether a job file has what the runner reads with an index: the common keys, and the ones a start needs. A
+    run job needs `env` (the submitter's environment), `tool` and `record` in every state: its file keeps all three."""
+    if not isinstance(job, dict) or any(k not in job for k in REQUIRED):
+        return False
+    needs = ("tool", "env", "record") if job["kind"] == "run" else ("tool",)
+    return (job["ticket"] == name and isinstance(job["command"], list) and isinstance(job["key"], str)
+            and isinstance(job["submitted"], (int, float)) and all(k in job for k in needs))
+
+
+class Queue:
+    """The job files in Q. Readers skip dot-files (locks, temporary files); writers hold Q/.lock."""
+
+    def __init__(self, q: Path):
+        self.q = q
+
+    def read(self, ticket: str):
+        return read_json(self.q / f"{ticket}.json")
+
+    def all(self) -> list[dict]:
+        """Every well-formed job; a file that is not JSON, or lacks a key the runner indexes, is skipped."""
+        names = sorted(n for n in os.listdir(self.q) if n.endswith(".json") and not n.startswith("."))
+        jobs = ((n[:-len(".json")], self.read(n[:-len(".json")])) for n in names)
+        return [job for name, job in jobs if well_formed(job, name)]
+
+    def update(self, ticket: str, change: dict, expect: str | None = None) -> dict | None:
+        """Read the job fresh, apply change, write it, all under Q/.lock; None when the job is gone or no longer in
+        state `expect`."""
+        fd = os.open(self.q / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            job = self.read(ticket)
+            if job is None or (expect and job.get("state") != expect):
+                return None
+            job.update(change)
+            atomic_write(self.q / f"{ticket}.json", job, 0o600)
+            return job
+        finally:
+            os.close(fd)
+
+
+class History:
+    """Q/../queue-history.jsonl, read at most once after each change."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.rows: dict[str, list[dict]] | None = None
+
+    def recent(self, key: str) -> list[dict]:
+        if self.rows is None:
+            self.rows = {}
+            try:
+                lines = self.path.read_text().splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                    float(row["cpu_seconds"]), float(row["wall_seconds"])
+                    self.rows.setdefault(row["hkey"], []).append(row)
+                except (ValueError, KeyError, TypeError):
+                    continue
+        return self.rows.get(key, [])[-5:]
+
+    def median_wall(self, key: str) -> float | None:
+        rows = self.recent(key)
+        return median(max(r["wall_seconds"], 1) for r in rows) if rows else None
+
+    def append(self, job: dict, record: dict, now: float) -> None:
+        cpu, wall = record.get("cpu_seconds"), record.get("seconds")
+        if not isinstance(cpu, (int, float)) or not isinstance(wall, (int, float)):
+            return
+        row = {"hkey": hkey(job), "class": job["class"], "cpu_seconds": cpu, "wall_seconds": wall, "finished": now}
+        with open(self.path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+        self.rows = None
+
+
+class Runner:
+    def __init__(self, q: Path, conf: Path):
+        self.q = q
+        self.queue = Queue(q)
+        self.conf = conf
+        self.history = History(q.parent / "queue-history.jsonl")
+        self.children: dict[str, subprocess.Popen] = {}
+        self.jobs: dict[str, dict] = {}
+        self.watches: dict[str, codeteam_hang.HangWatch] = {}
+        self.log_sizes: dict[str, int] = {}
+
+    def tick(self) -> bool:
+        """One decision: prune, settle, start, forecast, heartbeat. True while any job is queued or running.
+        Q is listed and read once, into `self.jobs`; every write below updates that snapshot in place, so a decision
+        costs one read of each job file however many phases it has. A job submitted meanwhile waits one tick."""
+        cfg = load_config(self.conf)
+        self.history = History(self.q.parent / "queue-history.jsonl")
+        self.jobs = {job["ticket"]: job for job in self.queue.all()}
+        self.prune(cfg)
+        self.reconcile()
+        guard = Guard(read_swap(), cfg.swap_max)
+        self.price_queued(cfg)
+        self.start_jobs(cfg, guard)
+        self.refresh_queued(cfg, guard)
+        jobs = list(self.jobs.values())
+        self.write_heartbeat(cfg, guard, jobs)
+        return any(j.get("state") in ("queued", "running") for j in jobs)
+
+    def write(self, ticket: str, change: dict, expect: str | None = None) -> dict | None:
+        """One locked write of a job file, then the snapshot follows it. When the write finds the job gone or no
+        longer in `expect` (a submitter changed it), the file is read again and the snapshot takes what is there, or
+        forgets the ticket, so the loop that asked never sees the stale entry again. The written job, or None."""
+        written = self.queue.update(ticket, change, expect)
+        current = written or self.queue.read(ticket)
+        if well_formed(current, ticket):
+            self.jobs[ticket] = current
+        else:
+            self.jobs.pop(ticket, None)
+        return written
+
+    # prune and reconcile
+
+    def prune(self, cfg: Config) -> None:
+        cutoff = time.time() - cfg.retention_hours * 3600
+        for job in list(self.jobs.values()):
+            if job.get("state") in ("done", "broken") and (job.get("finished") or math.inf) < cutoff:
+                for ext in ("json", "log"):
+                    (self.q / f"{job['ticket']}.{ext}").unlink(missing_ok=True)
+                del self.jobs[job["ticket"]]
+
+    def settle(self, job: dict, state: str, **fields) -> None:
+        """Moves a job out of queued or running; its job file keeps its env."""
+        self.write(job["ticket"], {"state": state, "finished": time.time(), "position": None, "hold": None, **fields})
+        self.watches.pop(job["ticket"], None)
+        self.log_sizes.pop(job["ticket"], None)
+
+    def reconcile(self) -> None:
+        table = {}
+        if any(j.get("state") == "running" and j.get("kind") == "run" for j in self.jobs.values()):
+            # An empty table preserves a failed listing as unknown without retrying ps for each job.
+            table = codeteam_hang._process_table() or {}
+        for job in list(self.jobs.values()):
+            state, slot = job.get("state"), job.get("kind") == "slot"
+            if state == "queued" and slot and not alive(job.get("pid")):
+                self.settle(job, "broken", reason="submitter gone before start")
+            elif state == "running" and slot:
+                self.reconcile_slot(job)
+            elif state == "running":
+                self.reconcile_run(job, table)
+
+    def reconcile_run(self, job: dict, table: dict[int, tuple[int, float]]) -> None:
+        pid, child = job.get("pid"), self.children.get(job["ticket"])
+        if pid is None:
+            return self.settle(job, "broken", reason="the runner stopped before it started this job")
+        if child is not None:
+            rc = child.poll()
+            if rc is not None:
+                del self.children[job["ticket"]]
+                return self.finish_run(job, rc)
+        elif not alive(pid):
+            return self.finish_run(job, None)
+        self.enforce_hang(job, time.monotonic(), codeteam_hang.tree_cpu(pid, table, exclude=(os.getpid(),)))
+
+    def answered(self, job: dict) -> bool:
+        """Whether `zone-test` answered this job from an existing record instead of running. The job's log says so in
+        its first non-wait line after any leading --single wait lines; nothing later counts."""
+        try:
+            with open(self.q / f"{job['ticket']}.log", errors="replace") as log:
+                line = log.readline(LINE_BYTES)
+                while line.rstrip("\n") == SINGLE_WAIT:
+                    line = log.readline(LINE_BYTES)
+        except OSError:
+            return False
+        return ANSWERED.match(line) is not None
+
+    def finish_run(self, job: dict, rc: int | None) -> None:
+        """A run job's process is over (rc is its exit code when the runner started it, None when it adopted it).
+        Done needs a record this run wrote: one newer than `record_mtime`, whose result and exit are the job's and
+        which the history learns from. A process that left no fresh record is broken, whatever its exit code. The one
+        exception is a job `zone-test` answered from an existing record (it is older, or restamped): done with that
+        record's result, flagged `answered`, and no history line, since nothing ran. A job stopped by the hang
+        backstop is broken with its hung reason, even if a record exists."""
+        if job.get("stopped") is not None:
+            return self.settle(job, "broken", reason=job["reason"])
+        record = read_json(Path(job["record"])) if job.get("record") else None
+        if isinstance(record, dict) and record.get("result") in ("PASS", "FAIL") and self.answered(job):
+            return self.settle(job, "done", exit=record.get("exit", rc), result=record["result"], answered=True)
+        mtime = record_mtime(job.get("record"))
+        if not isinstance(record, dict) or mtime is None or mtime <= (job.get("record_mtime") or -math.inf):
+            return self.settle(job, "broken", reason="process gone without a fresh record")
+        self.history.append(job, record, time.time())
+        self.settle(job, "done", exit=record.get("exit", rc), result=record.get("result"))
+
+    def reconcile_slot(self, job: dict) -> None:
+        pid = job.get("pid")
+        if not alive(pid) or job["tool"] not in ps_command(pid):
+            return self.settle(job, "done", exit=None)
+
+    def enforce_hang(self, job: dict, now: float, cpu: dict[int, float] | None) -> None:
+        """Backstop run jobs only: slot output belongs to the caller and cannot prove silence."""
+        if job.get("kind") != "run":
+            return
+        # The watch and stopped use monotonic seconds; submitted/started/finished remain epoch seconds.
+        if job.get("stopped") is not None:
+            if now - job["stopped"] >= KILL_AFTER:
+                kill_tree(job["pid"], 9)
+            return
+        ticket = job["ticket"]
+        if ticket not in self.watches:
+            window, cpu_pct = codeteam_hang.settings(job.get("env") or {})
+            # Give zone-tool's watchdog the first chance to stop the tree and write its HUNG record.
+            self.watches[ticket] = codeteam_hang.HangWatch(2 * window, cpu_pct, now)
+        watch = self.watches[ticket]
+        try:
+            size = (self.q / f"{ticket}.log").stat().st_size
+        except OSError:
+            size = self.log_sizes.get(ticket, 0)
+        if size > self.log_sizes.get(ticket, 0):
+            watch.output(now)
+        self.log_sizes[ticket] = size
+        watch.sample(now, cpu)
+        if reason := watch.hung(now):
+            kill_tree(job["pid"], 15)
+            self.write(ticket, {"stopped": now, "reason": reason})
+
+    # cost, order, start
+
+    def cost_of(self, job: dict, cfg: Config) -> float:
+        if job.get("kind") == "slot":
+            return cfg.slot_cost
+        rows = self.history.recent(hkey(job))
+        if not rows:
+            return 4 if job["class"] in ("full", "land") else 1
+        ratio = median(r["cpu_seconds"] / max(r["wall_seconds"], 1) for r in rows)
+        return max(1, min(cfg.budget, ratio))
+
+    def price_queued(self, cfg: Config) -> None:
+        for job in list(self.jobs.values()):
+            if job.get("state") == "queued" and job.get("cost") is None:
+                self.write(job["ticket"], {"cost": self.cost_of(job, cfg)}, expect="queued")
+
+    @staticmethod
+    def class_order(cls: str, jobs: list[dict]) -> list[dict]:
+        last: dict = {}
+        for j in jobs:
+            if j.get("class") == cls and j.get("started") is not None:
+                last[j.get("team")] = max(last.get(j.get("team"), 0), j["started"])
+        return round_robin([j for j in jobs if j.get("class") == cls and j.get("state") == "queued"], last)
+
+    def head(self, cls: str, jobs: list[dict], guard: Guard) -> dict | None:
+        """The class's next job: first in order that has a cost (a job submitted since this decision priced the queue
+        waits for the next one) and whose worktree is not still being warmed."""
+        if guard.hold(cls):
+            return None
+        order = self.class_order(cls, jobs)
+        # One build at a time per worktree and port (2026-11-04: one product submitted 16 Swift groups at once,
+        # they started together in one worktree, and xcodebuild failed on its locked build database). A queued job
+        # waits while a job for the same worktree and port runs; jobs in other worktrees or the other port go ahead.
+        busy = {(j.get("worktree"), job_port(j)) for j in jobs
+                if j.get("state") == "running" and job_port(j)}
+        return next((j for j in order if j.get("cost") is not None and not warm_held(j.get("warm_lock"))
+                     and (not job_port(j) or (j.get("worktree"), job_port(j)) not in busy)), None)
+
+    def next_job(self, cfg: Config, guard: Guard) -> dict | None:
+        jobs = list(self.jobs.values())
+        running = [j for j in jobs if j.get("state") == "running"]
+        used = sum(j.get("cost") or 0 for j in running)
+        count = Counter(j.get("class") for j in running)
+        heads = {cls: self.head(cls, jobs, guard) for cls in CLASSES}
+        for cls in CLASSES:
+            job = heads[cls]
+            if job is None:
+                continue
+            guaranteed, ceiling = cfg.shares[cls]
+            if count[cls] < guaranteed:
+                return job
+            # A class under its guaranteed share that has a startable job waiting keeps the room its next job needs.
+            reserved = sum(h["cost"] for o, h in heads.items() if o != cls and h and count[o] < cfg.shares[o][0])
+            if (used + job["cost"] + reserved <= cfg.budget
+                    and (ceiling == 0 or count[cls] < ceiling)):
+                return job
+        return None
+
+    def start_jobs(self, cfg: Config, guard: Guard) -> None:
+        while (job := self.next_job(cfg, guard)) is not None:
+            self.start(job)
+
+    def start(self, job: dict) -> None:
+        """Marks a queued job running (its job file keeps its env), and for a run job starts `zone-tool test` with
+        that env."""
+        ticket, now = job["ticket"], time.time()
+        marked = {"state": "running", "started": now, "position": None, "hold": None}
+        if job.get("kind") == "slot":
+            self.write(ticket, marked, expect="queued")               # the waiting codeteam-slot execs its tool
+            return
+        marked |= {"pid": None, "record_mtime": record_mtime(job.get("record"))}
+        if self.write(ticket, marked, expect="queued") is None:
+            return                                                    # a submitter took the job (fallback)
+        import subprocess
+        try:
+            proc = self.spawn(job)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.settle(job, "broken", reason=f"could not start: {e}")
+            return
+        self.children[ticket] = proc
+        self.write(ticket, {"pid": proc.pid})
+
+    def spawn(self, job: dict) -> subprocess.Popen:
+        flags = list(job.get("test_flags") or [])
+        env = {**job["env"], "CODETEAM_SLOT_HELD": "1", "CODETEAM_BUILDQ_TICKET": job["ticket"]}
+        # The job's share of the machine as compile threads: one build started one thread per core,
+        # and a few at once ran the load to 150-200 on 18 cores. Its cost units out of the budget, times the cores.
+        cfg = load_config(self.conf)
+        budget = max(1.0, float(cfg.budget))
+        jobs = max(2, math.ceil(float(job.get("cost") or 1) * (os.cpu_count() or 8) / budget))
+        # The landing gate's tests are what every team waits on (a gate once ran two hours at two
+        # compile threads a build and timed out): a land job gets at least land_jobs threads, and runs at normal
+        # priority while leads' own builds yield the CPU to it.
+        if job.get("class") == "land":
+            jobs = max(jobs, int(cfg.land_jobs))
+        env["CODETEAM_BUILD_JOBS"] = str(jobs)
+        # never below the runner's own: a process that is not root cannot lower its nice
+        nice = max(CLASS_NICE.get(job.get("class"), 5), os.getpriority(os.PRIO_PROCESS, 0))
+        import subprocess
+        log = os.open(self.q / f"{job['ticket']}.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            return subprocess.Popen([job["tool"], "test", *flags, "--", *job["command"]], cwd=job.get("worktree"),
+                                    env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True, preexec_fn=lambda: os.setpriority(os.PRIO_PROCESS, 0, nice))
+        finally:
+            os.close(log)
+
+    # forecast and heartbeat
+
+    @staticmethod
+    def hold_of(job: dict, guard: Guard) -> str | None:
+        """Why a queued job is not starting for a reason a reader should see: its worktree's warm is running, or
+        the swap guard holds its class."""
+        if warm_held(job.get("warm_lock")):
+            return "warm"
+        return guard.hold(job["class"])
+
+    def refresh_queued(self, cfg: Config, guard: Guard) -> None:
+        """Writes each queued job's place in its class, estimated start and hold: the n-th queued job in start
+        order gets the n-th predicted finish among the running jobs with history. A job that left the queue has
+        none of them."""
+        jobs = list(self.jobs.values())
+        finishes = sorted(j["started"] + wall for j in jobs if j.get("state") == "running" and j.get("started")
+                          and (wall := self.history.median_wall(hkey(j))) is not None)
+        n = 0
+        for cls in CLASSES:
+            for place, job in enumerate(self.class_order(cls, jobs), 1):
+                forecast = {"position": place, "estimated_start": finishes[n] if n < len(finishes) else None,
+                            "hold": self.hold_of(job, guard)}
+                n += 1
+                if any(job.get(k) != v for k, v in forecast.items()):
+                    self.write(job["ticket"], forecast, expect="queued")
+        for job in jobs:
+            if job.get("state") != "queued" and (job.get("position") is not None or job.get("hold") is not None):
+                self.write(job["ticket"], {"position": None, "hold": None})
+
+    def write_heartbeat(self, cfg: Config, guard: Guard, jobs: list[dict]) -> None:
+        used = sum(j.get("cost") or 0 for j in jobs if j.get("state") == "running")
+        beat = {"pid": os.getpid(), "beat": time.time(), "budget": cfg.budget, "used": used,
+                "swap": guard.swap, "swap_max": guard.swap_max, "swap_hold": guard.swap_hold}
+        atomic_write(self.q.parent / "queue-runner.json", beat, 0o644)
+
+
+def take_runner_lock(q: Path, wait: bool) -> int | None:
+    """The fd holding flock on Q/.runner.lock for the runner's whole life, or None when another runner has it."""
+    fd = os.open(q / ".runner.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    # Clients (zone-tool, codeteam-slot) probe this lock with a brief LOCK_NB to see whether a runner is alive. A
+    # runner starting during such a probe would see the lock held and exit, leaving none; a real runner holds it for
+    # its whole life, so retrying for half a second tells the two apart.
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.02)
+
+
+def main(argv: list[str]) -> int:
+    once, standby = "--once" in argv, "--standby" in argv
+    q = Path(os.environ.get("CODETEAM_QUEUE_DIR") or Path(__file__).resolve().parent.parent / "run" / "queue").absolute()
+    conf = Path(os.environ.get("CODETEAM_QUEUE_CONF") or q.parent / "queue.toml").absolute()
+    # A run job file holds the submitter's whole environment for its whole life, so no one else may read the folder.
+    q.mkdir(mode=0o700, parents=True, exist_ok=True)
+    q.chmod(0o700)
+    lock = take_runner_lock(q, standby)
+    if lock is None:
+        return 0
+    os.chdir("/")
+    runner = Runner(q, conf)
+    tick = num(os.environ.get("CODETEAM_BUILDQ_TICK"), 1.0)
+    idle_exit = num(os.environ.get("CODETEAM_BUILDQ_IDLE_EXIT"), 0)
+    busy_at, last_error = time.monotonic(), ""
+    while True:
+        try:
+            busy = runner.tick()
+        except Exception:
+            if once:
+                raise
+            # The heartbeat is not written, so clients see a stale runner and run their builds themselves.
+            import traceback
+            if (error := traceback.format_exc()) != last_error:
+                print(error, file=sys.stderr, flush=True)
+            last_error, busy = error, True
+        if once:
+            return 0
+        busy_at = time.monotonic() if busy else busy_at
+        if idle_exit and time.monotonic() - busy_at >= idle_exit:
+            return 0
+        time.sleep(tick)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

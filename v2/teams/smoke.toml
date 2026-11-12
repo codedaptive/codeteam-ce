@@ -1,0 +1,46 @@
+# codeteam v2 smoke team: the made-up smoke-project in ~/codeteam-work/sandbox, never a real repo.
+# v2/smoke/run.py writes its own manifest with the right paths; this one is a hand-run example.
+# claude_source must point at this checkout's v2/smoke/claude: edit it if you cloned elsewhere.
+product = "smoke"
+mode = "lab"
+repo = "~/codeteam-work/sandbox/smoke-project"
+base = "main"
+lane_branch_prefix = "lane/"
+worktree_root = "~/codeteam-work/sandbox/team-smoke"
+claude_source = "~/codeteam-gamma-preview/v2/smoke/claude"
+orc_agent = ""
+lane_agent = ""
+lane_coder = ""
+model = "claude-sonnet-5-5"
+lane_model = "claude-haiku-5-5"
+effort = "medium"
+lane_effort = "low"
+lane_permission_mode = "bypassPermissions"
+orc_permission_mode = "bypassPermissions"
+compact_window = 200000
+orc_compact_window = 200000
+
+[env]
+ZONE_TEST = "make --no-print-directory test-one DIR=$(ZONE)"
+ZONE_TEST_FLAGS = "--single --timeout 600"
+
+# codeteam v2 settings
+[v2]
+herdr_session = "codeteam"
+cap = 1                 # two lanes, one awake at a time: exercises wake and swap
+swap_idle_min = 1
+blocked_alert_min = 1
+agent = ""              # no --agent: the role file is the whole brief
+mcp = false             # no MCP servers for smoke sessions
+
+[[lanes]]
+name = "alpha"
+path = "zones/alpha"
+role = "zone"
+job = "alpha: arithmetic helpers (zones/alpha/calc.py), to docs/reference/ALPHA_SPEC.md."
+
+[[lanes]]
+name = "beta"
+path = "zones/beta"
+role = "zone"
+job = "beta: reports built on alpha (zones/beta/report.py), to docs/reference/BETA_SPEC.md."

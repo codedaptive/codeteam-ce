@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job that keeps the build queue's runner (bin/codeteam-buildq) alive on this Mac. It runs the runner in
+  standby mode: it waits for the queue's runner lock, so it never fights a runner that zone-tool or codeteam-slot
+  started, and it takes over when that runner dies. launchd does not expand the tilde, so every path is absolute.
+  With no WorkingDirectory, launchd starts the job in /.
+
+  This file is a template: __PREFIX__, __PYTHON__, __CODETEAM_HOME__ and __HOME__ are filled in by
+  share/install-buildq-plist.sh, which writes ~/Library/LaunchAgents/<prefix>.codeteam-buildq.plist and loads it
+  (it unloads a loaded job first, which stops the runner). `share/install-buildq-plist.sh --print` prints the
+  filled-in plist and installs nothing. The label prefix is CODETEAM_LAUNCHD_PREFIX (default com.codeteam).
+  To unload the job without removing its plist:
+    launchctl bootout gui/$(id -u)/<prefix>.codeteam-buildq
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__PREFIX__.codeteam-buildq</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__CODETEAM_HOME__/bin/codeteam-buildq</string>
+    <string>--standby</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.cargo/bin:/opt/homebrew/bin:__HOME__/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__CODETEAM_HOME__/run/buildq.log</string>
+  <key>StandardErrorPath</key>
+  <string>__CODETEAM_HOME__/run/buildq.log</string>
+</dict>
+</plist>

@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""codeteam-continue: a mechanical sweep. Run by cron every minute.
+
+A turn that ends on "API Error: Connection lost mid-response. The response above may be incomplete." leaves the
+session idle mid-task, and nothing wakes it until mail arrives. This finds those sessions in herdr and types
+"continue" to them, once per ended turn.
+
+It types only when all of these hold:
+- the session is a codeteam team's (its herdr name starts with a team's product) and the team is not HALTED or down;
+- herdr shows it idle or done (its turn has ended; never into a working or blocked session);
+- the error is the last thing it printed: among the last few non-empty lines above its input box;
+- its input box is empty (nobody is typing in it);
+- it hasn't been nudged since its turn ended (herdr's completion count has moved since the last nudge).
+After 5 nudges in an hour for the same session it stops nudging it and sends the owner a herdr notification instead.
+Log: codeteam/scratchpad/continue.log. State: codeteam/run/continue-state.json.
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HOME / "v2"))
+from codeteam2 import screen as screen_mod          # noqa: E402
+from codeteam2.herdr import Herdr, HerdrError       # noqa: E402
+
+ERROR = "Connection lost mid-response"
+SESSION = os.environ.get("HERDR_SESSION", "codeteam")
+STATE = HOME / "run" / "continue-state.json"
+LOG = HOME / "scratchpad" / "continue.log"
+MAX_PER_HOUR = 5
+TAIL = 6            # non-empty lines above the input box that count as "the last thing it printed"
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def teams():
+    """product -> team folder, for every manifest."""
+    import tomllib
+    out = {}
+    for m in (HOME / "teams").glob("*.toml"):
+        try:
+            d = tomllib.loads(m.read_text())
+        except Exception:
+            continue
+        root = Path(os.path.expanduser(d.get("worktree_root") or str(Path(os.environ.get("CODETEAM_WORKSPACE") or Path.home() / "codeteam-work") / f"team-{d.get('product', m.stem)}")))
+        out[d.get("product", m.stem)] = root / "team"
+    return out
+
+
+def stopped(team_dir):
+    return (team_dir / "HALTED").exists() or (team_dir / "v2" / "down").exists()
+
+
+def last_lines_above_box(text):
+    """The non-empty plain lines above the session's input box (the line starting with ❯ between rules)."""
+    plains = [screen_mod.plain(x) for x in text.splitlines()]
+    box = None
+    for i in range(len(plains) - 1, -1, -1):
+        if plains[i].lstrip().startswith(screen_mod.PROMPT):
+            box = i
+            break
+    above = plains[:box] if box is not None else plains
+    lines = [l.strip() for l in above if l.strip() and not set(l.strip()) <= set("─━—-▔▁ ")]
+    return lines[-TAIL:]
+
+
+def main():
+    h = Herdr(SESSION)
+    try:
+        agents = h.agents()
+    except HerdrError as e:
+        log(f"herdr: {e}")
+        return
+    tmap = teams()
+    st = json.loads(STATE.read_text()) if STATE.exists() else {}
+    now = time.time()
+    for a in agents:
+        name = a.get("name") or ""
+        status = a.get("agent_status")
+        if status not in ("idle", "done"):
+            continue
+        product = next((p for p in sorted(tmap, key=len, reverse=True) if name.startswith(p + "-")), None)
+        if not product or stopped(tmap[product]):
+            continue
+        rec = st.setdefault(name, {"nudged_at_completion": None, "times": []})
+        done_n = a.get("completion_seq")
+        if done_n is not None and rec.get("nudged_at_completion") == done_n:
+            continue                    # already nudged for this ended turn
+        try:
+            text = h.agent_screen(name, lines=40)
+        except HerdrError:
+            continue
+        if not text or not any(ERROR in l for l in last_lines_above_box(text)):
+            continue
+        if screen_mod.draft(text):      # someone is typing in it
+            continue
+        rec["times"] = [t for t in rec.get("times", []) if now - t < 3600]
+        if len(rec["times"]) >= MAX_PER_HOUR:
+            if not rec.get("alerted"):
+                rec["alerted"] = True
+                h.notify(f"codeteam: {name} keeps losing its connection",
+                         f"{MAX_PER_HOUR} 'continue' nudges in an hour; codeteam-continue has stopped nudging it.")
+                log(f"{name}: {MAX_PER_HOUR} nudges in an hour; stopped, owner notified")
+            continue
+        try:
+            h.agent_prompt(name, "continue")
+        except HerdrError as e:
+            log(f"{name}: prompt refused: {e}")
+            continue
+        rec.update({"nudged_at_completion": done_n, "alerted": False})
+        rec["times"].append(now)
+        log(f"{name}: '{ERROR}' was its last output; typed continue")
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=1))
+    tmp.replace(STATE)
+
+
+if __name__ == "__main__":
+    main()

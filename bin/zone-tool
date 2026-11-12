@@ -1,0 +1,1611 @@
+#!/usr/bin/env python3
+"""zone-tool: test record, warm build cache, docs, ledger and changelog for one zone, and
+test-one: the tests of one folder or file, for a repo with no Makefile (zone.mk's test-one), and
+job: the build queue's client verbs (submit, wait, status; bin/codeteam-buildq is the runner).
+
+Run from inside the zone's worktree (standing or per-request), or its folder for ledger/backlog."""
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from collections.abc import Callable
+
+if sys.version_info < (3, 11):
+    # The push gate and some shells put the system Python 3.9 first on PATH, and zone-tool uses 3.10+ APIs
+    # (glob root_dir); the product port is Python 3.11+. Re-run under the first Python 3.11+ found.
+    import shutil as _sh
+    for _cand in (os.environ.get("CODETEAM_PYTHON") or "python3", "python3.14", "python3.13", "python3.12", "python3.11",
+                  "/usr/local/bin/python3"):
+        _exe = _sh.which(_cand) or (_cand if Path(_cand).is_file() else None)
+        if _exe and os.path.realpath(_exe) != os.path.realpath(sys.executable):
+            _ok = subprocess.run([_exe, "-c", "import sys; sys.exit(sys.version_info < (3, 11))"]).returncode == 0
+            if _ok:
+                os.execv(_exe, [_exe, __file__, *sys.argv[1:]])
+    sys.exit("zone-tool needs Python 3.11+, and none was found")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "share"))
+import codeteam_hang
+
+# launchd owns this job so the runner is outside every client's process tree.
+BUILDQ_LABEL = (os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam") + ".codeteam-buildq"
+# The installed launchd job serves only this queue (this checkout's run/queue), hard-coded in its plist.
+BUILDQ_LIVE_QUEUE = str(Path(__file__).resolve().parent.parent / "run" / "queue")
+RECORD = ".test-record.json"
+LEDGER = ".ledger.md"
+LEDGER_CLOSED = ".ledger-closed"
+REVIEW_MARK = ".comment-review"
+# Test-count lines from swift test / xcodebuild / cargo test, kept in the record (2026-10-29).
+import re as _re
+COUNTS = _re.compile(r"Executed [0-9]+ tests?|test result:|Test Suite .* (passed|failed)|[0-9]+ (passed|failed)|tests? (passed|failed)", _re.I)
+# A disk-full run says nothing about the code, so it must not become a cached FAIL.
+OUT_OF_SPACE = ("no space left on device", "database or disk is full", "out of space")
+# Matched case-insensitively on the line itself: lowercasing can change a line's length ('İ' becomes two code
+# points), so offsets found in a lowercased copy would not fit the original.
+OUT_OF_SPACE_RE = _re.compile("|".join(map(_re.escape, OUT_OF_SPACE)), _re.I)
+DOCS = ["SPEC.md", "INTERFACE.md", "TESTING.md", "APPLIED_ADRS.md", "CHANGELOG.md"]
+SKELETON = Path(__file__).resolve().parent.parent / "zone" / "docs"
+SINGLE_WAIT = "zone-test: a run is already going in this worktree; waiting for its result"
+
+
+def git(*args, cwd="."):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
+
+
+def top():
+    return Path(git("rev-parse", "--show-toplevel").strip())
+
+
+def ledger_root() -> Path:
+    # Use the checkout root, or the current folder outside a checkout (such as a v5 zone folder).
+    try:
+        return top()
+    except subprocess.CalledProcessError:
+        return Path.cwd()
+
+
+def snapshot(root):
+    """The code as it stands: the tree that HEAD plus every staged and unstaged change makes, and the
+    untracked files (it is the content, not the commit: 2026-10-23)."""
+    import tempfile, shutil
+    ignore = os.environ.get("ZONE_HASH_IGNORE", "Package.resolved").split()
+    globs = [f":(glob)**/{g}" for g in ignore]
+    idx = Path(git("rev-parse", "--git-path", "index", cwd=root).strip())
+    if not idx.is_absolute():
+        idx = root / idx
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "index"
+        if idx.exists():
+            shutil.copy2(idx, tmp)          # keeps the stat cache: only changed files are hashed
+        env = dict(os.environ, GIT_INDEX_FILE=str(tmp))
+        run = lambda *a: subprocess.run(["git", *a], cwd=root, env=env, capture_output=True, text=True)
+        run("add", "-u", "--", ".")
+        if globs:
+            run("reset", "-q", "HEAD", "--", *globs)   # a build's lockfile churn is not a code change
+        tree = run("write-tree")
+        if tree.returncode != 0:
+            raise SystemExit(f"zone-tool: git write-tree failed: {tree.stderr.strip()}")
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=root).split("\0")
+    # LEDGER_CLOSED too: a repo that tracks it or does not exclude it must not churn the hash on close.
+    skip = {RECORD, LEDGER, LEDGER_CLOSED, REVIEW_MARK, *ignore}
+    untracked = sorted(u for u in untracked if u and Path(u).name not in skip and not Path(u).name.startswith(".test-record"))
+    return tree.stdout.strip(), untracked
+
+
+def scope_dirs(root, d, depth=None):
+    """What a test of DIR can touch (a test runs once and not again unless something that
+    touches it changed): the package that holds DIR, every local package it depends on by path
+    (Package.swift `path: "..."`, Cargo.toml `path = "..."`, followed through each one, and the manifests one
+    folder down, so a Swift package's rust/ crate brings its own dependencies), plus ZONE_SCOPE_ALWAYS
+    (default `scripts`, the test runner). None means the whole worktree: no manifest found, or the
+    package is the repo itself. depth=1: the package's direct path dependencies only, not followed through (the
+    landing gate's reach: change X and B calls X, test X and B, not A, which calls B)."""
+    d = os.path.normpath(d or ".").strip("/")
+    if d in ("", "."):
+        return None
+    rroot = root.resolve()
+    p = (root / d).resolve()
+    while not ((p / "Package.swift").exists() or (p / "Cargo.toml").exists()):
+        if p == rroot or rroot not in p.parents:
+            return None
+        p = p.parent
+    if p == rroot:
+        return None
+    # A Swift package's own Rust port (a child folder with a Cargo.toml and no Package.swift that no Swift source or
+    # test names) is the other port, not something Swift tests can touch: a Rust-only commit leaves the Swift records
+    # current (otherwise the full Swift set was rerun after every Rust commit). It is written into the scope as
+    # "<package>!<child>" so code_hash leaves it out, and its manifest is not followed. Applied to every Swift package
+    # on the walk; a Rust test's scope (DIR inside the crate) is unchanged.
+    swift_root = (p / "Package.swift").exists()
+    excl = {}
+
+    def rust_ports(q):
+        if not (swift_root and (q / "Package.swift").exists()):
+            return []
+        out = []
+        for child in sorted(c for c in q.iterdir() if c.is_dir() and (c / "Cargo.toml").exists()
+                            and not (c / "Package.swift").exists()):
+            pat = _re.compile(rf"(^|[^\w./-]|\.\./){_re.escape(child.name)}/")
+            named = False
+            for f in [*q.glob("Sources/**/*.swift"), *q.glob("Tests/**/*.swift")]:
+                for line in f.read_text(errors="replace").splitlines():
+                    if not line.lstrip().startswith("//") and pat.search(line):
+                        named = True
+                        break
+                if named:
+                    break
+            if not named:
+                out.append(child.name)
+        return out
+    seen, todo = set(), [(p, 0)]
+    while todo:
+        q, level = todo.pop()
+        try:
+            rel = str(q.resolve().relative_to(rroot))
+        except ValueError:
+            continue                        # outside the worktree: ZONE_KEY_DIRS covers pins
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if depth is not None and level >= depth:
+            continue                        # a direct dependency: in the scope, its own dependencies not
+        ports = rust_ports(q)
+        if ports:
+            excl[rel] = ports
+        mans = [q / "Package.swift", q / "Cargo.toml"] + sorted(q.glob("*/Package.swift")) + sorted(
+            m for m in q.glob("*/Cargo.toml") if m.parent.name not in ports)
+        for man in mans:
+            if not man.is_file():
+                continue
+            for m in _re.finditer(r'\bpath\s*[:=]\s*"([^"]+)"', man.read_text(errors="replace")):
+                t = (man.parent / m.group(1)).resolve()
+                if t.is_file() or t.suffix in (".rs", ".swift"):
+                    continue
+                todo.append((t, level + 1))
+    extra = [e.strip().strip("/") for e in os.environ.get("ZONE_SCOPE_ALWAYS", "scripts").split(":") if e.strip()]
+    return [f"{d}!{'!'.join(excl[d])}" if d in excl else d for d in sorted(seen | set(extra))]
+
+
+def code_hash(root, scope=None, snap=None):
+    """Hash of the code a record stands for. With no scope, the whole worktree. With a scope (scope_dirs), only
+    those folders, the files at the worktree top (not its .md files) and the untracked files under them: a
+    change anywhere else does not make the record stale."""
+    tree, untracked = snap or snapshot(root)
+    h = hashlib.sha256()
+    if scope is None:
+        h.update(tree.encode())
+        files = untracked
+    else:
+        for entry in scope:
+            d, *skip = entry.split("!")
+            if skip:
+                # the folder's entries one by one, leaving out the excluded children (a Swift package's Rust port)
+                listing = subprocess.run(["git", "ls-tree", f"{tree}:{d}"], cwd=root, capture_output=True,
+                                         text=True).stdout
+                for line in listing.splitlines():
+                    meta, name = line.split("\t", 1)
+                    if name not in skip:
+                        h.update(f"{d}/{name}={meta.split()[2]}\n".encode())
+                continue
+            obj = subprocess.run(["git", "rev-parse", "-q", "--verify", f"{tree}:{d}"], cwd=root,
+                                 capture_output=True, text=True).stdout.strip()
+            h.update(f"{d}={obj or 'none'}\n".encode())
+        for line in git("ls-tree", tree, cwd=root).splitlines():
+            meta, name = line.split("\t", 1)
+            if meta.split()[1] == "blob" and not name.endswith(".md"):
+                h.update(f"{name}={meta.split()[2]}\n".encode())
+        def in_scope(u):
+            for entry in scope:
+                d, *skip = entry.split("!")
+                if u.startswith(d + "/") and not any(u.startswith(f"{d}/{c}/") for c in skip):
+                    return True
+            return "/" not in u and not u.endswith(".md")
+        files = [u for u in untracked if in_scope(u)]
+    for rel in files:
+        p = root / rel
+        if p.is_file():
+            h.update(rel.encode())
+            h.update(p.read_bytes())
+    # Checkouts outside the worktree that the code builds against (e.g. ../acme-pin):
+    # their commit is part of the code, so moving a pin makes the record stale (2026-10-24).
+    for rel in os.environ.get("ZONE_KEY_DIRS", "").split(":"):
+        if rel.strip():
+            head = subprocess.run(["git", "-C", str((root / rel.strip()).resolve()), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True).stdout.strip()
+            h.update(f"{rel.strip()}={head}".encode())
+    return h.hexdigest()
+
+
+def record_current(root, rec, snap, whole):
+    """A record stands for the code as it is now: same whole tree, or nothing in its scope changed."""
+    if rec.get("hash") == whole:
+        return True
+    return bool(rec.get("scope")) and rec.get("scope_hash") == code_hash(root, rec["scope"], snap)
+
+
+def now():
+    return dt.datetime.now().astimezone()
+
+
+def kill_tree(pid, sig):
+    """Signal pid and every descendant, children first found by pgrep -P."""
+    kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+    for k in kids:
+        kill_tree(int(k), sig)
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def git_dir(root):
+    return Path(git("rev-parse", "--absolute-git-dir", cwd=root).strip())
+
+
+def record_path(root, key=""):
+    """The zone suite keeps .test-record.json; a keyed run (one package, a filter)
+    keeps its own record beside it."""
+    if not key:
+        return root / RECORD
+    return root / f".test-record-{hashlib.sha256(key.encode()).hexdigest()[:12]}.json"
+
+
+def read_record(root, key=""):
+    path = record_path(root, key)
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def test_group() -> str:
+    return os.environ.get("CODETEAM_TEST_GROUP", "").strip() or "unit"
+
+
+def commit_state(root: Path) -> tuple[str | None, bool]:
+    """Judge start-of-run cleanliness independently of the code hash's exclusions."""
+    try:
+        commit = git("rev-parse", "--verify", "HEAD^{commit}", cwd=root).strip()
+    except subprocess.CalledProcessError:
+        return None, False
+    tracked = git("status", "--porcelain", "--untracked-files=no", cwd=root)
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=root).split("\0")
+    skip = {RECORD, LEDGER, LEDGER_CLOSED, REVIEW_MARK}
+    return commit, not tracked and not any(
+        u and Path(u).name not in skip and not Path(u).name.startswith(".test-record") for u in untracked)
+
+
+
+def append_commit_record(root: Path, key: str, rec: dict, answered: bool = False) -> None:
+    if rec["commit"] is None:
+        return
+    entry = {field: rec[field] for field in ("commit", "clean", "group", "result", "time")}
+    entry.update(key=key, exit=rec.get("exit", 0 if rec["result"] == "PASS" else 1),
+                 record=record_path(root, key).name)
+    if answered:
+        entry["answered"] = True
+    # Different keys can finish together; keep their JSON lines separate in this worktree's private log.
+    with (git_dir(root) / "zone-test-commits.jsonl").open("a") as log:
+        fcntl.flock(log, fcntl.LOCK_EX)
+        log.write(json.dumps(entry) + "\n")
+
+
+def record_hit(root, key, salt, scope_arg):
+    """The record that answers a --cached or --single run, or None, with the hashes it was judged by (the run
+    stamps them into its own record): (hit, snap, before, scope, sbefore). A record answers when it is a finished
+    PASS or FAIL with this salt and either the same whole tree or, with a scope, the same scope and nothing in it
+    changed."""
+    snap = snapshot(root)
+    before = code_hash(root, None, snap)
+    scope = scope_dirs(root, scope_arg) if scope_arg else None
+    sbefore = code_hash(root, scope, snap) if scope else None
+    rec = read_record(root, key)
+    hit = rec and rec.get("result") in ("PASS", "FAIL") and rec.get("salt", "") == salt and (
+        rec.get("hash") == before or (scope and rec.get("scope") == scope and rec.get("scope_hash") == sbefore))
+    # A record made before ports were split (2026-11-04) has the same scope without the "!rust" exclusions. It still
+    # answers when nothing in that wider scope changed, and is restamped with the new scope (else every record on the
+    # machine would miss once and every lane rerun its whole set, which happened within the hour).
+    if not hit and rec and scope and rec.get("result") in ("PASS", "FAIL") and rec.get("salt", "") == salt:
+        old_scope = rec.get("scope") or []
+        wide = {e.split("!")[0] for e in scope}
+        # the record's own (older, wider) scope covers the new one, and nothing in it changed
+        if old_scope and not any("!" in e for e in old_scope) and wide <= set(old_scope) \
+                and rec.get("scope_hash") == code_hash(root, old_scope, snap):
+            rec["scope"], rec["scope_hash"] = scope, sbefore
+            record_path(root, key).write_text(json.dumps(rec, indent=1) + "\n")
+            hit = True
+    return (rec if hit else None), snap, before, scope, sbefore
+
+
+def answer_from_record(root, key, rec, before):
+    """Print and restamp a matching record; log its answer at this commit only for a clean tree and matching group."""
+    commit, clean = commit_state(root)
+    group = test_group()
+    if clean and rec.get("group", "unit") == group:
+        append_commit_record(root, key, rec | {"commit": commit, "clean": clean, "group": group,
+                                             "time": now().isoformat(timespec="seconds")}, answered=True)
+    when = dt.datetime.fromisoformat(rec["time"]).strftime("%H:%M")
+    if rec.get("hash") == before:
+        print(f"zone-test: {rec['result']} at {when} already recorded for this exact code; not run again", flush=True)
+    else:
+        # Nothing these tests can touch changed: the record stands for this tree too. Stamp it so
+        # `zone-tool covered` (push-up) and test-status read it as current.
+        rec["hash"] = before
+        rec["restamped"] = now().isoformat(timespec="seconds")
+        record_path(root, key).write_text(json.dumps(rec, indent=1) + "\n")
+        print(f"zone-test: {rec['result']} at {when} already recorded; nothing these tests touch has changed "
+              f"since; not run again", flush=True)
+    for l in (rec.get("counts") or []) + ([] if rec["result"] == "PASS" else ["--- last lines of that run ---"] + (rec.get("tail") or [])[-25:]):
+        print(f"  {l}", flush=True)
+    return rec.get("exit", 0 if rec["result"] == "PASS" else 1)
+
+
+def hang_wait(proc: subprocess.Popen, watch: codeteam_hang.HangWatch, clock: Callable[[], float],
+              sample: Callable[[], dict[int, float] | None], poll: float) -> tuple[int | None, str | None]:
+    """Wait for completion or a hang decision, without an absolute runtime limit."""
+    while True:
+        try:
+            return proc.wait(timeout=poll), None
+        except subprocess.TimeoutExpired:
+            t = clock()
+            watch.sample(t, sample())
+            reason = watch.hung(t)
+            if reason is not None:
+                return None, reason
+
+
+def wait_for_lock(try_lock: Callable[[], bool], clock: Callable[[], float],
+                  sleep: Callable[[float], None], say: Callable[[str], None],
+                  every: float, poll: float) -> None:
+    """Acquire the lock, with wait output scheduled every interval while blocked."""
+    if try_lock():
+        return
+    say(SINGLE_WAIT)
+    last_said = clock()
+    while True:
+        sleep(poll)
+        if try_lock():
+            return
+        if clock() - last_said >= every:
+            say(SINGLE_WAIT)
+            last_said = clock()
+
+
+def cmd_test(args):
+    """zone-tool test [--cached] [--single] [--timeout SECONDS] [--key TEXT] [--salt TEXT] [--scope DIR] -- <test command>
+
+    --key      record this run under its own name (a package, a filter) instead of
+               the zone suite's record; `make zone-test-one` uses it.
+    --salt     what else the test set depends on besides the code (a lane's CODETEAM_OWNS,
+               in a repo with no Makefile); kept in the record, and a record answers
+               --cached or --single only when its salt is this one too. The code hash
+               stays the code's alone, so test-status and covered need no salt.
+
+    --cached   a record for exactly this code (or, with --scope, for the same scope with nothing
+               in it changed) and the same salt answers without running (2026-10-22:
+               63% of suite runs repeated an unchanged tree within the hour).
+    --single   one run at a time per worktree and key; a second caller waits for the first,
+               then is answered only by a matching PASS or FAIL record with the same salt.
+    --timeout  accepted as --timeout SECONDS or --timeout=SECONDS and ignored; no effect since v5.2.
+               CODETEAM_HANG_WINDOW (default 600 s) and CODETEAM_HANG_CPU_PCT (default 1) govern
+               HUNG: no output and tree CPU below the threshold over a whole window. There is
+               no absolute runtime limit. A nonzero run matching an OUT_OF_SPACE phrase is BROKEN unless
+               it is HUNG; neither HUNG nor BROKEN answers --cached or --single.
+    --scope    DIR: the record stands until something DIR's tests can touch changes (scope_dirs),
+               not until anything in the worktree changes; `make zone-test-one` passes its DIR.
+               A hit through the scope alone restamps the record with the current whole-tree
+               hash, and still needs the same salt.
+    With no options: run, record, return the exit code."""
+    import signal
+    def options():
+        values = {"--cached": False, "--single": False, "--key": "", "--salt": "", "--scope": None}
+        it = iter(args)
+        for a in it:
+            if a in ("--cached", "--single"):
+                values[a] = True
+            elif a == "--timeout":
+                next(it)
+            elif a.startswith("--timeout="):
+                continue
+            elif a in values:
+                values[a] = next(it)
+            elif a == "--":
+                return values, list(it)
+            else:
+                sys.exit(f"zone-tool test: unknown option {a}")
+        return values, None
+
+    opts, cmd = options()
+    if not cmd:
+        sys.exit("usage: zone-tool test [--cached] [--single] [--timeout SECONDS] [--key TEXT] [--salt TEXT] [--scope DIR] -- <test command>")
+    cached, single = opts["--cached"], opts["--single"]
+    key, salt, scope_arg = " ".join(opts["--key"].split()), opts["--salt"], opts["--scope"]
+    root = top()
+    lock = None
+    if single:
+        lock = open(git_dir(root) / (f"zone-test-{record_path(root, key).stem[13:]}.lock" if key else "zone-test.lock"), "a")
+        def try_lock() -> bool:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+        # Waiting is not testing: schedule output eight times per runner backstop window.
+        every = codeteam_hang.settings(os.environ)[0] / 4
+        wait_for_lock(try_lock, time.monotonic, time.sleep, lambda line: print(line, flush=True),
+                      every, min(1.0, every))
+    hit, _, before, scope, sbefore = record_hit(root, key, salt, scope_arg)
+    if (cached or single) and hit:
+        return answer_from_record(root, key, hit, before)
+    commit, clean = commit_state(root)
+    group = test_group()
+    start = now()
+    # CPU seconds of the run (all its child processes) and the machine's load when it started, so test time can be
+    # compared fairly whatever else the machine is doing. CPU time barely moves with load; wall does.
+    import resource
+    ru0 = resource.getrusage(resource.RUSAGE_CHILDREN); load0 = os.getloadavg()[0]
+    # Evidence is a tool, not ceremony: keep the run's output with its record, so a reviewer can
+    # read the assertion failures of a red run (or the counts of a green one) without anyone saving logs by hand.
+    import collections, threading
+    log_path = record_path(root, key).with_suffix(".log")
+    tail = collections.deque(maxlen=80)
+    window, cpu_pct = codeteam_hang.settings(os.environ)
+    watch = codeteam_hang.HangWatch(window, cpu_pct, time.monotonic())
+    poll = min(10, max(0.05, window / 20))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, text=True, errors="replace")
+    logf = open(log_path, "w")
+    out_of_space = None
+    def pump():
+        nonlocal out_of_space
+        for line in proc.stdout:
+            watch.output(time.monotonic())
+            if out_of_space is None:
+                stripped = line.strip()
+                m = OUT_OF_SPACE_RE.search(stripped)
+                if m:
+                    # Shift the capped excerpt to keep the phrase, not just the line's prefix.
+                    lo = max(0, min(m.start(), len(stripped) - 200))
+                    out_of_space = stripped[lo:lo + 200]
+            sys.stdout.write(line); sys.stdout.flush(); logf.write(line); tail.append(line.rstrip("\n"))
+    pumper = threading.Thread(target=pump, daemon=True); pumper.start()
+    def run_result():
+        try:
+            rc, reason = hang_wait(proc, watch, time.monotonic,
+                                   lambda: codeteam_hang.tree_cpu(proc.pid), poll)
+            if reason is not None:
+                kill_tree(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    kill_tree(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                rc = 124
+                print(f"zone-test: HUNG: {reason}; stopped the run and every process under it",
+                      file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            kill_tree(proc.pid, signal.SIGTERM)
+            raise
+        pumper.join(timeout=10); logf.close()
+        if reason is not None:
+            return rc, "HUNG", reason
+        if rc != 0 and out_of_space is not None:
+            print(f"zone-test: BROKEN (out of space): {out_of_space}", flush=True)
+            return rc, "BROKEN", f"out of space: {out_of_space}"
+        return rc, "PASS" if rc == 0 else "FAIL", None
+
+    rc, result, reason = run_result()
+    ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    record = {
+        "cpu_seconds": round((ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime), 1),
+        "load_at_start": round(load0, 1),
+        "cpu_count": os.cpu_count(),
+        "log": log_path.name,
+        "tail": list(tail)[-40:],
+        "counts": [l for l in tail if COUNTS.search(l)][-6:],
+        "hash": before,
+        "commit": commit,
+        "clean": clean,
+        "group": group,
+        "scope": scope,
+        "scope_hash": sbefore,
+        "key": key,
+        "salt": salt,
+        "command": " ".join(cmd),
+        "result": result,
+        "reason": reason,
+        "exit": rc,
+        "time": start.isoformat(timespec="seconds"),
+        "seconds": round((now() - start).total_seconds()),
+    }
+    record_path(root, key).write_text(json.dumps(record, indent=1) + "\n")
+    append_commit_record(root, key, record)
+    return rc
+
+
+def latest_commit_records(root: Path, commit: str, key: str | None) -> list[tuple[int, dict]]:
+    """File order, not timestamps, decides the newest eligible result for each key."""
+    try:
+        lines = (git_dir(root) / "zone-test-commits.jsonl").read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    latest = {}
+    for position, line in enumerate(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue  # a line cut short by a crash mid-write says nothing about any run
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("commit") == commit and rec.get("clean") is True and rec.get("group") == "unit" \
+                and (key is None or rec.get("key") == key):
+            latest[rec.get("key", "")] = (position, rec)
+    return list(latest.values())
+
+
+def commit_record_options(args: list[str]) -> tuple[str, str | None]:
+    if len(args) not in (1, 3) or args[1:2] not in ([], ["--key"]) or args[0].startswith("-"):
+        usage_error("usage: zone-tool commit-record <commit> [--key K]")
+    return args[0], " ".join(args[2].split()) if len(args) == 3 else None
+
+
+def cmd_commit_record(args: list[str]) -> int:
+    """zone-tool commit-record <commit> [--key K]: look up clean unit results, newest per key."""
+    revision, key = commit_record_options(args)
+    root = top()
+    try:
+        commit = git("rev-parse", "--verify", f"{revision}^{{commit}}", cwd=root).strip()
+    except subprocess.CalledProcessError:
+        print(f"none: no clean unit-group record at {revision}")
+        return 2
+    latest = latest_commit_records(root, commit, key)
+    if not latest:
+        print(f"none: no clean unit-group record at {commit}")
+        return 2
+    failures = [entry for entry in latest if entry[1]["result"] != "PASS"]
+    _, rec = max(failures or latest, key=lambda entry: entry[0])
+    print(f"{rec['result']} {rec['time']} commit={commit} key={rec['key'] or 'zone suite'} record={rec['record']}")
+    return 1 if failures else 0
+
+
+def cmd_test_status(args):
+    """Every test record in this worktree (the zone suite's and each keyed run's): result, time, whether it matches
+    the current code, its counts, and for a current non-PASS its last lines. Exit 0 all current PASS,
+    1 any current non-PASS (FAIL, HUNG, TIMEOUT, BROKEN), 2 none current."""
+    root = top()
+    recs = sorted(root.glob(".test-record*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not recs:
+        print("no record: run make zone-test or make zone-test-one")
+        return 2
+    snap = snapshot(root); cur = code_hash(root, None, snap); current = []
+    for path in recs:
+        try: rec = json.loads(path.read_text())
+        except Exception: continue
+        when = dt.datetime.fromisoformat(rec["time"]).strftime("%m-%d %H:%M")
+        what = rec.get("key") or "zone suite"
+        fresh = record_current(root, rec, snap, cur)
+        print(f"{rec['result']:7s} {when}  {'matches current code' if fresh else 'stale (code changed since)'}  {what}")
+        for l in rec.get("counts") or []: print(f"          {l}")
+        if fresh:
+            current.append(rec["result"])
+            if rec["result"] != "PASS":
+                for l in (rec.get("tail") or [])[-20:]: print(f"          | {l}")
+        if rec.get("log"): print(f"          full output: {path.with_name(rec['log'])}")
+    if not current: return 2
+    return 1 if any(r != "PASS" for r in current) else 0
+
+
+def cmd_covered(args):
+    """zone-tool covered: is the code as it stands tested? Exit 0 when at least one
+    record (the zone suite's or a keyed one) PASSed on exactly this code and none
+    recorded on it failed; exit 1 otherwise, naming what is missing. push-up runs it
+    on the tree it is about to push (2026-10-25: a record for the tree before
+    an exchange merge passed for the merged tree, and 22 red tests sat on exchange)."""
+    root = top()
+    here = code_hash(root)
+    passed, failed, stale = [], [], 0
+    for path in sorted(root.glob(".test-record*.json")):
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        name = rec.get("key") or "zone suite"
+        if rec.get("hash") != here:
+            stale += 1
+        elif rec.get("result") == "PASS":
+            passed.append(name)
+        else:
+            failed.append(f"{name} ({rec.get('result')})")
+    if failed:
+        print("not covered: on this exact code, " + "; ".join(failed))
+        return 1
+    if not passed:
+        print("not covered: no test record matches this exact code"
+              + (f" ({stale} older record(s) are for code before the last change or merge)" if stale else ""))
+        return 1
+    print("covered: PASS on this exact code for " + "; ".join(passed))
+    return 0
+
+
+def cmd_warm(args):
+    """Copy-on-write clone of the exchange build cache into this worktree."""
+    src = dst_rel = None
+    it = iter(args)
+    for a in it:
+        if a == "--from":
+            src = next(it)
+        elif a == "--target":
+            dst_rel = next(it)
+    if not src:
+        sys.exit("usage: zone-tool warm --from <exchange worktree> [--target <dir, default target>]")
+    dst_rel = dst_rel or "target"
+    source = Path(src) / dst_rel
+    dest = top() / dst_rel
+    if dest.exists():
+        print(f"warm: {dest} already present")
+        return 0
+    if not (source / "debug").is_dir():
+        # The lane's worktree often holds no build (its leads build in their own trees), and a cold start compiles
+        # everything a build script makes: vendored OpenSSL once took an hour for a lead at load 170.
+        # Take the freshest build among this lane's other worktrees, then exchange's.
+        cands = [p_ / dst_rel for p_ in top().parent.iterdir() if p_.is_dir() and p_ != top()]
+        if os.environ.get("CODETEAM_EXCHANGE"):
+            cands.append(Path(os.environ["CODETEAM_EXCHANGE"]) / dst_rel)
+        built = [c for c in cands if (c / "debug").is_dir()]
+        if not built:
+            print(f"warm: nothing to clone at {source}, nor in this lane's other worktrees or exchange")
+            return 0
+        best = max(built, key=lambda c: (c / "debug").stat().st_mtime)
+        print(f"warm: {source} has no build; taking the freshest one, {best}")
+        source = best
+    flag = ["-c"] if platform.system() == "Darwin" else ["--reflink=auto"]
+    subprocess.run(["cp", *flag, "-R", str(source), str(dest)], check=True)
+    if platform.system() == "Darwin":
+        # Build output is rebuildable; keep it out of Time Machine.
+        subprocess.run(["tmutil", "addexclusion", str(dest)], capture_output=True)
+    print(f"warm: cloned {source} -> {dest}")
+    return 0
+
+
+def cmd_init_docs(args):
+    zone = Path(args[0]) if args else Path(".")
+    docs = zone / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    for name in DOCS:
+        target = docs / name
+        if target.exists():
+            print(f"keep   {target}")
+        else:
+            shutil.copy(SKELETON / name, target)
+            print(f"create {target}")
+    return 0
+
+
+def cmd_changelog(args):
+    # Retired 2026-10-23, the user's ruling: lanes write no changelog lines. The guard (Kong)
+    # writes one entry per feature when he clears it; the builder (Nagatha) puts the entries
+    # into the logs before each promote. Kept so an old habit costs nothing: it writes nothing.
+    print("zone-tool changelog is retired: lanes write no changelog line. Kong writes the "
+          "feature's entry when he clears it. Nothing written.")
+    return 0
+
+
+def read_ledger(root):
+    path = root / LEDGER
+    rows = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            parts = [p.strip() for p in line.split("·")]
+            if len(parts) == 3:
+                rows.append(parts)
+    return rows
+
+
+def exclude_ledger(root):
+    """Append missing /.ledger.md and /.ledger-closed entries to the common info/exclude (shared
+    by every linked worktree), so `git add -A` does not stage them for push-up to refuse.
+    Outside a work tree, return quietly without writing; update failures warn."""
+    try:
+        try:
+            if git("rev-parse", "--is-inside-work-tree", cwd=root).strip() != "true":
+                return
+        except subprocess.CalledProcessError:
+            return
+        path = Path(git("rev-parse", "--git-path", "info/exclude", cwd=root).strip())
+        if not path.is_absolute():
+            path = root / path
+        text = path.read_text() if path.exists() else ""
+        have = set(text.splitlines())
+        want = [f"/{n}" for n in (LEDGER, LEDGER_CLOSED) if f"/{n}" not in have]
+        if not want:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            if text and not text.endswith("\n"):
+                f.write("\n")
+            f.write("".join(w + "\n" for w in want))
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"zone-tool: could not update info/exclude for the ledger files: {e}", file=sys.stderr)
+
+
+def write_ledger(root, rows):
+    exclude_ledger(root)
+    (root / LEDGER).write_text("".join(f"{n} · {s} · {w}\n" for n, s, w in rows))
+
+
+def cmd_ledger(args):
+    root = ledger_root()
+    rows = read_ledger(root)
+    if not args:
+        for r in rows:
+            print(" · ".join(r))
+        return 0
+    op, rest = args[0], args[1:]
+    names = [r[0] for r in rows]
+    if op == "add" and len(rest) == 1:
+        if rest[0] in names:
+            sys.exit(f"ledger: {rest[0]} is already open")
+        rows.append([rest[0], "queued", "-"])
+    elif op == "stage" and len(rest) in (2, 3):
+        if rest[0] not in names:
+            sys.exit(f"ledger: {rest[0]} is not open")
+        for r in rows:
+            if r[0] == rest[0]:
+                r[1] = rest[1]
+                if len(rest) == 3:
+                    # Every worktree cut for the request accumulates here (leads, rework
+                    # leads, gauntlet sides): push-up removes them all once it is accepted.
+                    have = [w for w in r[2].split(",") if w and w != "-"]
+                    r[2] = ",".join(have + [rest[2]] if rest[2] not in have else have)
+    elif op == "close" and len(rest) == 1:
+        if rest[0] not in names:
+            sys.exit(f"ledger: {rest[0]} is not open")
+        closed = [r for r in rows if r[0] == rest[0]]
+        rows = [r for r in rows if r[0] != rest[0]]
+        # Kept so push-up can remove the request's worktrees once its squash is on exchange.
+        with (root / LEDGER_CLOSED).open("a") as f:
+            for n, _, w in closed:
+                f.write(f"{n} · {w} · {dt.datetime.now().isoformat(timespec='minutes')}\n")
+    elif op == "first" and len(rest) == 1:
+        rows.sort(key=lambda r: r[0] != rest[0])
+    else:
+        sys.exit("usage: zone-tool ledger [add <name> | stage <name> <stage> [worktree] | close <name> | first <name>]")
+    write_ledger(root, rows)
+    return 0
+
+
+def cmd_backlog(args):
+    root = ledger_root()
+    zone = args[0] if args else root.name
+    rows = read_ledger(root)
+    if not rows:
+        print(f"{zone}: idle. backlog: none")
+        return 0
+    active = next((r for r in rows if r[1] != "queued"), rows[0])
+    rest = [r[0] for r in rows if r is not active]
+    print(f"{zone}: now {active[0]} (stage: {active[1]}, ~ETA). backlog: {', '.join(rest) or 'none'}")
+    return 0
+
+
+def cmd_comment_review_due(args):
+    mark = top() / REVIEW_MARK
+    if not mark.exists():
+        print("yes")
+        return 0
+    last = dt.datetime.fromisoformat(mark.read_text().strip())
+    due = now() - last >= dt.timedelta(days=7)
+    print("yes" if due else f"no (last {last.date()})")
+    return 0 if due else 1
+
+
+def cmd_comment_review_done(args):
+    (top() / REVIEW_MARK).write_text(now().isoformat(timespec="seconds") + "\n")
+    return 0
+
+
+# test-one: the repo-level `make test-one DIR=...` for a repo zone.mk reaches only through
+# MAKEFILES, with no root Makefile of its own.
+# zone.mk defines the make rule only in such a repo and calls this.
+# Folders, besides dot folders, that the search for a Python test file skips before
+# deciding to run pytest on a folder: build output, caches, dependencies. pytest then
+# collects with its own rules.
+TEST_ONE_SKIP_DIRS = {"__pycache__", "node_modules", "cargo-target", ".build"}
+
+
+def _is_py_test(name):
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def _has_py_tests(folder):
+    for _, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in TEST_ONE_SKIP_DIRS]
+        if any(_is_py_test(f) for f in files):
+            return True
+    return False
+
+
+def _test_one_plan(path, rel, owned):
+    """The runs for one path as [(kind, rel)], kind "py" or "sh", plus the skipped run.sh paths.
+    owned: the path came from CODETEAM_OWNS, where a FILE runs only if it is a test by name
+    (a Python test file, or a .sh in a folder named tests); given directly as DIR, any .py or
+    .sh file runs. A file named run.sh is never run: by convention it is a manual runner for
+    the folder's other tests (codeteam's tests/run.sh is slow and makes worktrees)."""
+    runs, skipped, shells = [], [], []
+    if path.is_dir():
+        if _has_py_tests(path):
+            runs.append(("py", rel))
+        shdir = path if path.name == "tests" else path / "tests"
+        if shdir.is_dir():
+            for sh in sorted(shdir.glob("*.sh")):
+                if sh.is_file():
+                    shells.append(str(Path(rel) / sh.relative_to(path)))
+    elif path.is_file():
+        if path.suffix == ".py" and (not owned or _is_py_test(path.name)):
+            runs.append(("py", rel))
+        elif path.suffix == ".sh" and (not owned or path.parent.name == "tests"):
+            shells.append(rel)
+    for sh in shells:
+        if Path(sh).name == "run.sh":
+            skipped.append(sh)
+        else:
+            runs.append(("sh", sh))
+    return runs, skipped
+
+
+def cmd_test_one(args):
+    """zone-tool test-one <DIR>: run the tests in one folder or file, from the repo root.
+
+    A folder runs pytest once over it when it holds test_*.py or *_test.py anywhere below
+    (dot folders, __pycache__, node_modules, cargo-target and .build are not searched;
+    pytest's exit 5, no tests collected, is not a failure), then each *.sh, sorted, in the
+    folder itself when it is named tests, else in <folder>/tests/, each as `bash <file>`.
+    A .py file runs under pytest, a .sh file under bash. A file named run.sh is never run:
+    by convention it is a manual runner for the folder's other tests (codeteam's
+    tests/run.sh is slow and makes worktrees).
+    A missing path, or one with no tests, prints "no tests" and exits 0.
+    A DIR that resolves to the repo root (., ./, zone/.., the root's absolute path) means
+    the lane's owned paths: each colon-separated entry of CODETEAM_OWNS, glob-expanded from
+    the root; an owned file runs only if it is a test by name. With CODETEAM_OWNS empty or
+    unset, the root is refused (exit 2) rather than passing with no tests or running the
+    whole repo.
+    Python is ZONE_PYTHON, default CODETEAM_PYTHON, else the Python running zone-tool. Children drop CODETEAM_* and
+    HERDR_* except CODETEAM_HOME, CODETEAM_BUILD_JOBS, CODETEAM_BUILDQ_TICKET,
+    CODETEAM_LANDING and CODETEAM_TEST_GROUP. They also drop MAKEFLAGS, MFLAGS, MAKELEVEL,
+    MAKEOVERRIDES and DIR, so a command-line DIR=x does not reach a test that itself runs make.
+    Exit 1 if any test failed, else 0."""
+    import glob
+    import shlex
+    if len(args) != 1 or not args[0]:
+        sys.exit("usage: zone-tool test-one <DIR>")
+    target = args[0]
+    root = top()
+    # Resolved, not compared as text: ./ or zone/.. is the root too, and must not run as a
+    # plain folder (pytest over every lane's tests).
+    if (root / target).resolve() == root.resolve():
+        owns = [e for e in os.environ.get("CODETEAM_OWNS", "").split(":") if e]
+        if not owns:
+            print(f"test-one: DIR={target} is the repo root, which means the lane's owned "
+                  "paths, and CODETEAM_OWNS is empty; set CODETEAM_OWNS or give DIR a folder")
+            return 2
+        paths = [(m, True) for e in owns for m in sorted(glob.glob(e, root_dir=root))]
+    else:
+        paths = [(target, False)]
+    runs, skipped = [], []
+    for rel, owned in paths:
+        r, s = _test_one_plan(root / rel, rel, owned)
+        runs += r
+        skipped += s
+    for s in skipped:
+        print(f"skipped {s}: run.sh is a manual runner")
+    py = os.environ.get("ZONE_PYTHON") or os.environ.get("CODETEAM_PYTHON") or sys.executable
+    # Drop CODETEAM_* and HERDR_* except the keep list: an inherited CODETEAM_MANIFEST can make a hook test
+    # act on a live team. Keep codeteam's location, the build queue's variables, landing and the test group;
+    # CODETEAM_TEST_GROUP names tests, not a team.
+    keep = ("CODETEAM_HOME", "CODETEAM_BUILD_JOBS", "CODETEAM_BUILDQ_TICKET", "CODETEAM_LANDING",
+            "CODETEAM_TEST_GROUP")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "DIR")
+           and (k in keep or not k.startswith(("CODETEAM_", "HERDR_")))}
+    passed, failed = 0, []
+    for kind, rel in runs:
+        # -p no:cacheprovider: no .pytest_cache folder in the worktree.
+        cmd = [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", rel] if kind == "py" else ["bash", rel]
+        print(f"test-one: run {shlex.join(cmd)}", flush=True)
+        rc = subprocess.run(cmd, cwd=root, env=env).returncode
+        if kind == "py" and rc == 5:  # pytest collected nothing: no tests, not a failure
+            continue
+        if rc == 0:
+            passed += 1
+            print(f"ok   {rel}")
+        else:
+            failed.append(rel)
+            print(f"FAIL {rel} (exit {rc})")
+    if not passed and not failed:
+        print(f"test-one: {target}: no tests")
+        return 0
+    print(f"test-one: {passed} passed, {len(failed)} failed" + (": " + " ".join(failed) if failed else ""))
+    return 1 if failed else 0
+
+
+# The build queue: `zone-tool job submit` hands a test run to the runner (bin/codeteam-buildq), which starts it
+# when its class's share and the machine allow. Every job is one file, Q/<ticket>.json; the submitter, the
+# waiters and the runner each change it only while holding Q/.lock, so none overwrites another's change.
+CLASSES = ("land", "full", "post", "pre", "dev")
+TICKET = _re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}")
+HERE = Path(__file__).resolve().parent
+# What a reader needs of a job file: a file in Q that lacks any of these is not one of ours, and is skipped.
+JOB_KEYS = {"ticket", "kind", "class", "state", "submitted", "key", "command", "worktree", "test_flags", "record"}
+
+
+def queue_dir():
+    return Path(os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
+
+
+def env_seconds(name, default):
+    return float(os.environ.get(name) or default)
+
+
+@contextlib.contextmanager
+def queue_lock(q):
+    """Q/.lock for one read-modify-write of a job file, never across a wait or a build."""
+    fd = os.open(q / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_job(q, ticket):
+    try:
+        job = json.loads((q / f"{ticket}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return job if isinstance(job, dict) and JOB_KEYS <= job.keys() else None
+
+
+def read_jobs(q):
+    """Every readable job, oldest first. Dot-files (the lock, the temp file of a write in flight) are not jobs."""
+    jobs = (read_job(q, p.stem) for p in q.glob("*.json") if not p.name.startswith("."))
+    return sorted((j for j in jobs if j), key=lambda j: j["submitted"])
+
+
+def write_job(q, job):
+    """Atomic (temp file, then rename), 0600: the job holds the submitter's whole environment."""
+    tmp = q / f".{job['ticket']}.json.tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(job, f)
+    os.replace(tmp, q / f"{job['ticket']}.json")
+
+
+def update_job(q, ticket, when=None, **changes):
+    """Change a job under Q/.lock; with `when`, only while it is still in that state. The job, or None."""
+    with queue_lock(q):
+        job = read_job(q, ticket)
+        if job is None or (when and job["state"] != when):
+            return None
+        job.update(changes)
+        write_job(q, job)
+        return job
+
+
+def flag_value(flags, name):
+    return flags[flags.index(name) + 1] if name in flags else ""
+
+
+def runner_held(q):
+    """Whether a runner holds Q/.runner.lock for its life: a free lock means no runner."""
+    try:
+        fd = os.open(q / ".runner.lock", os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def read_runner_state(q):
+    try:
+        state = json.loads((q.parent / "queue-runner.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def beat_age(q):
+    """Seconds since the runner's last heartbeat; None when it has written none."""
+    beat = (read_runner_state(q) or {}).get("beat")
+    return time.time() - beat if isinstance(beat, (int, float)) else None
+
+
+def start_runner(q: Path) -> "str | None":
+    """Ask launchd to start the live-queue runner outside the client's process tree, so a tree kill
+    does not take the runner and its jobs with it. An override can serve any queue, including scratch queues.
+    Return None if the command succeeds, or the reason it failed."""
+    launch = os.environ.get("CODETEAM_BUILDQ_LAUNCH")
+    if not launch and os.path.realpath(q) != os.path.realpath(BUILDQ_LIVE_QUEUE):
+        return (f"cannot start a runner for {q}: launchd's job {BUILDQ_LABEL} serves {BUILDQ_LIVE_QUEUE}; "
+                "set CODETEAM_BUILDQ_LAUNCH to start a runner for another queue")
+    argv = [launch or "/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{BUILDQ_LABEL}"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, input="", cwd="/", start_new_session=True,
+                           env=dict(os.environ, CODETEAM_QUEUE_DIR=str(q),
+                                    CODETEAM_BUILDQ_LOG=str(q.parent / "buildq.log")))
+    except OSError as e:
+        return f"cannot start the runner: {e}"
+    out = (r.stderr or r.stdout or "").strip()
+    if r.returncode == 0:
+        return None
+    if r.returncode == 113 or "Could not find service" in (r.stdout or "") + (r.stderr or ""):
+        return (f"build-queue runner job {BUILDQ_LABEL} is not loaded in launchd "
+                f"({' '.join(argv)}: exit {r.returncode}: {out}); install it: "
+                f"launchctl bootstrap gui/{os.getuid()} ~/Library/LaunchAgents/{BUILDQ_LABEL}.plist")
+    return f"cannot start the runner: {' '.join(argv)} exited {r.returncode}: {out}"
+
+
+def ensure_runner(q):
+    """Start the runner when nobody holds its lock, then wait up to CODETEAM_BUILDQ_START_WAIT for one that
+    holds the lock and has beaten within CODETEAM_BUILDQ_STALE seconds. None when one is up, else why not."""
+    if not runner_held(q) and (why := start_runner(q)):
+        return why
+    stale = env_seconds("CODETEAM_BUILDQ_STALE", 60)
+    deadline = time.time() + env_seconds("CODETEAM_BUILDQ_START_WAIT", 10)
+    while True:
+        age = beat_age(q)
+        if runner_held(q) and age is not None and age <= stale:
+            return None
+        if time.time() >= deadline:
+            return "the runner is not alive"
+        time.sleep(env_seconds("CODETEAM_BUILDQ_TICK", 1))
+
+
+def usage_error(msg):
+    print(msg, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def wait_seconds(text):
+    """The seconds of --wait. `auto` is the caller's shell limit (BASH_DEFAULT_TIMEOUT_MS) less a minute, at
+    least 30 s, so a wait that has not ended returns its WAITING line before the shell kills it; with no limit
+    known, 100 s, under Claude Code's default shell limit of 120 s."""
+    if text != "auto":
+        return float(text)
+    try:
+        return max(30.0, float(os.environ["BASH_DEFAULT_TIMEOUT_MS"]) / 1000 - 60)
+    except (KeyError, ValueError):
+        return 100.0
+
+
+def parse_submit(args):
+    """Parse `job submit` options, keeping the forwarded zone-tool test flags in the order given."""
+    o = {"class": "dev", "wait": None, "flags": [], "key": "", "salt": "", "scope": None, "cached": False,
+         "single": False, "cmd": None}
+    it = iter(args)
+    def collect():
+        for a in it:
+            if a == "--class":
+                o["class"] = next(it)
+            elif a == "--wait":
+                o["wait"] = wait_seconds(next(it))
+            elif a in ("--cached", "--single"):
+                o["flags"].append(a)
+                o[a[2:]] = True
+            elif a.startswith("--timeout="):
+                o["flags"].append(a)
+            elif a == "--timeout":
+                o["flags"] += [a, next(it)]
+            elif a in ("--key", "--salt", "--scope"):
+                v = next(it)
+                o["flags"] += [a, v]
+                o[a[2:]] = " ".join(v.split()) if a == "--key" else v
+            elif a == "--":
+                o["cmd"] = list(it)
+            else:
+                usage_error(f"zone-tool job submit: unknown option {a}")
+    try:
+        collect()
+    except (StopIteration, ValueError):
+        usage_error("zone-tool job submit: an option is missing its value")
+    if not o["cmd"] or o["class"] not in CLASSES:
+        usage_error("usage: zone-tool job submit --class land|full|post|pre|dev [--wait SECONDS|auto] [--key T] [--salt T] "
+                    "[--scope DIR] [--timeout S] [--cached] [--single] -- <command>")
+    return o
+
+
+def new_job(root, o):
+    return {
+        "ticket": f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}",
+        "kind": "run", "class": o["class"], "key": o["key"], "command": o["cmd"],
+        "worktree": str(root), "env": dict(os.environ),
+        "team": next((part for part in root.parts if part.startswith("team-")), None),
+        "session": os.environ.get("CODETEAM_SESSION") or None,
+        "submitted": time.time(), "started": None, "finished": None, "pid": None, "state": "queued",
+        "record": str(record_path(root, o["key"])), "cost": None,
+        "estimated_start": None, "position": None,
+        "warm_lock": None if os.environ.get("CODETEAM_WARMING") else str(git_dir(root) / "codeteam-warm.lock"),
+        "test_flags": o["flags"], "tool": str(Path(__file__).resolve()), "record_mtime": None,
+        "exit": None, "result": None, "reason": None, "fallback": False,
+    }
+
+
+def enqueue(q, job, single):
+    """Write the job and return (ticket, True); with single, an identical job (worktree, key, salt and command)
+    still queued or running answers instead: (its ticket, False)."""
+    q.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with queue_lock(q):
+        if single:
+            for j in read_jobs(q):
+                if (j["kind"] == "run" and j["state"] in ("queued", "running") and j["worktree"] == job["worktree"]
+                        and j["key"] == job["key"] and j["command"] == job["command"]
+                        and flag_value(j["test_flags"], "--salt") == flag_value(job["test_flags"], "--salt")):
+                    return j["ticket"], False
+        write_job(q, job)
+    return job["ticket"], True
+
+
+def run_here(q, ticket, why, test_args):
+    """The queue cannot serve the job, so the test runs in this process as `zone-tool test` does: a queue that
+    fails never fails the build."""
+    print(f"zone-tool: build queue unavailable ({why}); running the test here", file=sys.stderr, flush=True)
+    rc = cmd_test(test_args)
+    if ticket:
+        with contextlib.suppress(Exception):
+            update_job(q, ticket, state="done", exit=rc, finished=time.time())
+    return rc
+
+
+def claim_fallback(q, ticket, why, record):
+    """Mark the job running here (fallback: true, this process's pid, the record's mtime before the run) so the
+    runner leaves it alone, but only while it is still queued. False when the runner started it first: that run
+    is the job's. True otherwise, also when the queue cannot be reached: the test then runs here anyway."""
+    try:
+        with queue_lock(q):
+            job = read_job(q, ticket)
+            if job is None:
+                return True
+            if job["state"] != "queued":
+                return False
+            job.update(state="running", fallback=True, reason=f"fallback: {why}", pid=os.getpid(),
+                       started=time.time(), record_mtime=os.path.getmtime(record) if os.path.exists(record) else None)
+            write_job(q, job)
+    except Exception:
+        pass
+    return True
+
+
+def print_done(q, job):
+    """A done job's log, then its summary line; for a job whose test was answered from an existing record (it
+    ran nothing), the line says so."""
+    with contextlib.suppress(FileNotFoundError):
+        log = (q / f"{job['ticket']}.log").read_text(errors="replace")
+        sys.stdout.write(log if log.endswith("\n") or not log else log + "\n")
+    code = job.get("exit")
+    source = "answered from record" if job.get("answered") else "record"
+    print(f"zone-test: {job.get('result') or ('PASS' if code == 0 else 'FAIL')} (exit {code}); {source} {job['record']}")
+
+
+def print_waiting(q, job):
+    if job["state"] == "queued":
+        ahead = sum(1 for j in read_jobs(q) if j["state"] == "queued" and j["class"] == job["class"]
+                    and j["submitted"] < job["submitted"])
+        at = time.strftime("%H:%M", time.localtime(job["estimated_start"])) if job.get("estimated_start") else "unknown"
+        held = f", held: {job['hold']}" if job.get("hold") else ""
+        print(f"WAITING: queued, number {job.get('position') or ahead + 1} in class {job['class']}, "
+              f"estimated start {at}{held}")
+    else:
+        print(f"WAITING: running for {int((time.time() - job['started']) / 60)} min")
+    print(f"WAITING: zone-tool job wait {job['ticket']}")
+
+
+def wait_job(q, ticket, max_s, runs_here=False):
+    """Poll the job every CODETEAM_BUILDQ_TICK until it is done or broken, or max_s seconds pass (0: no limit).
+    Returns (exit code, job): 0 done (its log, then a summary line, are printed), 4 still waiting, 3 broken,
+    2 no such job. A runner found dead meanwhile is started again, so a wait never hangs on one. A runner that
+    holds its lock but has stopped beating (hung) while the job is still queued returns (None, job) when
+    runs_here, so the submitter can run the test itself; otherwise it prints that and returns 4."""
+    deadline = time.time() + max_s if max_s else None
+    stale = env_seconds("CODETEAM_BUILDQ_STALE", 60)
+    while True:
+        job = read_job(q, ticket)
+        if job is None:
+            print(f"zone-tool: no such job {ticket}", file=sys.stderr)
+            return 2, None
+        if job["state"] == "done":
+            print_done(q, job)
+            return 0, job
+        if job["state"] == "broken":
+            print(f"BROKEN: {job.get('reason')}")
+            return 3, job
+        age = beat_age(q)
+        if job["state"] == "queued" and age is not None and age > stale and runner_held(q):
+            if runs_here:
+                return None, job
+            print(f"WAITING: the runner is not responding (last beat {int(age)} s ago)")
+            print(f"WAITING: zone-tool job wait {ticket}")
+            return 4, job
+        if deadline and time.time() >= deadline:
+            print_waiting(q, job)
+            return 4, job
+        if not runner_held(q):
+            ensure_runner(q)
+        time.sleep(env_seconds("CODETEAM_BUILDQ_TICK", 1))
+
+
+
+# ---------------------------------------------------------------- test guards
+# A day of the queue (zone-audit, 2026-11-06): lanes kept to their zones, but reran their whole zone after every small
+# edit: about 36 of 79 whole-zone hours were reruns on a worktree that had already passed, and 12 more were whole
+# reruns straight after a FAIL. Three guards, on every `zone-tool job submit` that would run (an answer from a record
+# is free and never guarded):
+#   1. the type-check first: the product's `make check` (or the manifest's ZONE_CHECK_CMD) must be clean on this code,
+#      else the run is refused (exit 5) with the check's errors. The latest result is keyed by tree hash and DIR,
+#      plus CODETEAM_OWNS at the root; only a clean result is reused. ZONE_CHECK_CMD gets DIR's paths as arguments.
+#   2. after a whole-zone FAIL, the next whole run of that DIR waits until a filtered run of the failing tests passes.
+#   3. a request worktree gets ZONE_WHOLE_BUDGET (default 4) whole runs per DIR; past that, refused. The coordinator
+#      can grant more with `zone-tool grant <worktree> <key...> --reason TEXT` (logged).
+REFUSED = 5
+GUARD_FILE = "codeteam-test-guards.json"
+
+
+def _guards_load(root):
+    p = git_dir(root) / GUARD_FILE
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"check": {}, "whole": {}, "grants": {}, "log": []}
+
+
+def _guards_save(root, g):
+    p = git_dir(root) / GUARD_FILE
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(g, indent=1) + "\n")
+    os.replace(tmp, p)
+
+
+def _key_parts(key):
+    """('one', DIR, filters) for a zone-test-one key; filters excludes owns=, group= and test-group= words."""
+    w = key.split()
+    if len(w) < 2 or w[0] != "one":
+        return None, None, []
+    return w[0], w[1], [x for x in w[2:] if not x.startswith(("owns=", "group=", "test-group="))]
+
+
+def _key_groups(key):
+    """Sorted group= and test-group= words identifying which tests a record covers."""
+    return tuple(sorted(w for w in key.split() if w.startswith(("group=", "test-group="))))
+
+
+def _check_paths(root, d):
+    """DIR's paths, expanding root forms to sorted matches per non-empty CODETEAM_OWNS entry.
+
+    None means empty owns at the root: pass no arguments to the command. An empty
+    list means owns entries matched nothing: skip ZONE_CHECK_CMD rather than check everything.
+    Non-root DIRs are returned as given.
+    """
+    import glob
+    if (root / (d or ".")).resolve() != root.resolve():
+        return [d]
+    owns = [e for e in os.environ.get("CODETEAM_OWNS", "").split(":") if e]
+    if not owns:
+        return None
+    return [m for e in owns for m in sorted(glob.glob(e, root_dir=root))]
+
+
+def _check_command(root, d=None):
+    """(argv, shown) for ZONE_CHECK_CMD with DIR's paths as shell positional arguments, else
+    the product's `make check` with no arguments. Empty argv skips unmatched owns; None means
+    no gate, including when ZONE_CHECK=0.
+    """
+    import shlex
+    if os.environ.get("ZONE_CHECK", "1") == "0":
+        return None
+    if os.environ.get("ZONE_CHECK_CMD"):
+        paths = _check_paths(root, d)
+        shown = os.environ["ZONE_CHECK_CMD"]
+        if paths:
+            shown += " " + shlex.join(paths)
+        if paths == []:
+            return [], shown
+        return ["sh", "-c", os.environ["ZONE_CHECK_CMD"] + ' "$@"', "zone-check", *(paths or [])], shown
+    r = subprocess.run(["make", "-n", "--no-print-directory", "check"], cwd=root, capture_output=True, text=True)
+    if r.returncode == 0 or "No rule to make target" not in r.stderr:
+        return ["make", "--no-print-directory", "check"], "make --no-print-directory check"
+    return None
+
+
+def run_check(root, d, tree_hash, g):
+    """(ok, tail, shown) for DIR's check; reuse the latest clean result for the same tree and scope.
+
+    ZONE_CHECK_CMD receives DIR's paths as arguments; unmatched root owns is clean without
+    running it. The make fallback receives DIR through its environment. ok None means no gate.
+    """
+    command = _check_command(root, d)
+    if command is None:
+        return None, [], None
+    cmd, shown = command
+    scope = "." if (root / (d or ".")).resolve() == root.resolve() else d.rstrip("/")
+    if scope == ".":
+        scope += " owns=" + os.environ.get("CODETEAM_OWNS", "")
+    if g["check"].get("hash") == tree_hash and g["check"].get("scope") == scope and g["check"].get("ok"):
+        return True, [], shown
+    if cmd:
+        print(f"zone-test: type-check first: {shown}", flush=True)
+        r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=dict(os.environ, DIR=d or "."))
+        ok = r.returncode == 0
+        tail = (r.stdout + r.stderr).strip().splitlines()[-40:]
+    else:
+        ok, tail = True, ["zone-check: DIR=. matches none of CODETEAM_OWNS; nothing to check"]
+    g["check"] = {"hash": tree_hash, "scope": scope, "ok": ok, "time": now().isoformat(timespec="seconds")}
+    return ok, tail, shown
+
+
+def guard_run(root, key, tree_hash, joined):
+    """None to go ahead, or the refusal text. `joined`: an identical job is already queued (joining it is free)."""
+    if joined or os.environ.get("CODETEAM_BUILDQ_TICKET") or os.environ.get("CODETEAM_LANDING") == "1":
+        return None                 # the landing gate (codeteam-land) runs its own type check and bisects by design
+    g = _guards_load(root)
+    _, d, filters = _key_parts(key)
+    ok, tail, shown = run_check(root, d, tree_hash, g)
+    _guards_save(root, g)
+    if ok is False:
+        return ("\n".join([
+            f"zone-test: REFUSED: `{shown}` fails on this code, and you asked for a test run anyway.",
+            "  A test run on code that does not type-check burns a build slot to tell you what the check already",
+            "  says in seconds. Run the check after every batch of edits and get it clean BEFORE you ask for tests;",
+            "  that is your job, not the test queue's. Its errors:",
+            *[f"  | {l}" for l in tail],
+            "  Fix these, run the check until it is clean, then submit the tests again.",
+        ]))
+    if d is None:
+        return None
+    # A DIR that is one test file is already the narrow run: only a folder is a whole run.
+    whole = not filters and (root / d).is_dir()
+    in_request = "/requests/" in str(root) or "/wo/" in str(root)        # v5 work order trees get the budget too
+    if whole:
+        rec = read_record(root, key)
+        if rec and rec.get("result") == "FAIL":
+            since = dt.datetime.fromisoformat(rec["time"])
+            passed = False
+            for p in root.glob(".test-record-*.json"):
+                try:
+                    r2 = json.loads(p.read_text())
+                except (OSError, ValueError):
+                    continue
+                k2 = _key_parts(r2.get("key") or "")
+                # a filtered run of DIR, or a run of a narrower DIR inside it (one test file: some
+                # Makefiles refuse filters), counts as the failing tests run on their own
+                # a filtered pass of DIR; a pass of a narrower DIR the failing run named (a whole path token of its
+                # last lines, not a substring: 'zone' is not 'bin/zone-tool'); or a whole pass of a wider DIR.
+                # Groups must match: a pass in one group never unlocks a whole rerun in another.
+                named = set(_re.findall(r"[\w./-]+", "\n".join(rec.get("tail") or [])))
+                narrower = bool(k2[1]) and k2[1] != d and (d in (".", "") or k2[1].startswith(d.rstrip("/") + "/")) \
+                    and k2[1] in named
+                wider = bool(k2[1]) and not k2[2] and k2[1] != d and (k2[1] in (".", "") or d.startswith(k2[1].rstrip("/") + "/"))
+                if ((k2[1] == d and k2[2]) or narrower or wider) and r2.get("result") == "PASS" and \
+                        _key_groups(r2.get("key") or "") == _key_groups(key) and \
+                        dt.datetime.fromisoformat(r2["time"]) > since:
+                    passed = True
+                    break
+            if not passed:
+                return ("\n".join([
+                    f"zone-test: REFUSED: the last whole run of {d} FAILED, and no run of just the failing tests (a filter,",
+                    "  or DIR narrowed to their test file)",
+                    "  has passed since. Do not rerun the whole zone to find out whether your fix worked: fix every",
+                    "  failure that record lists in one round, run `make check` clean, then run ONLY the failing tests",
+                    "  (zone-test-one with a filter, the product layer's form). When they pass, the whole zone runs once.",
+                    "  The failing run's last lines:",
+                    *[f"  | {l}" for l in (rec.get("tail") or [])[-20:]],
+                ]))
+        if in_request:
+            budget = int(os.environ.get("ZONE_WHOLE_BUDGET", "4")) + int(g["grants"].get(key, 0))
+            used = int(g["whole"].get(key, 0))
+            if used >= budget:
+                return ("\n".join([
+                    f"zone-test: REFUSED: this request worktree has used its {budget} whole runs of {d}.",
+                    "  Whole-zone runs are for the baseline, the final set and a review round, not for checking each",
+                    "  edit. Batch your changes, keep `make check` clean, and run only the tests your change touches",
+                    "  (a filter; `codegraph affected <files> -p <worktree>` names them). If the whole zone really must",
+                    "  run again, return to your coordinator with the records: it can grant one more with",
+                    f"  zone-tool grant {root} '{key}' --reason <why>",
+                ]))
+            g["whole"][key] = used + 1
+            _guards_save(root, g)
+    return None
+
+
+def cmd_grant(args):
+    """zone-tool grant <worktree> <key> --reason TEXT: one more whole run of <key> in that request worktree
+    (the coordinator's call; logged in the worktree's guard file and printed by test-status)."""
+    if len(args) < 4 or "--reason" not in args:
+        usage_error("usage: zone-tool grant <worktree> <key> --reason TEXT")
+    i = args.index("--reason")
+    wt, key, reason = Path(args[0]).resolve(), " ".join(args[1:i]), " ".join(args[i + 1:])
+    if not reason.strip():
+        usage_error("zone-tool grant: say why")
+    key = " ".join(key.split())
+    g = _guards_load(wt)
+    g["grants"][key] = int(g["grants"].get(key, 0)) + 1
+    g["log"].append({"time": now().isoformat(timespec="seconds"), "key": key, "reason": reason,
+                     "by": os.environ.get("CODETEAM_SESSION") or "?"})
+    _guards_save(wt, g)
+    print(f"granted one more whole run of {key} in {wt}: {reason}")
+    return 0
+
+
+def cmd_check(args):
+    """zone-tool check [DIR]: run the guard's scope-cached check and print its result.
+
+    ZONE_CHECK_CMD gets DIR's paths (root forms mean CODETEAM_OWNS matches); `make check`
+    gets DIR in its environment. For ZONE_CHECK_CMD, empty root owns passes no paths and
+    unmatched owns skips the command.
+    """
+    root = top()
+    g = _guards_load(root)
+    ok, tail, shown = run_check(root, args[0] if args else ".", code_hash(root, None, snapshot(root)), g)
+    _guards_save(root, g)
+    if ok is None:
+        print("zone-check: this team has no type-check (no `make check` and no ZONE_CHECK_CMD)")
+        return 0
+    for l in tail:
+        print(l)
+    print(f"zone-check: {'clean' if ok else 'FAILS'} ({shown})")
+    return 0 if ok else 1
+
+
+def cmd_job_submit(args):
+    """zone-tool job submit --class C [--wait SECONDS|auto] [--key T] [--salt T] [--scope DIR] [--timeout S]
+    [--cached] [--single] -- <command>
+
+    Queue `zone-tool test` with these options for the class C. Prints the ticket and returns; with --wait waits
+    like `job wait` (0: no limit; auto: wait_seconds) and exits 0 when the test passed, 1 when it ran and did
+    not, 4 still waiting, 3 broken. When the runner stops beating while the job is queued, the test runs here.
+    A record that answers --cached or --single is printed as `zone-tool test` prints it, with no job.
+    Inside a running job (CODETEAM_BUILDQ_TICKET) the test just runs here.
+    --timeout S and --timeout=S pass through unchanged and have no effect since v5.2."""
+    o = parse_submit(args)
+    test_args = [*o["flags"], "--", *o["cmd"]]
+    if os.environ.get("CODETEAM_BUILDQ_TICKET"):
+        return cmd_test(test_args)
+    root = top()
+    if o["cached"] or o["single"]:
+        hit, _, before, _, _ = record_hit(root, o["key"], o["salt"], o["scope"])
+        if hit:
+            answer_from_record(root, o["key"], hit, before)
+            return (0 if hit["result"] == "PASS" else 1) if o["wait"] is not None else 0
+        tree_hash = before
+    else:
+        tree_hash = code_hash(root, None, snapshot(root))
+    q = queue_dir()
+    joined = any(j["kind"] == "run" and j["state"] in ("queued", "running") and j["worktree"] == str(root)
+                 and j["key"] == o["key"] and j["command"] == o["cmd"] for j in read_jobs(q)) if q.exists() else False
+    refusal = guard_run(root, o["key"], tree_hash, joined)
+    if refusal:
+        print(refusal, flush=True)
+        return REFUSED
+    record = str(record_path(root, o["key"]))
+    ticket = why = None
+    try:
+        ticket, written = enqueue(q, new_job(root, o), o["single"])
+        why = ensure_runner(q) if written else None
+    except Exception as e:
+        why = f"the queue failed: {type(e).__name__}: {e}"
+    if why:
+        runner_took_it = ticket and not claim_fallback(q, ticket, why, record)
+        if not runner_took_it:
+            return run_here(q, ticket, why, test_args)
+    if o["wait"] is None:
+        print(ticket)
+        return 0
+    code, job = wait_job(q, ticket, o["wait"], runs_here=True)
+    while code is None:
+        if claim_fallback(q, ticket, "the runner is not responding", record):
+            return run_here(q, ticket, "the runner is not responding", test_args)
+        code, job = wait_job(q, ticket, o["wait"], runs_here=True)
+    return code or (0 if job.get("exit") == 0 else 1)
+
+
+def cmd_job_wait(args):
+    """zone-tool job wait <ticket> [--max SECONDS]  (default: the shell limit less a minute, as --wait auto; 540 s when no limit is set)
+
+    The default was 540 s, under Claude Code's old 10-minute shell ceiling. codeteam sessions have a 30-minute
+    default since 2026-11-02, so each re-wait now blocks up to 29 minutes instead of 9: fewer turns, each of
+    which re-reads the waiting agent's whole context.
+
+    Exit 0 done: the job's output, then `zone-test: <result> (exit N); record <path>` (a FAIL is still exit 0);
+    4 still waiting (the last line is the command to wait on again); 3 broken; 2 no such job."""
+    if not args or not TICKET.fullmatch(args[0]) or len(args) not in (1, 3) or args[1:2] not in ([], ["--max"]):
+        usage_error("usage: zone-tool job wait <ticket> [--max SECONDS]")
+    return wait_job(queue_dir(), args[0], float(args[2]) if len(args) == 3 else (wait_seconds("auto") if "BASH_DEFAULT_TIMEOUT_MS" in os.environ else 540))[0]
+
+
+def job_detail(j):
+    if j["state"] == "queued":
+        return f"queued {int(time.time() - j['submitted'])} s"
+    if j["state"] == "running":
+        return f"running {int(time.time() - j['started'])} s"
+    if j["state"] == "done":
+        return f"done exit {'-' if j.get('exit') is None else j['exit']}"
+    return f"broken: {j.get('reason')}"
+
+
+def job_line(j):
+    cost = "-" if j.get("cost") is None else f"{j['cost']:g}"
+    return (f"{j['ticket']} {j['class']} {j['state']} {j.get('team') or '-'} {j.get('session') or '-'} "
+            f"{j.get('worktree') or '-'} cost={cost} {job_detail(j)}")
+
+
+def cmd_job_status(args):
+    """zone-tool job status [<ticket>]: the runner's budget and swap, then a line for each queued and
+    running job (with a ticket: that job in any state)."""
+    q = queue_dir()
+    st = read_runner_state(q)
+    if st is None or not runner_held(q):
+        print("runner: not running")
+    else:
+        print(f"budget {st['used']:g}/{st['budget']:g} swap {st['swap']:.2f}/{st['swap_max']:g}"
+              + (" HOLD dev" if st["swap_hold"] else ""))
+    jobs = read_jobs(q)
+    for j in [j for j in jobs if j["ticket"] in args] if args else [j for j in jobs if j["state"] in ("queued", "running")]:
+        print(job_line(j))
+    return 0
+
+
+def cmd_job_cancel(args):
+    """zone-tool job cancel <ticket>... | --worktree [PATH]: take queued jobs out of the queue (a running one is left
+    to finish). --worktree: every queued job of this worktree (or PATH). Each cancelled job is marked broken,
+    reason "cancelled", so a `job wait` on it returns 3. Without it, a lane that queued a batch by mistake
+    had no way to withdraw it."""
+    q = queue_dir()
+    if args[:1] == ["--worktree"]:
+        wt = str(Path(args[1]).resolve()) if len(args) > 1 else str(top())
+        tickets = [j["ticket"] for j in read_jobs(q) if j["state"] == "queued" and j.get("worktree") == wt]
+    else:
+        tickets = args
+    if not tickets:
+        print("nothing queued to cancel")
+        return 0
+    for t in tickets:
+        done = update_job(q, t, when="queued", state="broken", reason="cancelled", finished=time.time())
+        print(f"{t}: {'cancelled' if done else 'not queued (running, finished or unknown); left as it is'}")
+    return 0
+
+
+JOB_VERBS = {"submit": cmd_job_submit, "wait": cmd_job_wait, "status": cmd_job_status, "cancel": cmd_job_cancel}
+
+
+def cmd_job(args):
+    if not args or args[0] not in JOB_VERBS:
+        usage_error("usage: zone-tool job " + " | ".join(JOB_VERBS))
+    return JOB_VERBS[args[0]](args[1:])
+
+
+COMMANDS = {
+    "test": cmd_test,
+    "test-one": cmd_test_one,
+    "job": cmd_job,
+    "grant": cmd_grant,
+    "check": cmd_check,
+    "test-status": cmd_test_status,
+    "commit-record": cmd_commit_record,
+    "covered": cmd_covered,
+    "warm": cmd_warm,
+    "init-docs": cmd_init_docs,
+    "changelog": cmd_changelog,
+    "ledger": cmd_ledger,
+    "backlog": cmd_backlog,
+    "comment-review-due": cmd_comment_review_due,
+    "comment-review-done": cmd_comment_review_done,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.exit("usage: zone-tool " + " | ".join(COMMANDS))
+    sys.exit(COMMANDS[sys.argv[1]](sys.argv[2:]))

@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""codeteam-rt: session runtime. Mail watcher, session registry, hourly idle
+tick, worktree sweep, and the process helpers bin/codeteam loads. Spends no
+tokens: cron and the sessions' own background watchers run it.
+
+Mail: each session has <mail>/inbox, <mail>/outbox, <mail>/done. A message is
+<name>.md in inbox; its reply is outbox/<name>.md; handled messages move to done/.
+
+Registry: JSON at --registry or $CODETEAM_REGISTRY, one entry per session."""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import platform
+import signal
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+# cron runs with a short PATH and lsof lives in /usr/sbin. Homebrew comes first
+# so every tool this starts gets one python3 and one git.
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:/sbin:" + os.environ.get("PATH", "")
+
+HOUR = 3600
+COMPACT_AFTER = float(os.environ.get("CT_COMPACT_HOURS", "3")) * HOUR
+EXIT_AFTER = float(os.environ.get("CT_EXIT_HOURS", "6")) * HOUR
+EXIT_WAIT = float(os.environ.get("CT_EXIT_WAIT", "15"))
+KILL_WAIT = float(os.environ.get("CT_KILL_WAIT", "15"))
+IDLE_CHECK = "_idle-check-"
+COMPACT_MARKERS = ('"compact_boundary"', '"isCompactSummary":true', '"isCompactSummary": true')
+
+
+def now():
+    return time.time()
+
+
+def stamp(t=None):
+    return dt.datetime.fromtimestamp(t or now()).astimezone().isoformat(timespec="seconds")
+
+
+def log(msg):
+    print(f"{stamp()} {msg}", flush=True)
+
+
+# ---------- registry ----------
+
+def registry_path(args):
+    p = getattr(args, "registry", None) or os.environ.get("CODETEAM_REGISTRY")
+    if not p:
+        sys.exit("set --registry or CODETEAM_REGISTRY")
+    return Path(p)
+
+
+@contextmanager
+def registry(args):
+    path = registry_path(args)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = json.loads(path.read_text()) if path.exists() else {"sessions": {}}
+        yield data
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+
+
+# ---------- mail ----------
+
+def mail_dirs(mail):
+    m = Path(mail)
+    return m / "inbox", m / "outbox", m / "done"
+
+
+def unanswered(mail):
+    inbox, outbox, _ = mail_dirs(mail)
+    if not inbox.is_dir():
+        return []
+    return sorted(f.name for f in inbox.glob("*.md") if not (outbox / f.name).exists())
+
+
+def last_activity(entry):
+    _, _, done = mail_dirs(entry["mail"])
+    times = [entry.get("launched_at", 0), entry.get("activity_floor", 0)]
+    if done.is_dir():
+        times += [f.stat().st_mtime for f in done.glob("*.md") if not f.name.startswith(IDLE_CHECK)]
+    return max(times)
+
+
+def cmd_watch(args):
+    """Background watcher: exits when an inbox message has no reply, or at the timeout."""
+    mail = Path(args.inbox).resolve().parent
+    end = now() + args.timeout
+    while True:
+        waiting = unanswered(mail)
+        if waiting:
+            print("messages: " + ", ".join(waiting))
+            return 0
+        if now() >= end:
+            print("timeout: no messages")
+            return 0
+        time.sleep(min(args.interval, max(0.0, end - now())))
+
+
+def cmd_send(args):
+    inbox, outbox, done = mail_dirs(args.mail)
+    for d in (inbox, outbox, done):
+        d.mkdir(parents=True, exist_ok=True)
+    name = args.name if args.name.endswith(".md") else args.name + ".md"
+    text = sys.stdin.read() if args.text == "-" else args.text
+    (inbox / name).write_text(text.rstrip("\n") + "\n")
+    print(inbox / name)
+    return 0
+
+
+# ---------- processes ----------
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie still answers kill(0); treat it as gone.
+    r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return r.returncode == 0 and not r.stdout.strip().startswith("Z")
+
+
+def proc_command(pid):
+    r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def proc_cwd(pid):
+    if platform.system() == "Linux":
+        try:
+            return os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return ""
+    r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+def wait_gone(pid, seconds):
+    end = now() + seconds
+    while now() < end:
+        if not alive(pid):
+            return True
+        time.sleep(0.5)
+    return not alive(pid)
+
+
+def precise_kill(name, e):
+    """Kill exactly one process: the PID recorded at launch, after checking it is still that session."""
+    pid = e.get("pid")
+    if not alive(pid):
+        return True
+    cmd, cwd = proc_command(pid), proc_cwd(pid)
+    want_cwd = os.path.realpath(e["cwd"])
+    if e.get("match", "claude") not in cmd or os.path.realpath(cwd) != want_cwd:
+        e["kill_refused"] = f"{stamp()} pid {pid} is now '{cmd[:80]}' in '{cwd}'"
+        log(f"{name}: kill refused, pid {pid} no longer matches the session")
+        return False
+    log(f"{name}: TERM pid {pid}")
+    os.kill(pid, signal.SIGTERM)
+    if wait_gone(pid, KILL_WAIT):
+        return True
+    log(f"{name}: KILL pid {pid}")
+    os.kill(pid, signal.SIGKILL)
+    return wait_gone(pid, 5)
+
+
+# ---------- typing ----------
+
+def type_line(target, line):
+    """Retired: typed lines land in the user's own typing. Types nothing."""
+    return
+    kind, _, where = target.partition(":")
+    if kind == "tmux":
+        subprocess.run(["tmux", *tmux_server(), "send-keys", "-t", where, "-l", line], check=True)
+        time.sleep(0.5)
+        subprocess.run(["tmux", *tmux_server(), "send-keys", "-t", where, "Enter"], check=True)
+    elif kind == "terminal":
+        esc = line.replace("\\", "\\\\").replace('"', '\\"')
+        script = f'''tell application "Terminal"
+            repeat with w in windows
+                repeat with x in tabs of w
+                    if custom title of x is "{where}" or custom title of x ends with " {where}" then do script "{esc}" in x
+                end repeat
+            end repeat
+        end tell'''
+        subprocess.run(["osascript", "-e", script], check=True)
+    else:
+        raise ValueError(f"unknown target '{target}'")
+
+
+def tmux_server():
+    sock = os.environ.get("CT_TMUX_SOCKET", "codeteam")
+    return ["-L", sock] if sock else []
+
+
+# ---------- compaction check ----------
+
+def compact_count(e):
+    path = e.get("transcript")
+    if not path or not Path(path).exists():
+        return None
+    text = Path(path).read_text(errors="replace")
+    return sum(text.count(m) for m in COMPACT_MARKERS)
+
+
+# ---------- sleep ----------
+
+def make_target(swt, target):
+    if swt and Path(swt).is_dir():
+        r = subprocess.run(["make", "-C", swt, target], capture_output=True, text=True)
+        log(f"make {target} in {swt}: exit {r.returncode}")
+
+
+def put_to_sleep(name, e, how):
+    make_target(e.get("swt"), "clean")
+    e.update(state="asleep", asleep_since=stamp(), slept_by=how, pending_exit=None, pid=None)
+    log(f"{name}: asleep ({how})")
+
+
+def cmd_register(args):
+    with registry(args) as reg:
+        e = reg["sessions"].setdefault(args.name, {})
+        e.update(
+            state="awake", pid=args.pid, cwd=os.path.realpath(args.cwd), mail=os.path.realpath(args.mail),
+            target=args.target, launch=args.launch, launched_at=now(), pending_exit=None,
+            compact_try=None, compact_fail=e.get("compact_fail", 0),
+        )
+        for k in ("swt", "transcript", "match"):
+            v = getattr(args, k)
+            if v:
+                e[k] = os.path.realpath(v) if k != "match" else v
+    for d in mail_dirs(args.mail):
+        d.mkdir(parents=True, exist_ok=True)
+    log(f"{args.name}: registered pid {args.pid}")
+    return 0
+
+
+def cmd_tick(args):
+    """Check awake sessions: record compact attempts or request an idle reply before a precise kill.
+
+    The default thresholds are 3 and 6 hours; type_line is a no-op. Clean a session's
+    worktree when it is put to sleep, not on subsequent ticks while it is asleep.
+    """
+    with registry(args) as reg:
+        for name, e in sorted(reg["sessions"].items()):
+            if e.get("state") != "awake":
+                continue
+            if not alive(e.get("pid")):
+                put_to_sleep(name, e, "process ended")
+                continue
+            idle = now() - last_activity(e)
+            pend = e.get("pending_exit")
+            if pend:
+                reply = mail_dirs(e["mail"])[1] / pend
+                answer = reply.read_text().strip().lower() if reply.exists() else ""
+                if answer.startswith("busy"):
+                    e.update(pending_exit=None, activity_floor=now())
+                    log(f"{name}: answered busy; idle reset")
+                elif precise_kill(name, e):
+                    put_to_sleep(name, e, f"kill after idle check ({answer or 'no answer'})")
+                continue
+            if idle >= EXIT_AFTER:
+                log(f"{name}: idle {idle / HOUR:.2f} h, typing /exit")
+                try:
+                    type_line(e["target"], "/exit")
+                except Exception as ex:  # noqa: BLE001
+                    log(f"{name}: typing failed: {ex}")
+                if wait_gone(e["pid"], EXIT_WAIT):
+                    put_to_sleep(name, e, "/exit")
+                else:
+                    fname = f"{IDLE_CHECK}{int(now())}.md"
+                    inbox = mail_dirs(e["mail"])[0]
+                    inbox.mkdir(parents=True, exist_ok=True)
+                    (inbox / fname).write_text("Are you idle? Reply `idle` or `busy` in one word.\n")
+                    e["pending_exit"] = fname
+                    log(f"{name}: /exit did not end it; sent {fname}")
+                continue
+            if idle >= COMPACT_AFTER:
+                tried = e.get("compact_try")
+                if tried and tried > last_activity(e):
+                    count = compact_count(e)
+                    if count is not None and count > e.get("compact_count_at_try", 0):
+                        if not e.get("compacted_at") or e["compacted_at"] < tried:
+                            e["compacted_at"] = tried
+                            log(f"{name}: compaction confirmed")
+                        continue
+                    if count is None:
+                        continue  # no transcript to check; one attempt per idle stretch
+                    e["compact_fail"] = e.get("compact_fail", 0) + 1
+                    log(f"{name}: compaction not seen; retrying")
+                log(f"{name}: idle {idle / HOUR:.2f} h, typing /compact")
+                e["compact_count_at_try"] = compact_count(e) or 0
+                e["compact_try"] = now()
+                try:
+                    type_line(e["target"], "/compact")
+                except Exception as ex:  # noqa: BLE001
+                    log(f"{name}: typing failed: {ex}")
+    return 0
+
+
+# ---------- worktree sweep ----------
+
+def git(swt, *a, check=True):
+    return subprocess.run(["git", "-C", swt, *a], capture_output=True, text=True, check=check)
+
+
+def cmd_sweep(args):
+    """Remove request worktrees whose work is in the SWT; report the rest once to the SWE."""
+    swt = os.path.realpath(args.swt)
+    porcelain = git(swt, "worktree", "list", "--porcelain").stdout
+    trees, cur = [], {}
+    for line in porcelain.splitlines() + [""]:
+        if not line:
+            if cur:
+                trees.append(cur)
+            cur = {}
+        else:
+            k, _, v = line.partition(" ")
+            cur[k] = v
+    reported_file = Path(git(swt, "rev-parse", "--git-dir").stdout.strip())
+    if not reported_file.is_absolute():
+        reported_file = Path(swt) / reported_file
+    reported_file = reported_file / "codeteam-sweep-reported"
+    reported = set(reported_file.read_text().split()) if reported_file.exists() else set()
+    unmerged = []
+    for t in trees:
+        path = t.get("worktree", "")
+        if "/.claude/worktrees/agent-" not in path:
+            continue
+        wid = Path(path).name
+        branch = t.get("branch", "").removeprefix("refs/heads/")
+        in_swt = bool(git(swt, "log", "HEAD", "--format=%H", f"--grep=Worktree: {wid}").stdout.strip())
+        no_own_work = branch and git(swt, "merge-base", "--is-ancestor", branch, "HEAD", check=False).returncode == 0
+        clean = not git(path, "status", "--porcelain", check=False).stdout.strip()
+        if (in_swt or no_own_work) and clean:
+            git(swt, "worktree", "remove", path)
+            if branch:
+                git(swt, "branch", "-D", branch, check=False)
+            log(f"sweep: removed {wid}")
+        else:
+            unmerged.append(wid)
+    new = [w for w in unmerged if w not in reported]
+    if new and args.mail:
+        inbox = mail_dirs(args.mail)[0]
+        inbox.mkdir(parents=True, exist_ok=True)
+        name = f"_sweep-{int(now())}.md"
+        (inbox / name).write_text("Request worktrees not yet in the SWT: " + ", ".join(new) + "\n")
+        log(f"sweep: reported {', '.join(new)}")
+    reported_file.write_text("\n".join(sorted(set(unmerged))) + "\n")
+    return 0
+
+
+def cmd_status(args):
+    with registry(args) as reg:
+        for name, e in sorted(reg["sessions"].items()):
+            idle = (now() - last_activity(e)) / HOUR if e.get("mail") else 0
+            extra = " pending-exit" if e.get("pending_exit") else ""
+            print(f"{name:24} {e.get('state', '?'):7} pid={e.get('pid')} idle={idle:.1f}h "
+                  f"compact_fail={e.get('compact_fail', 0)}{extra}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="codeteam-rt")
+    ap.add_argument("--registry")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    w = sub.add_parser("watch"); w.add_argument("inbox"); w.add_argument("--timeout", type=float, default=1800); w.add_argument("--interval", type=float, default=20)
+    s = sub.add_parser("send"); s.add_argument("mail"); s.add_argument("name"); s.add_argument("text")
+    r = sub.add_parser("register"); r.add_argument("name")
+    for k in ("--cwd", "--mail", "--target", "--launch"):
+        r.add_argument(k, required=True)
+    r.add_argument("--pid", type=int, required=True)
+    for k in ("--swt", "--transcript", "--match"):
+        r.add_argument(k)
+    sub.add_parser("tick"); sub.add_parser("status")
+    sw = sub.add_parser("sweep"); sw.add_argument("swt"); sw.add_argument("--mail")
+    args = ap.parse_args()
+    return {"watch": cmd_watch, "send": cmd_send, "register": cmd_register, "tick": cmd_tick,
+            "sweep": cmd_sweep, "status": cmd_status}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

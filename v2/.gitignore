@@ -1,0 +1,5 @@
+logs/
+__pycache__/
+# smoke/run.py writes teams/<name>.toml for each run; only the hand-written example is tracked.
+teams/*.toml
+!teams/smoke.toml

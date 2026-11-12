@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+# Runtime state and scratch space codeteam writes inside its own checkout
+run/
+scratchpad/
+logs/
+.test-record*
+# The catalog's build output (python3 -I catalog/generate.py <product>)
+catalog/build/
+# Local settings: copy the examples
+mcp.json
+windows.toml
+# Rust and Swift build output
+target/
+cargo-target/
+.build/
+.DS_Store

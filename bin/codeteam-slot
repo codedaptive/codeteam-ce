@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Build queue client. `swift`, `cargo` and `xcodebuild` in codeteam's bin (first on every session's PATH) run
+their build and test commands through here. A gated command writes a slot job file into the build queue
+(zone/docs/build-queue.md), makes sure the queue's runner (bin/codeteam-buildq) is running, and waits until the runner marks
+the job running: that is its turn, and the runner decides it (class shares, swap, a worktree still being warmed).
+Then it sets CODETEAM_SLOT_HELD and execs the real tool, so the tool keeps this process's pid, which the job file
+names and the deck reads. A command that is not gated, or that already holds a turn (CODETEAM_SLOT_HELD, or
+CODETEAM_BUILDQ_TICKET inside a job the runner started), runs at once and writes nothing.
+If the queue folder is unwritable, a runner start fails or the runner goes quiet, the client falls back to
+running the build directly and says why on stderr."""
+import contextlib, fcntl, json, os, secrets, subprocess, sys, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+# launchd owns this job so the runner is outside every client's process tree.
+BUILDQ_LABEL = (os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam") + ".codeteam-buildq"
+# The installed launchd job serves only this queue (this checkout's run/queue), hard-coded in its plist.
+BUILDQ_LIVE_QUEUE = str(HERE.parent / "run" / "queue")
+# Jobs per build: a build is one tool call, and each tool defaults to one job per core (18), so four
+# concurrent builds were once 70+ compilers and the Mac ran out of memory (127 of 128 GB, 35 GB compressed) with half the CPU
+# idle. Every gated tool, warm builds included, gets this many parallel jobs unless the caller already set it.
+JOBS = int(os.environ.get("CODETEAM_JOBS_PER_SLOT", "4"))
+GATED = {
+    "swift": {"build", "test", "run"},
+    "cargo": {"build", "b", "test", "t", "check", "c", "run", "r", "clippy", "bench"},
+}
+
+
+class QueueUnavailable(Exception):
+    """The queue cannot give this build a turn; the message is the reason printed to the user."""
+
+
+def real_tool(name):
+    dirs = os.environ.get("PATH", "").split(os.pathsep) + [str(Path.home() / ".cargo" / "bin")]
+    for d in dirs:
+        if not d or Path(d).resolve() == HERE:
+            continue
+        p = Path(d) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    sys.exit(f"codeteam-slot: no {name} on PATH outside {HERE}")
+
+
+# xcodebuild has no subcommand: a run builds or tests unless it only asks for information (2026-10-28).
+XCODEBUILD_INFO = {"-list", "-version", "-showsdks", "-showBuildSettings", "-showdestinations", "-showTestPlans",
+                   "-resolvePackageDependencies", "-help", "-usage", "-license", "-checkFirstLaunchStatus",
+                   "-runFirstLaunch", "-find-executable", "-find-library", "-showBuildTimingSummary"}
+
+
+def gated(name, args):
+    if name == "xcodebuild":
+        return not any(a in XCODEBUILD_INFO for a in args)
+    return subcommand(name, args) in GATED.get(name, set())
+
+
+def subcommand(name, args):
+    for a in args:
+        if a.startswith("+") and name == "cargo":     # cargo +toolchain
+            continue
+        if not a.startswith("-"):
+            return a
+    return ""
+
+
+def cargo_target():
+    """A team that sets CODETEAM_CARGO_TARGET=1 builds Rust into <worktree>/cargo-target, the folder codeteam's
+    warm clones into new worktrees and its sweep empties when a worktree goes idle (a team's builds once
+    went to target/, which neither knows, and 30 of them filled the disk). Set only when nothing chose one."""
+    if os.environ.get("CODETEAM_CARGO_TARGET") == "1" and not os.environ.get("CARGO_TARGET_DIR"):
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+        if top:
+            os.environ["CARGO_TARGET_DIR"] = os.path.join(top, "cargo-target")
+
+
+def build_worktree():
+    """The git top level of the build's folder, or None when it cannot be told. Never raises and gives up
+    after 2 seconds, because this runs on every gated build."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=2)
+        return top.stdout.strip() or None if top.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def queue_dir():
+    return Path(os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
+
+
+@contextlib.contextmanager
+def queue_lock(q):
+    """Q/.lock, held only for one read-modify-write of a job file, never across a wait or a build: the runner
+    takes the same lock for its own edits."""
+    fd = os.open(str(q / ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def store_job(q, ticket, job):
+    """Writes the job file whole and atomically, 0600 like every file in Q: a run job in the same folder
+    holds its submitter's whole environment. The caller holds queue_lock."""
+    tmp = q / f".{ticket}.json.tmp"
+    with os.fdopen(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+        json.dump(job, f)
+    os.replace(str(tmp), str(q / f"{ticket}.json"))
+
+
+def warm_lock():
+    """The worktree's warm lock file when it exists, for the runner to hold the build until the warm that holds it
+    ends. The warm's own builds (CODETEAM_WARMING) never wait for themselves. Never raises: it runs on every
+    gated build."""
+    if os.environ.get("CODETEAM_WARMING"):
+        return None
+    try:
+        gd = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-dir"], capture_output=True,
+                            text=True, timeout=2)
+        lock = Path(gd.stdout.strip()) / "codeteam-warm.lock"
+        return str(lock) if gd.returncode == 0 and gd.stdout.strip() and lock.exists() else None
+    except Exception:
+        return None
+
+
+def write_job(q, name, args):
+    worktree = build_worktree()
+    ticket = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    job = {"ticket": ticket, "kind": "slot", "class": "dev", "key": f"slot {name}", "command": [name, *args],
+           "worktree": worktree, "env": {}, "session": os.environ.get("CODETEAM_SESSION") or None,
+           "team": next((p for p in Path(worktree).parts if p.startswith("team-")), None) if worktree else None,
+           "submitted": time.time(), "started": None, "finished": None, "pid": os.getpid(), "state": "queued",
+           "record": None, "cost": None, "estimated_start": None, "warm_lock": warm_lock(), "test_flags": [],
+           "tool": name, "record_mtime": None, "exit": None, "result": None, "reason": None, "fallback": False,
+           "position": None}
+    q.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with queue_lock(q):
+        store_job(q, ticket, job)
+    return q / f"{ticket}.json"
+
+
+def runner_alive(q):
+    """The runner holds Q/.runner.lock for its whole life, so a lock this probe can take means none runs."""
+    fd = os.open(str(q / ".runner.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def start_runner(q: Path) -> "str | None":
+    """Ask launchd to start the live-queue runner outside the client's process tree, so a tree kill
+    does not take the runner and its jobs with it. An override can serve any queue, including scratch queues.
+    Return None if the command succeeds, or the reason it failed."""
+    launch = os.environ.get("CODETEAM_BUILDQ_LAUNCH")
+    if not launch and os.path.realpath(q) != os.path.realpath(BUILDQ_LIVE_QUEUE):
+        return (f"cannot start a runner for {q}: launchd's job {BUILDQ_LABEL} serves {BUILDQ_LIVE_QUEUE}; "
+                "set CODETEAM_BUILDQ_LAUNCH to start a runner for another queue")
+    argv = [launch or "/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{BUILDQ_LABEL}"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, input="", cwd="/", start_new_session=True,
+                           env=dict(os.environ, CODETEAM_QUEUE_DIR=str(q),
+                                    CODETEAM_BUILDQ_LOG=str(q.parent / "buildq.log")))
+    except OSError as e:
+        return f"cannot start the runner: {e}"
+    out = (r.stderr or r.stdout or "").strip()
+    if r.returncode == 0:
+        return None
+    if r.returncode == 113 or "Could not find service" in (r.stdout or "") + (r.stderr or ""):
+        return (f"build-queue runner job {BUILDQ_LABEL} is not loaded in launchd "
+                f"({' '.join(argv)}: exit {r.returncode}: {out}); install it: "
+                f"launchctl bootstrap gui/{os.getuid()} ~/Library/LaunchAgents/{BUILDQ_LABEL}.plist")
+    return f"cannot start the runner: {' '.join(argv)} exited {r.returncode}: {out}"
+
+
+def ensure_runner(q):
+    """Request a runner when none holds the lock, then wait for it to come alive. Returns the
+    time before which an old heartbeat file means only that the runner has not written its first beat yet."""
+    if runner_alive(q):
+        return 0.0
+    if (why := start_runner(q)):
+        raise QueueUnavailable(why)
+    wait = float(os.environ.get("CODETEAM_BUILDQ_START_WAIT", "10"))
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if runner_alive(q):
+            return deadline
+        time.sleep(0.02)
+    raise QueueUnavailable(f"the runner did not come alive within {wait:g} s")
+
+
+def heartbeat_age(q):
+    try:
+        return time.time() - json.loads((q.parent / "queue-runner.json").read_text())["beat"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return float("inf")
+
+
+def wait_in_queue(q, jf, quiet_until):
+    """Polls the job file until the runner marks it running. The runner writes the job's place among the queued
+    dev jobs (a place of 1 is next in line and says nothing) and a hold of "warm" while the worktree's warm runs."""
+    tick = float(os.environ.get("CODETEAM_BUILDQ_TICK", "1.0"))
+    stale = float(os.environ.get("CODETEAM_BUILDQ_STALE", "60"))
+    told, warned = None, False
+    while True:
+        job = json.loads(jf.read_text())
+        if job["state"] == "running":
+            os.chmod(str(jf), 0o600)    # the runner writes job files 0600 too; this keeps the file private whatever wrote it
+            break
+        if job["state"] != "queued":
+            raise QueueUnavailable(f"the runner ended the job ({job['state']})")
+        if job.get("hold") == "warm" and not warned:
+            print("This worktree is still being warmed (codeteam's make warm, started when it was created). "
+                  "Waiting for it; this build then reuses its work.", file=sys.stderr, flush=True)
+            warned = True
+        place = job.get("position")
+        if place and place > 1 and place != told:
+            print(f"The build queue is full: you are number {place} among dev jobs.", file=sys.stderr, flush=True)
+            told = place
+        if time.time() > quiet_until and heartbeat_age(q) > stale:
+            raise QueueUnavailable(f"the runner has been quiet for over {stale:g} s")
+        time.sleep(tick)
+    if told is not None or warned:
+        print("A build share is free. Starting.", file=sys.stderr, flush=True)
+
+
+def claim_fallback(q, jf, why):
+    """Compare-and-swap under the queue lock: this build takes its own turn only while the runner has not granted
+    one. Returns the state the job was in before, so a caller finding "running" runs as the granted turn."""
+    with queue_lock(q):
+        job = json.loads(jf.read_text())
+        before = job["state"]
+        if before == "queued":
+            job.update(state="running", started=time.time(), fallback=True, reason=f"fallback: {why}", position=None)
+            store_job(q, job["ticket"], job)
+        return before
+
+
+def same_build_running(q, name, args):
+    """A live slot job in this worktree running the same command, or None. A lead whose shell gave up after its 30-min
+    limit runs the same `cargo check` again, and the first one is still building (the same command once ran three
+    times in one tree, 30 minutes apart, each waiting on the others' cargo lock)."""
+    worktree, cmd = build_worktree(), [name, *args]
+    for f in q.glob("*.json"):
+        try:
+            j = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if j.get("kind") == "slot" and j.get("state") in ("queued", "running") and j.get("worktree") == worktree \
+                and j.get("command") == cmd and j.get("pid") and j["pid"] != os.getpid():
+            try:
+                os.kill(int(j["pid"]), 0)
+                return j
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def wait_for_same_build(q, name, args):
+    """Wait while the same build already runs in this tree; then this one runs on its output (fast, incremental)."""
+    told = False
+    while (j := same_build_running(q, name, args)) is not None:
+        if not told:
+            print(f"codeteam-slot: the same {name} is already building in this tree (job {j.get('ticket')}); "
+                  "waiting for it instead of starting it twice", file=sys.stderr, flush=True)
+            told = True
+        time.sleep(5)
+
+
+def wait_for_turn(name, args):
+    q = queue_dir()
+    jf = None
+    try:
+        wait_for_same_build(q, name, args)
+        jf = write_job(q, name, args)
+        wait_in_queue(q, jf, ensure_runner(q))
+    except Exception as e:
+        why = str(e) if isinstance(e, QueueUnavailable) else f"{type(e).__name__}: {e}"
+        granted = False
+        if jf:
+            try:
+                granted = claim_fallback(q, jf, why) == "running"
+            except Exception:
+                pass
+        if not granted:
+            print(f"codeteam-slot: build queue unavailable ({why}); running the build now", file=sys.stderr,
+                  flush=True)
+
+
+def with_jobs(name, args):
+    """The tool's own parallelism flag, added when the caller gave none."""
+    if name == "cargo":
+        os.environ.setdefault("CARGO_BUILD_JOBS", str(JOBS))
+        return args
+    if name == "swift" and args and args[0] in GATED["swift"] and not any(a == "-j" or a.startswith("-j") or a == "--jobs" for a in args):
+        return [args[0], "-j", str(JOBS), *args[1:]]
+    if name == "xcodebuild" and "-jobs" not in args:
+        return [*args, "-jobs", str(JOBS)]
+    return args
+
+
+def main():
+    name, args = sys.argv[1], sys.argv[2:]
+    tool = real_tool(name)
+    if gated(name, args):
+        args = with_jobs(name, args)
+    if name == "cargo":
+        cargo_target()
+    if os.environ.get("CODETEAM_SLOT_HELD") or os.environ.get("CODETEAM_BUILDQ_TICKET") or not gated(name, args):
+        os.execv(tool, [tool, *args])
+    wait_for_turn(name, args)
+    os.environ["CODETEAM_SLOT_HELD"] = "1"
+    os.execv(tool, [tool, *args])
+
+
+if __name__ == "__main__":
+    main()

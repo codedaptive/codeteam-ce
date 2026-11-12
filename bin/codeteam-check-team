@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""codeteam-check-team <team> [<team>...]: check a team's setup against docs/new-team.md, read-only.
+
+Prints one line per check, PASS / FIX / INFO, and exits 1 if anything needs fixing. It changes nothing and never
+writes into a product repo. Written after a team's setup missed the build settings, a clean target,
+the whole-zone test rows and more; run it before unhalting a new team, and after any change to the harness.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from collections.abc import Callable
+from pathlib import Path
+
+HOME = Path.home()
+CT = Path(os.environ.get("CODETEAM_HOME") or Path(__file__).resolve().parent.parent)
+CATALOG = Path(os.environ.get("CODETEAM_CATALOG") or CT / "catalog")
+WORKSPACE = Path(os.environ.get("CODETEAM_WORKSPACE") or HOME / "codeteam-work")
+LAUNCHD_PREFIX = os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam"
+bad = 0
+
+
+def say(ok, what, hint=""):
+    global bad
+    tag = {True: "PASS", False: "FIX ", None: "INFO"}[ok]
+    if ok is False:
+        bad += 1
+    print(f"  {tag} {what}" + (f"  -> {hint}" if hint and ok is not True else ""))
+
+
+def git(repo, *a):
+    return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=30).stdout.strip()
+
+
+def has_file(repo, name):
+    out = git(repo, "ls-files", f"*{name}", name)
+    return bool(out)
+
+
+def runner_checks(team: str, running: Callable[[str], bool]) -> list[tuple[bool, str, str]]:
+    return [
+        (running(f"{LAUNCHD_PREFIX}.codeteam-{runner}.{team}"), f"v5: {command} runs (launchd)",
+         "codeteam-land <m> service install")
+        for runner, command in (("land", "queue-run"), ("recheck", "recheck-run"), ("validate", "validate-run"))
+    ]
+
+
+def check(team):
+    mpath = CT / "teams" / f"{team}.toml"
+    print(f"== {team}")
+    if not mpath.exists():
+        say(False, f"manifest {mpath}")
+        return
+    m = tomllib.loads(mpath.read_text())
+    env = m.get("env", {})
+    repo = Path(m["repo"]).expanduser()
+    root = Path(os.path.expanduser(m.get("worktree_root") or str(WORKSPACE / f"team-{team}")))
+    home = root / "team"
+    rust, swift = has_file(repo, "Cargo.toml"), has_file(repo, "Package.swift")
+    say(None, f"repo {repo} ({'rust ' if rust else ''}{'swift' if swift else ''}".strip() + ")")
+
+    # remotes
+    for line in git(repo, "remote", "-v").splitlines():
+        url = line.split()[1]
+        if "github" in url:
+            say(url.startswith("https://"), f"remote {line.split()[0]} {url}", "use https://github.com/... (gh)")
+            break
+
+    # build settings
+    if rust:
+        for k, v in (("CODETEAM_CARGO_TARGET", "1"), ("CODETEAM_WARM", "1"), ("CARGO_INCREMENTAL", "1"),
+                     ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"), ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
+                     ("CARGO_PROFILE_RELEASE_LTO", "false"), ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")):
+            say(env.get(k) == v, f"[env] {k} = {v}", f"set it in teams/{team}.toml")
+        say(str(env.get("RUSTC_WRAPPER", "")).endswith("sccache-wt/sccache"), "[env] RUSTC_WRAPPER = sccache-wt",
+            "codeteam/bin/sccache-wt/sccache")
+    if swift:
+        xc = env.get("CODETEAM_SWIFT_XCODE") == "1" or "swift-test-xcode" in str(env.get("ZONE_TEST_ONE_CMD", ""))
+        say(xc, "Swift builds through Xcode's compile cache (CODETEAM_SWIFT_XCODE=1 / swift-test-xcode)",
+            "plain `swift test` rebuilds every package in every worktree")
+        say(env.get("CODETEAM_SWIFT_XCODE") == "1" or env.get("CODETEAM_WARM") == "1",
+            "new worktrees are warmed (CODETEAM_SWIFT_XCODE=1 or CODETEAM_WARM=1)")
+    say(bool(env.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")), "[env] CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+
+    # build output ignored
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir") or repo / ".git")
+    ignored = (repo / ".gitignore").read_text() if (repo / ".gitignore").exists() else ""
+    ignored += (common / "info" / "exclude").read_text() if (common / "info" / "exclude").exists() else ""
+    for d in (["cargo-target"] if rust else []) + ([".build"] if swift else []):
+        say(d in ignored, f"{d}/ ignored by git", "add it to the repo's info/exclude")
+    rec = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", ".test-record-x.json"]).returncode == 0
+    say(rec, ".test-record-* (zone-tool records) ignored by git", "add /.test-record-* to the repo's info/exclude")
+
+    # make targets (codeteam's zone.mk is loaded through MAKEFILES)
+    mk = dict(os.environ, MAKEFILES=str(CT / "zone" / "zone.mk"), CODETEAM_HOME=str(CT))
+    for tgt, extra in (("zone-test-one", ["DIR=."]), ("zone-test-status", []), ("zone-clean", []), ("warm", [])):
+        r = subprocess.run(["make", "-n", "-C", str(repo), tgt, *extra], env=mk, capture_output=True, text=True,
+                           timeout=30)
+        say(r.returncode == 0 or "No rule" not in r.stderr, f"make {tgt}", (r.stderr.strip().splitlines() or [""])[-1][:100])
+    r = subprocess.run(["make", "-n", "-C", str(repo), "check"], env=mk, capture_output=True, text=True, timeout=30)
+    say(True if "No rule" not in r.stderr else None, "make check (the quick type-check)",
+        "none: the push gate is the manifest's `gate`")
+
+    # agents from the catalog
+    prod = CATALOG / "products" / team
+    say((prod / "product.toml").exists(), f"catalog product products/{team}")
+    pmd = prod / "rules" / "product.md"
+    text = pmd.read_text() if pmd.exists() else ""
+    say("Test calls" in text, "product.md has a Test calls table")
+    say("whole zone" in text.lower(), "product.md has a whole-zone row", "one call per port for a whole zone")
+    agents = home / "claude" / "agents"
+    first = next(iter(sorted(agents.glob("*.md"))), None) if agents.exists() else None
+    link = os.readlink(first) if first and first.is_symlink() else ""
+    say(f"v4/build/{team}" in link, "team/claude/agents link to the v4 build", f"generate.py {team} --install")
+    skills = home / "claude" / "skills"
+    for sk in ("refocus", "zone-tests", "codegraph"):
+        say((skills / sk / "SKILL.md").exists(), f"skill {sk} installed")
+    say((home / "claude" / "hooks" / "capture-metrics.sh").exists(), "hooks/capture-metrics.sh (status line)")
+    say((home / "claude" / "commands" / "prepare-for-compact.md").exists(), "commands/prepare-for-compact.md")
+    if (home / "claude" / "skills" / "codegraph" / "SKILL.md").exists():
+        same = (home / "claude" / "skills" / "codegraph" / "SKILL.md").read_bytes() == \
+               (CATALOG / "skills" / "codegraph" / "SKILL.md").read_bytes()
+        say(same, "codegraph skill matches the catalog", f"generate.py {team} --install")
+
+    # CodeGraph index in every standing worktree (a pinned worktree without one is skipped)
+    import re as _re
+    std = _re.compile(rf"^{_re.escape(str(root))}/(workcrews/[^/]+/[^/]+-exchange-[^/]+|exchange/[^/]+|integration/[^/]+)$")
+    missing = [p for p in [Path(l.split()[0]) for l in git(repo, "worktree", "list").splitlines() if l.split()]
+               if std.match(str(p)) and not (p / ".codegraph" / "codegraph.db").exists()]
+    say(not missing, f"every standing worktree has a CodeGraph index",
+        f"{len(missing)} without: codeteam-seed-index " + " ".join(str(p) for p in missing[:3]))
+
+    # MCP
+    mcp = repo / ".mcp.json"
+    if mcp.exists():
+        say("graft" not in mcp.read_text(), "repo .mcp.json has no graft", "remove the stray .mcp.json")
+    v2 = m.get("v2", {})
+    say(None, f"mcp_extra: {v2.get('mcp_extra') or 'none'}")
+
+    # staff
+    roles = [a.get("role") for a in m.get("assistants", [])]
+    say("designer" in roles, "a designer", "add an assistant with role = \"designer\"")
+    say(None, f"orchestrator {m.get('orc_model')}, lanes {m.get('lane_model')}")
+
+    # branch flow v5: a team with [land] enabled lands with codeteam-land
+    land = m.get("land") or {}
+    if land.get("enabled"):
+        hook = git(repo, "config", "--get", "hook.codeteam-land.command")
+        say(bool(hook) and Path(hook).exists(), "v5: the landing guard hook is installed", "codeteam-land <m> install-hook")
+        # The guard is a config hook (hook.<name>.command), which git runs from 2.54 on; an older git on the PATH moves
+        # integration with no guard at all (2026-11-08: Homebrew's 2.53, first on every session's PATH).
+        old_gits = []
+        for g in dict.fromkeys(["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]):
+            if Path(g).exists():
+                v = re.search(r"(\d+)\.(\d+)", subprocess.run([g, "--version"], capture_output=True, text=True).stdout)
+                if v and (int(v.group(1)), int(v.group(2))) < (2, 54):
+                    old_gits.append(f"{g} {v.group(0)}")
+        say(not old_gits, "v5: every git on the PATH runs the guard (2.54+)", "upgrade: " + ", ".join(old_gits))
+        for row in runner_checks(team, lambda label: subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                capture_output=True, text=True).returncode == 0):
+            say(*row)
+        tier = "remote" if land.get("remote") else "validate" if land.get("validate") else "default local clone"
+        say(True, f"v5: validation tier: {tier}")
+        integ = land.get("integration") or (m.get("base") if m.get("mode") == "lab" else m.get("integration", "integration"))
+        holders = [l for l in git(repo, "worktree", "list", "--porcelain").split("\n\n") if f"branch refs/heads/{integ}" in l]
+        say(all(f"worktree {repo}" in h for h in holders), f"v5: {integ} is checked out nowhere but the base checkout")
+        standing = [l for l in git(repo, "worktree", "list", "--porcelain").splitlines()
+                    if l.startswith("branch refs/heads/" + m.get("lane_branch_prefix", "lane/"))]
+        say(not standing, "v5: no standing lane worktrees", "codeteam-land <m> migrate retire")
+    else:
+        say(None, "branch flow: v2 (push-up)")
+
+    # plugin and halt
+    plug = HOME / ".config" / "herdr" / "plugins" / "config" / "codeteam.v2" / "teams.toml"
+    say(f"teams/{team}.toml" in (plug.read_text() if plug.exists() else ""), "herdr plugin lists the team")
+    say(None, "HALTED" if (home / "HALTED").exists() else "not halted")
+
+
+if __name__ == "__main__":
+    for t in sys.argv[1:] or [p.stem for p in sorted((CT / "teams").glob("*.toml"))]:
+        try:
+            check(t)
+        except Exception as e:
+            say(False, f"check failed: {type(e).__name__}: {e}")
+    sys.exit(1 if bad else 0)

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stand in for launchctl kickstart by starting the configured runner in the background for tests.
+d=$(cd "$(dirname "$0")" && pwd)
+runner="${CODETEAM_BUILDQ:-$d/../../bin/codeteam-buildq}"
+if [ ! -x "$runner" ]; then
+  echo "Could not find service \"com.codeteam.codeteam-buildq\" in domain for user gui: $(id -u)" >&2
+  exit 113
+fi
+"$runner" </dev/null >>"${CODETEAM_BUILDQ_LOG:-/dev/null}" 2>&1 &
+exit 0

@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""codeteam-check-manifests [DIR]: every teams/*.toml of this checkout loads.
+
+Each manifest is read the three ways the tools read it: as TOML, by codeteam's Team (bin/codeteam: modes, tiers,
+assistants, lanes) and by codeteam-land's Team. Nothing is created or changed. Exit 1 naming each manifest that does
+not load, so it cannot land (a Nagatha entry with a tier a lab team cannot have once landed, two teams'
+manifests stopped loading, and one team's loop stayed down)."""
+import importlib.machinery
+import importlib.util
+import sys
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load(name, path):
+    ld = importlib.machinery.SourceFileLoader(name, str(path))
+    sp = importlib.util.spec_from_loader(name, ld)
+    m = importlib.util.module_from_spec(sp)
+    sys.modules[name] = m
+    ld.exec_module(m)
+    return m
+
+
+def main(argv):
+    teams = Path(argv[0]) if argv else HERE.parent / "teams"
+    ct, cl = load("ct_check", HERE / "codeteam"), load("cl_check", HERE / "codeteam-land")
+    bad = []
+    for m in sorted(teams.glob("*.toml")):
+        for what, read in (("TOML", lambda: tomllib.loads(m.read_text())), ("codeteam", lambda: ct.Team(str(m))),
+                           ("codeteam-land", lambda: cl.Team(str(m), create=False))):
+            try:
+                read()
+            except SystemExit as e:
+                bad.append(f"{m.name} ({what}): {e}")
+                break
+            except Exception as e:
+                bad.append(f"{m.name} ({what}): {type(e).__name__}: {e}")
+                break
+    for line in bad:
+        print(f"FAIL {line}")
+    print(f"manifests: {len(list(teams.glob('*.toml'))) - len(bad)} load, {len(bad)} do not")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

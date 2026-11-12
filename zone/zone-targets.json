@@ -1,0 +1,3 @@
+{
+  "_doc": "Product make targets that belong to one zone: the zone guard lets that zone's lane run them. Every other repo-root target is whole-product (Nagatha's and tooling's). Add a target here when a zone's own test lives behind a product target. Example entry: \"packages/kits/StorageKit\": [\"zone-test-no-features\"]."
+}

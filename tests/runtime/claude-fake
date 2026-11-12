@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+import sys, os
+name, transcript = sys.argv[1], sys.argv[2]
+stubborn = os.environ.get("STUBBORN") == "1"
+log = open(os.path.join(os.path.dirname(transcript), name + ".typed"), "a")
+for line in sys.stdin:
+    l = line.strip(); log.write(l + "\n"); log.flush()
+    if l == "/exit" and not stubborn: sys.exit(0)
+    if l == "/compact":
+        open(transcript, "a").write('{"type":"system","subtype":"compact_boundary"}\n')

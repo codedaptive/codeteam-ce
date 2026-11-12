@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""codeteam-own starts /usr/bin/ssh as a separate responsible process (macOS).
+
+Accepted forms are ssh or /usr/bin/ssh, alone or under /usr/bin/timeout <n>. Bare ssh is pinned to /usr/bin/ssh.
+This network-access wrapper is limited to ssh, meaning the program
+/usr/bin/ssh. macOS judges local-network access by the responsible program, and children inherit their parent's
+responsibility. In launchd measurements, Homebrew Python's ssh got "No route to host", while ssh started
+through this wrapper connected. Disclaiming responsibility lets macOS judge the spawned command rather than the runner.
+stdin, stdout and stderr are the caller's. TERM, INT and HUP are passed to the spawned command; its exit status is
+returned, or 128 plus the signal number if it is signalled. Without the macOS responsibility call, the validated
+command runs directly."""
+import ctypes
+import ctypes.util
+import os
+import re
+import signal
+import sys
+
+
+# Pin the program so the responsibility bypass cannot reach another file named ssh or a PATH entry.
+SSH = "/usr/bin/ssh"
+
+
+def refused(argv: list[str]) -> str | None:
+    """Name what is refused (the program, or what is wrong with the command), or None for ssh with an optional
+    fixed-form /usr/bin/timeout."""
+    if not argv:
+        return "no command"
+    program = argv[0]
+    if program == "/usr/bin/timeout":
+        if len(argv) < 3:
+            return "/usr/bin/timeout (no command)"
+        if re.fullmatch(r"\d+(\.\d+)?[smhd]?", argv[1]) is None:
+            return "/usr/bin/timeout (invalid duration)"
+        program = argv[2]
+    if program in ("ssh", SSH):
+        return None
+    return program or "empty program"
+
+
+def command(argv: list[str]) -> list[str]:
+    """Pin bare ssh in an admitted command without changing the caller's argv."""
+    cmd = list(argv)
+    program = 2 if cmd[0] == "/usr/bin/timeout" else 0
+    if cmd[program] == "ssh":
+        cmd[program] = SSH
+    return cmd
+
+
+def main(argv: list[str]) -> int:
+    if name := refused(argv):
+        sys.stderr.write(f"codeteam-own: refused {name}: only ssh or /usr/bin/ssh, alone or under "
+                         "/usr/bin/timeout <n>, may be started\n")
+        return 2
+    cmd = command(argv)
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        disclaim = libc.responsibility_spawnattrs_setdisclaim
+    except (OSError, AttributeError, TypeError):
+        try:
+            os.execv(cmd[0], cmd)
+        except OSError as err:
+            sys.stderr.write(f"codeteam-own: {cmd[0]}: {err.strerror}\n")
+            return 127
+    attr = ctypes.c_void_p()
+    libc.posix_spawnattr_init(ctypes.byref(attr))
+    disclaim(ctypes.byref(attr), 1)
+    args = (ctypes.c_char_p * (len(cmd) + 1))(*[a.encode() for a in cmd], None)
+    env = (ctypes.c_char_p * (len(os.environ) + 1))(*[f"{k}={v}".encode() for k, v in os.environ.items()], None)
+    pid = ctypes.c_int()
+    err = libc.posix_spawn(ctypes.byref(pid), cmd[0].encode(), None, ctypes.byref(attr), args, env)
+    if err:
+        sys.stderr.write(f"codeteam-own: {cmd[0]}: {os.strerror(err)}\n")
+        return 127
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, lambda n, _f: os.kill(pid.value, n))
+    while True:
+        try:
+            _, status = os.waitpid(pid.value, 0)
+            break
+        except InterruptedError:
+            continue
+    code = os.waitstatus_to_exitcode(status)
+    return code if code >= 0 else 128 - code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,11 @@
+#!/bin/sh
+# launch-fake NAME STUBBORN  -- start a fake session in tmux and register it.
+# T is the private folder run-test*.sh made (CT_RT_DIR, holds this script and claude-fake); RT is the
+# codeteam-rt under test (CODETEAM_RT). Exit status is the register call's.
+T=${CT_RT_DIR:?set by run-test*.sh}; RT=${CODETEAM_RT:?set by run-test*.sh}
+N=$1; S=${2:-0}; mkdir -p "$T/$N/swt" "$T/$N/mail"
+printf 'clean:\n\t@date >> cleaned\nwarm:\n\t@date >> warmed\n' > "$T/$N/swt/Makefile"
+tmux -L ctest new-window -d -n $N -c "$T/$N/swt" "exec env STUBBORN=$S '$T/claude-fake' $N '$T/$N/transcript.jsonl'" 2>/dev/null || tmux -L ctest new-session -d -s ct -n $N -c "$T/$N/swt" "exec env STUBBORN=$S '$T/claude-fake' $N '$T/$N/transcript.jsonl'"
+sleep 0.5
+PID=$(tmux -L ctest list-panes -a -F '#{window_name} #{pane_pid}' | awk -v n=$N '$1==n{print $2}' | tail -1)
+"$RT" register $N --pid $PID --cwd "$T/$N/swt" --mail "$T/$N/mail" --target tmux:ct:$N --launch "'$T/launch-fake' $N $S" --swt "$T/$N/swt" --transcript "$T/$N/transcript.jsonl"
