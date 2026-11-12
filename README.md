@@ -39,7 +39,7 @@ to migration from CT to CTJJ.
 - Forge will then replace CTJJ and wrap GIT, GITHUB, JJ, Tessera, Mortar, and T3 Code into a full maintained software factory agent migration from version to version.
 - This version will receive bug fixes but no enhancements are planned it is feature complete.
 
-## Works with
+## Works with but does not require:
 
 - **[MOOTx01 CE](https://github.com/codedaptive/mootx01-ce)**: compatible with the MOOTx01 memory system, so
   agents keep what they learn across sessions, models and machines.
@@ -52,7 +52,7 @@ to migration from CT to CTJJ.
 - **Astra 6, Sol 6.1, Terra 6.1**
 > All agent files and skills where optimize using hundreds of hours of real python, typescript, swift, rust, agentic transcripts replayed through the models listed and tuned to the published prompting guides for each. If the expectations of future models change automous behavior will degrade; using with other models will require tuning to achieve automous factory production.
 
-Both are optional.
+
 
 ## Prerequisites
 
