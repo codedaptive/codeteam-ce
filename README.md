@@ -1,14 +1,43 @@
-# codeteam gamma preview
+<div align="center">
 
-codeteam runs a git repository as a team of standing Claude Code sessions: an orchestrator, a designer (Skippy), one
-coordinator per lane (a lane owns a set of packages or crates), and assistants such as Kong (reviews every change
-before it lands) and Nagatha (integration tests and promotion). Each session works in its own git worktree, inside
-walls that hooks enforce; messages between sessions go through a store and are delivered only when the recipient is
-ready. Every change lands through one tool, `codeteam-land`, which tests it, has it reviewed, merges it, rechecks
-and validates it, and promotes proven commits to the base branch.
+# codeteam
 
-This is a **gamma preview** of branch flow v5.4 (`docs/SPEC-branch-flow-v5.4.md`) published by
-[codedaptive](https://github.com/codedaptive). Expect rough edges; interfaces may change. It is **macOS only**.
+### A team of AI coding agents that ships working code.
+
+</div>
+
+One agent writing code is easy. Many agents writing code in the same repository at
+once is where things break: work collides, tests rot, and nobody can say what
+actually shipped. codeteam turns that crowd into a team.
+
+It runs a git repository as a standing crew of Claude Code sessions: an
+orchestrator, a designer (Skippy), a coordinator for each part of the code, a
+reviewer (Kong) and an integration builder (Nagatha). Each works in its own folder, inside walls the tools
+enforce. Every change reaches the main branch the same way: tested, reviewed,
+merged, rechecked and validated, then promoted only when it is proven.
+
+<div align="center">
+
+**The agents write the code. The landing flow decides what ships.**
+
+</div>
+
+[![release](https://img.shields.io/github/v/release/codedaptive/codeteam-ce?include_prereleases&label=release&color=success)](https://github.com/codedaptive/codeteam-ce/releases)
+![platforms](https://img.shields.io/badge/platforms-macOS-blue)
+![license](https://img.shields.io/badge/license-MIT-success)
+
+> **Gamma preview.** This is branch flow v5.4 ([`docs/SPEC-branch-flow-v5.4.md`](docs/SPEC-branch-flow-v5.4.md)),
+> released early to help people now. Expect rough edges; interfaces may change. macOS only.
+
+## Works with
+
+- **[MOOTx01 CE](https://github.com/codedaptive/mootx01-ce)**: compatible with the MOOTx01 memory system, so
+  agents keep what they learn across sessions, models and machines.
+- **[CodeGraph Hub](https://github.com/codedaptive/codegraph-hub)**: compatible with CodeGraph's pre-indexed code
+  knowledge graph, so agents find callers, impact and tests without grepping the repo
+  (`mcp.example.json` shows the setup).
+
+Both are optional.
 
 ## Prerequisites
 
