@@ -19,7 +19,9 @@ merged, rechecked and validated, then promoted only when it is proven.
 
 <div align="center">
 
-**The agents write the code. The landing flow decides what ships.**
+**You describe the spec, the Agents build it.**
+
+**Discovers and Risks are surfaced to the human**
 
 </div>
 
