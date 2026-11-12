@@ -47,7 +47,7 @@ to migration from CT to CTJJ.
   knowledge graph, so agents find callers, impact and tests without grepping the repo. The fork listed here is our
   custom fork that tracks codegraph but adds a centralized server needed for a software factory work at scale.
   (`mcp.example.json` shows the setup).
--  If not using Enterprise API pair with **[Official CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**: or our **[Codedaptive CLIProxy fork](https://github.com/codedaptive/CLIProxyAPI)** and our **[Quota forcasting and spend analysis management center fork](https://github.com/codedaptive/CLIProxyAPI-MgmtCenterWithForecasting)**)
+-  If not using Enterprise API pair with **[Official CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**: or our **[Codedaptive CLIProxy fork](https://github.com/codedaptive/CLIProxyAPI)** and our **[Quota forecasting and spend analysis management center fork](https://github.com/codedaptive/CLIProxyAPI-MgmtCenterWithForecasting)**)
 - **Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.2**
 - **Astra 6, Sol 6.1, Terra 6.1**
 > All agent files and skills where optimize using hundreds of hours of real python, typescript, swift, rust, agentic transcripts replayed through the models listed and tuned to the published prompting guides for each. If the expectations of future models change automous behavior will degrade; using with other models will require tuning to achieve automous factory production.

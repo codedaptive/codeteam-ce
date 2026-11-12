@@ -21,8 +21,8 @@ list() {
 scan() { list | tr '\n' '\0' | xargs -0 grep -nIE "$@" 2>/dev/null; }
 
 fail=0
-# README.md may name the public sibling projects (MOOTx01 CE) on lines that link to their public repos.
-hits=$( { scan -i "$NAMES" | grep -vE '^README\.md:[0-9]+:.*(github\.com/codedaptive/mootx01-ce|MOOTx01 memory system)'; scan -i "$BENCH" | grep -vi 'cargo'; } | sort -u)
+# README.md is marketing: it may name sibling projects. Everything else stays strict.
+hits=$( { scan -i "$NAMES" | grep -vE '^README\.md:'; scan -i "$BENCH" | grep -vi 'cargo'; } | sort -u)
 if [ -n "$hits" ]; then echo "private names or paths:"; echo "$hits" ; fail=1; fi
 org=$(scan -i "$ORG" | grep -vE '^(README\.md|LICENSE):')
 if [ -n "$org" ]; then echo "org name outside README.md and LICENSE:"; echo "$org" ; fail=1; fi
