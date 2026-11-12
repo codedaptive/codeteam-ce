@@ -11,7 +11,7 @@ once is where things break: work collides, tests rot, and nobody can say what
 actually shipped. codeteam turns that crowd into a team.
 
 It runs a git repository as a standing crew of Claude Code sessions: an
-orchestrator, a designer (Skippy), a coordinator for each part of the code, a
+orchestrator, a designer (Skippy), a coordinator (Bilby) for each part of the code, a
 reviewer (Kong) and an integration builder (Nagatha). Each works in its own folder, inside walls the tools
 enforce. Every change reaches the main branch the same way: tested, reviewed,
 merged, rechecked and validated, then promoted only when it is proven.
