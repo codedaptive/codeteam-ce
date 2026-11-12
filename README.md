@@ -1,3 +1,5 @@
+<img src="docs/assets/codeteam-ce-hero.jpg" alt="CodeTeam-CE: an LLM-powered multi-agent framework for repository-level code generation. Community Edition." width="100%">
+
 <div align="center">
 
 # CodeTeam - Gamma Release
