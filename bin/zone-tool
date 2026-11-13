@@ -51,6 +51,13 @@ OUT_OF_SPACE = ("no space left on device", "database or disk is full", "out of s
 # Matched case-insensitively on the line itself: lowercasing can change a line's length ('İ' becomes two code
 # points), so offsets found in a lowercased copy would not fit the original.
 OUT_OF_SPACE_RE = _re.compile("|".join(map(_re.escape, OUT_OF_SPACE)), _re.I)
+# Likewise a run whose package graph never resolved: no test ran (2026-11-11: two xcodebuilds racing on one
+# SourcePackages tree left a cached FAIL that refused the retry).
+PACKAGE_FAULT_RE = _re.compile(_re.escape("could not resolve package dependencies"), _re.I)
+# And xcodebuild's refusal when another build holds the same build database: nothing was built or tested
+# (2026-11-11: nine recheck builds fell back to running at once in land/itest and one was cached as FAIL).
+BUILD_DB_RE = _re.compile(_re.escape("two concurrent builds running in the same filesystem location"), _re.I)
+FAULTS = (("out of space", OUT_OF_SPACE_RE), ("package resolution", PACKAGE_FAULT_RE), ("build database in use", BUILD_DB_RE))
 DOCS = ["SPEC.md", "INTERFACE.md", "TESTING.md", "APPLIED_ADRS.md", "CHANGELOG.md"]
 SKELETON = Path(__file__).resolve().parent.parent / "zone" / "docs"
 SINGLE_WAIT = "zone-test: a run is already going in this worktree; waiting for its result"
@@ -264,7 +271,10 @@ def read_record(root, key=""):
 
 
 def test_group() -> str:
-    return os.environ.get("CODETEAM_TEST_GROUP", "").strip() or "unit"
+    """The test group a run proves: CODETEAM_TEST_GROUP (zone.mk's own test-one), else GROUP (a repo Makefile's
+    test-one reads it, and make exports a command-line GROUP=... to zone-tool and to the queued job), else unit.
+    Reading CODETEAM_TEST_GROUP alone labelled a repo's integration and validation runs "unit"."""
+    return os.environ.get("CODETEAM_TEST_GROUP", "").strip() or os.environ.get("GROUP", "").strip() or "unit"
 
 
 def commit_state(root: Path) -> tuple[str | None, bool]:
@@ -295,16 +305,20 @@ def append_commit_record(root: Path, key: str, rec: dict, answered: bool = False
         log.write(json.dumps(entry) + "\n")
 
 
-def record_hit(root, key, salt, scope_arg):
+def record_hit(root, key, salt, scope_arg, command=None):
     """The record that answers a --cached or --single run, or None, with the hashes it was judged by (the run
     stamps them into its own record): (hit, snap, before, scope, sbefore). A record answers when it is a finished
     PASS or FAIL with this salt and either the same whole tree or, with a scope, the same scope and nothing in it
-    changed."""
+    changed. Given the run's command (its words joined by spaces, as the record stores it), a record of another
+    command never answers: a run corrected by its command alone runs (a FAIL from a
+    wrong invocation answered the corrected one, so it could not be corrected without a code change)."""
     snap = snapshot(root)
     before = code_hash(root, None, snap)
     scope = scope_dirs(root, scope_arg) if scope_arg else None
     sbefore = code_hash(root, scope, snap) if scope else None
     rec = read_record(root, key)
+    if rec and command is not None and rec.get("command", command) != command:
+        rec = None
     hit = rec and rec.get("result") in ("PASS", "FAIL") and rec.get("salt", "") == salt and (
         rec.get("hash") == before or (scope and rec.get("scope") == scope and rec.get("scope_hash") == sbefore))
     # A record made before ports were split (2026-11-04) has the same scope without the "!rust" exclusions. It still
@@ -326,11 +340,19 @@ def answer_from_record(root, key, rec, before):
     """Print and restamp a matching record; log its answer at this commit only for a clean tree and matching group."""
     commit, clean = commit_state(root)
     group = test_group()
+    # A record written by an older version says "unit" for a run made with GROUP alone. Its key names the group (group= or
+    # test-group=) and matched this run's, so the run was in this group: the label is corrected and saved.
+    relabel = rec.get("group", "unit") == "unit" and group != "unit" and \
+        bool({f"group={group}", f"test-group={group}"} & set(key.split()))
+    if relabel:
+        rec["group"] = group
     if clean and rec.get("group", "unit") == group:
         append_commit_record(root, key, rec | {"commit": commit, "clean": clean, "group": group,
                                              "time": now().isoformat(timespec="seconds")}, answered=True)
     when = dt.datetime.fromisoformat(rec["time"]).strftime("%H:%M")
     if rec.get("hash") == before:
+        if relabel:
+            record_path(root, key).write_text(json.dumps(rec, indent=1) + "\n")
         print(f"zone-test: {rec['result']} at {when} already recorded for this exact code; not run again", flush=True)
     else:
         # Nothing these tests can touch changed: the record stands for this tree too. Stamp it so
@@ -387,14 +409,15 @@ def cmd_test(args):
                stays the code's alone, so test-status and covered need no salt.
 
     --cached   a record for exactly this code (or, with --scope, for the same scope with nothing
-               in it changed) and the same salt answers without running (2026-10-22:
-               63% of suite runs repeated an unchanged tree within the hour).
+               in it changed), the same salt and the same test command answers without running
+               (2026-10-22: 63% of suite runs repeated an unchanged tree within the hour; a
+               changed command runs).
     --single   one run at a time per worktree and key; a second caller waits for the first,
-               then is answered only by a matching PASS or FAIL record with the same salt.
+               then is answered only by a matching PASS or FAIL record with the same salt and command.
     --timeout  accepted as --timeout SECONDS or --timeout=SECONDS and ignored; no effect since v5.2.
                CODETEAM_HANG_WINDOW (default 600 s) and CODETEAM_HANG_CPU_PCT (default 1) govern
                HUNG: no output and tree CPU below the threshold over a whole window. There is
-               no absolute runtime limit. A nonzero run matching an OUT_OF_SPACE phrase is BROKEN unless
+               no absolute runtime limit. A nonzero run matching an OUT_OF_SPACE, package-resolution or build-database phrase is BROKEN unless
                it is HUNG; neither HUNG nor BROKEN answers --cached or --single.
     --scope    DIR: the record stands until something DIR's tests can touch changes (scope_dirs),
                not until anything in the worktree changes; `make zone-test-one` passes its DIR.
@@ -439,7 +462,7 @@ def cmd_test(args):
         every = codeteam_hang.settings(os.environ)[0] / 4
         wait_for_lock(try_lock, time.monotonic, time.sleep, lambda line: print(line, flush=True),
                       every, min(1.0, every))
-    hit, _, before, scope, sbefore = record_hit(root, key, salt, scope_arg)
+    hit, _, before, scope, sbefore = record_hit(root, key, salt, scope_arg, " ".join(cmd))
     if (cached or single) and hit:
         return answer_from_record(root, key, hit, before)
     commit, clean = commit_state(root)
@@ -466,11 +489,13 @@ def cmd_test(args):
             watch.output(time.monotonic())
             if out_of_space is None:
                 stripped = line.strip()
-                m = OUT_OF_SPACE_RE.search(stripped)
-                if m:
-                    # Shift the capped excerpt to keep the phrase, not just the line's prefix.
-                    lo = max(0, min(m.start(), len(stripped) - 200))
-                    out_of_space = stripped[lo:lo + 200]
+                for label, pattern in FAULTS:
+                    m = pattern.search(stripped)
+                    if m:
+                        # Shift the capped excerpt to keep the phrase, not just the line's prefix.
+                        lo = max(0, min(m.start(), len(stripped) - 200))
+                        out_of_space = (label, stripped[lo:lo + 200])
+                        break
             sys.stdout.write(line); sys.stdout.flush(); logf.write(line); tail.append(line.rstrip("\n"))
     pumper = threading.Thread(target=pump, daemon=True); pumper.start()
     def run_result():
@@ -494,8 +519,9 @@ def cmd_test(args):
         if reason is not None:
             return rc, "HUNG", reason
         if rc != 0 and out_of_space is not None:
-            print(f"zone-test: BROKEN (out of space): {out_of_space}", flush=True)
-            return rc, "BROKEN", f"out of space: {out_of_space}"
+            label, excerpt = out_of_space
+            print(f"zone-test: BROKEN ({label}): {excerpt}", flush=True)
+            return rc, "BROKEN", f"{label}: {excerpt}"
         return rc, "PASS" if rc == 0 else "FAIL", None
 
     rc, result, reason = run_result()
@@ -820,6 +846,28 @@ def _is_py_test(name):
     return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
 
 
+# The repo's unit, integration and validation test folders and the group each belongs to: the defaults of a
+# manifest's [land] unit_tests, integration_tests and validation_tests, which no team overrides. The landing tool
+# (bin/codeteam-land repo_test_steps) runs every .py and .sh file directly inside one, except conftest.py and
+# __init__.py (REPO_TEST_NOT_SCRIPTS), a .py that is not a pytest file by name as a plain script: tests/unit in
+# Stage 2's unit step, tests/integration in its integration step and tests/validation in Stage 6's validate-suite.
+# test-one runs them the same way, so a lane's receipt covers what the landing tool will run (codeteam's
+# land-*.py scripts were once skipped as "not a test by name", and the lane's record said PASS with none of them
+# run; a validation script once ran under pytest, whose INTERNALERROR on its sys.exit(0) recorded FAIL).
+REPO_TEST_FOLDERS = {"tests/unit": "unit", "tests/integration": "integration", "tests/validation": "validation"}
+REPO_TEST_NOT_SCRIPTS = ("conftest.py", "__init__.py")
+
+
+def _repo_script_kind(name):
+    """How a file directly inside a repo test folder runs, as Stage 2 runs it: "sh" (bash), "script" (python3 FILE),
+    or None (a pytest file, which pytest runs, or conftest.py, __init__.py and other files, which do not run)."""
+    if name.endswith(".sh"):
+        return "sh"
+    if name.endswith(".py") and not _is_py_test(name) and name not in REPO_TEST_NOT_SCRIPTS:
+        return "script"
+    return None
+
+
 def _has_py_tests(folder):
     for _, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in TEST_ONE_SKIP_DIRS]
@@ -828,13 +876,27 @@ def _has_py_tests(folder):
     return False
 
 
-def _test_one_plan(path, rel, owned):
-    """The runs for one path as [(kind, rel)], kind "py" or "sh", plus the skipped run.sh paths.
+def _test_one_plan(path, rel, owned, group="unit"):
+    """The runs for one path as [(kind, rel)], kind "py" (pytest), "script" (python3 FILE) or "sh" (bash), plus the
+    skipped paths as [(rel, why)], why "run.sh" or the group a repo test folder's script belongs to.
     owned: the path came from CODETEAM_OWNS, where a FILE runs only if it is a test by name
-    (a Python test file, or a .sh in a folder named tests); given directly as DIR, any .py or
-    .sh file runs. A file named run.sh is never run: by convention it is a manual runner for
-    the folder's other tests (codeteam's tests/run.sh is slow and makes worktrees)."""
+    (a Python test file, or a .sh in a folder named tests) or a script in a repo test folder;
+    given directly as DIR, any .py or .sh file runs. A repo test folder (REPO_TEST_FOLDERS), or a
+    folder holding one, also runs each script directly inside it as Stage 2 does, but only in that
+    folder's group; an owned script outside its group is skipped too, while one given as DIR runs.
+    A file named run.sh is never run: by convention it is a manual runner for the folder's other
+    tests (codeteam's tests/run.sh is slow and makes worktrees)."""
     runs, skipped, shells = [], [], []
+    norm = os.path.normpath(rel)
+
+    def script(rel_file, kind, folder_group, gate):
+        if gate and folder_group != group:
+            skipped.append((rel_file, folder_group))
+        elif kind == "sh":
+            shells.append(rel_file)
+        else:
+            runs.append((kind, rel_file))
+
     if path.is_dir():
         if _has_py_tests(path):
             runs.append(("py", rel))
@@ -843,14 +905,28 @@ def _test_one_plan(path, rel, owned):
             for sh in sorted(shdir.glob("*.sh")):
                 if sh.is_file():
                     shells.append(str(Path(rel) / sh.relative_to(path)))
+        for folder, folder_group in REPO_TEST_FOLDERS.items():
+            if folder != norm and not folder.startswith(norm + "/"):
+                continue
+            inside = path / os.path.relpath(folder, norm)
+            if not inside.is_dir():
+                continue
+            for f in sorted(inside.iterdir()):
+                kind = _repo_script_kind(f.name) if f.is_file() else None
+                if kind:
+                    script(str(Path(rel) / f.relative_to(path)), kind, folder_group, gate=True)
     elif path.is_file():
-        if path.suffix == ".py" and (not owned or _is_py_test(path.name)):
+        folder_group = REPO_TEST_FOLDERS.get(os.path.dirname(norm))
+        kind = _repo_script_kind(path.name) if folder_group else None
+        if kind:
+            script(rel, kind, folder_group, gate=owned)
+        elif path.suffix == ".py" and (not owned or _is_py_test(path.name)):
             runs.append(("py", rel))
         elif path.suffix == ".sh" and (not owned or path.parent.name == "tests"):
             shells.append(rel)
     for sh in shells:
         if Path(sh).name == "run.sh":
-            skipped.append(sh)
+            skipped.append((sh, "run.sh"))
         else:
             runs.append(("sh", sh))
     return runs, skipped
@@ -863,13 +939,19 @@ def cmd_test_one(args):
     (dot folders, __pycache__, node_modules, cargo-target and .build are not searched;
     pytest's exit 5, no tests collected, is not a failure), then each *.sh, sorted, in the
     folder itself when it is named tests, else in <folder>/tests/, each as `bash <file>`.
-    A .py file runs under pytest, a .sh file under bash. A file named run.sh is never run:
+    tests/unit, tests/integration and tests/validation (REPO_TEST_FOLDERS), as a folder or inside
+    one, also run each script directly in them as the landing tool does: a .py that is not a pytest
+    file by name as `python3 <file>`, a .sh under bash; each folder's only when the group
+    (test_group) is its own, with one "skipped" line per folder left out.
+    A .py file runs under pytest, a .sh file under bash, a script in a repo test folder as above
+    whatever the group. A file named run.sh is never run:
     by convention it is a manual runner for the folder's other tests (codeteam's
     tests/run.sh is slow and makes worktrees).
     A missing path, or one with no tests, prints "no tests" and exits 0.
     A DIR that resolves to the repo root (., ./, zone/.., the root's absolute path) means
     the lane's owned paths: each colon-separated entry of CODETEAM_OWNS, glob-expanded from
-    the root; an owned file runs only if it is a test by name. With CODETEAM_OWNS empty or
+    the root; an owned file runs only if it is a test by name or a script in a repo test
+    folder of this run's group, and each run happens once. With CODETEAM_OWNS empty or
     unset, the root is refused (exit 2) rather than passing with no tests or running the
     whole repo.
     Python is ZONE_PYTHON, default CODETEAM_PYTHON, else the Python running zone-tool. Children drop CODETEAM_* and
@@ -894,13 +976,22 @@ def cmd_test_one(args):
         paths = [(m, True) for e in owns for m in sorted(glob.glob(e, root_dir=root))]
     else:
         paths = [(target, False)]
-    runs, skipped = [], []
+    runs, skipped, group = [], [], test_group()
     for rel, owned in paths:
-        r, s = _test_one_plan(root / rel, rel, owned)
+        r, s = _test_one_plan(root / rel, rel, owned, group)
         runs += r
         skipped += s
-    for s in skipped:
-        print(f"skipped {s}: run.sh is a manual runner")
+    # An owns list may name a folder and files in it (tests/unit and tests/unit/land-*.py): each runs once.
+    runs, skipped = list(dict.fromkeys(runs)), list(dict.fromkeys(skipped))
+    other_group = {}
+    for s, why in skipped:
+        if why == "run.sh":
+            print(f"skipped {s}: run.sh is a manual runner")
+        else:
+            other_group.setdefault((os.path.dirname(os.path.normpath(s)), why), []).append(s)
+    for (folder, why), files in other_group.items():
+        print(f"skipped {len(files)} script(s) in {folder}: the {why} group's, and this run is {group}; "
+              f"run them with CODETEAM_TEST_GROUP={why}")
     py = os.environ.get("ZONE_PYTHON") or os.environ.get("CODETEAM_PYTHON") or sys.executable
     # Drop CODETEAM_* and HERDR_* except the keep list: an inherited CODETEAM_MANIFEST can make a hook test
     # act on a live team. Keep codeteam's location, the build queue's variables, landing and the test group;
@@ -913,7 +1004,7 @@ def cmd_test_one(args):
     passed, failed = 0, []
     for kind, rel in runs:
         # -p no:cacheprovider: no .pytest_cache folder in the worktree.
-        cmd = [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", rel] if kind == "py" else ["bash", rel]
+        cmd = {"py": [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", rel], "script": [py, rel]}.get(kind, ["bash", rel])
         print(f"test-one: run {shlex.join(cmd)}", flush=True)
         rc = subprocess.run(cmd, cwd=root, env=env).returncode
         if kind == "py" and rc == 5:  # pytest collected nothing: no tests, not a failure
@@ -1246,8 +1337,9 @@ def wait_job(q, ticket, max_s, runs_here=False):
 # reruns straight after a FAIL. Three guards, on every `zone-tool job submit` that would run (an answer from a record
 # is free and never guarded):
 #   1. the type-check first: the product's `make check` (or the manifest's ZONE_CHECK_CMD) must be clean on this code,
-#      else the run is refused (exit 5) with the check's errors. The latest result is keyed by tree hash and DIR,
-#      plus CODETEAM_OWNS at the root; only a clean result is reused. ZONE_CHECK_CMD gets DIR's paths as arguments.
+#      else the run is refused (exit 5) with the check's errors. One result is kept per scope (DIR, plus
+#      CODETEAM_OWNS at the root and a group other than unit) for the current tree hash; only a clean result is
+#      reused. ZONE_CHECK_CMD gets DIR's paths as arguments. A key with no DIR checks the lane's zone.
 #   2. after a whole-zone FAIL, the next whole run of that DIR waits until a filtered run of the failing tests passes.
 #   3. a request worktree gets ZONE_WHOLE_BUDGET (default 4) whole runs per DIR; past that, refused. The coordinator
 #      can grant more with `zone-tool grant <worktree> <key...> --reason TEXT` (logged).
@@ -1260,7 +1352,7 @@ def _guards_load(root):
     try:
         return json.loads(p.read_text())
     except (OSError, ValueError):
-        return {"check": {}, "whole": {}, "grants": {}, "log": []}
+        return {"checks": {}, "whole": {}, "grants": {}, "log": []}
 
 
 def _guards_save(root, g):
@@ -1271,16 +1363,18 @@ def _guards_save(root, g):
 
 
 def _key_parts(key):
-    """('one', DIR, filters) for a zone-test-one key; filters excludes owns=, group= and test-group= words."""
+    """('one', DIR, filters) for a zone-test-one key; filters excludes owns=, group=, test-group= and env: words
+    (zone.mk's opt-in variables: a run with one on is still a whole run of DIR)."""
     w = key.split()
     if len(w) < 2 or w[0] != "one":
         return None, None, []
-    return w[0], w[1], [x for x in w[2:] if not x.startswith(("owns=", "group=", "test-group="))]
+    return w[0], w[1], [x for x in w[2:] if not x.startswith(("owns=", "group=", "test-group=", "env:"))]
 
 
 def _key_groups(key):
-    """Sorted group= and test-group= words identifying which tests a record covers."""
-    return tuple(sorted(w for w in key.split() if w.startswith(("group=", "test-group="))))
+    """Sorted group=, test-group= and env: words identifying which tests a record covers (an opt-in variable turns
+    tests on, so a pass with it off never unlocks a whole rerun with it on)."""
+    return tuple(sorted(w for w in key.split() if w.startswith(("group=", "test-group=", "env:"))))
 
 
 def _check_paths(root, d):
@@ -1321,6 +1415,12 @@ def _check_command(root, d=None):
     return None
 
 
+def _zone_dir():
+    """The lane's zone (CODETEAM_ZONE), or . when the session names none: the DIR a check gets when its caller
+    names no DIR (a plain `make zone-check`, the zone suite, a product's own suite key)."""
+    return os.environ.get("CODETEAM_ZONE", "").strip().strip("/") or "."
+
+
 def run_check(root, d, tree_hash, g):
     """(ok, tail, shown) for DIR's check; reuse the latest clean result for the same tree and scope.
 
@@ -1334,7 +1434,16 @@ def run_check(root, d, tree_hash, g):
     scope = "." if (root / (d or ".")).resolve() == root.resolve() else d.rstrip("/")
     if scope == ".":
         scope += " owns=" + os.environ.get("CODETEAM_OWNS", "")
-    if g["check"].get("hash") == tree_hash and g["check"].get("scope") == scope and g["check"].get("ok"):
+    # The check runs with the caller's GROUP, which can declare more targets (a Package.swift may declare its
+    # integration and validation test targets only for their GROUP): a clean check of one group never answers for
+    # another.
+    if test_group() != "unit":
+        scope += " group=" + test_group()
+    # One result per scope for this tree: a lane that moves between DIRs, or between a DIR and its zone, does
+    # not re-run a check it already passed on the same code. Results for other trees are dropped when one is saved.
+    checks = g.setdefault("checks", {})
+    hit = checks.get(scope) or {}
+    if hit.get("hash") == tree_hash and hit.get("ok"):
         return True, [], shown
     if cmd:
         print(f"zone-test: type-check first: {shown}", flush=True)
@@ -1343,7 +1452,8 @@ def run_check(root, d, tree_hash, g):
         tail = (r.stdout + r.stderr).strip().splitlines()[-40:]
     else:
         ok, tail = True, ["zone-check: DIR=. matches none of CODETEAM_OWNS; nothing to check"]
-    g["check"] = {"hash": tree_hash, "scope": scope, "ok": ok, "time": now().isoformat(timespec="seconds")}
+    g["checks"] = {s: c for s, c in checks.items() if c.get("hash") == tree_hash}
+    g["checks"][scope] = {"hash": tree_hash, "ok": ok, "time": now().isoformat(timespec="seconds")}
     return ok, tail, shown
 
 
@@ -1353,7 +1463,8 @@ def guard_run(root, key, tree_hash, joined):
         return None                 # the landing gate (codeteam-land) runs its own type check and bisects by design
     g = _guards_load(root)
     _, d, filters = _key_parts(key)
-    ok, tail, shown = run_check(root, d, tree_hash, g)
+    # A key with no DIR (the zone suite, or a product's own suite key) checks the lane's zone, not the whole repo.
+    ok, tail, shown = run_check(root, d if d is not None else _zone_dir(), tree_hash, g)
     _guards_save(root, g)
     if ok is False:
         return ("\n".join([
@@ -1441,7 +1552,8 @@ def cmd_grant(args):
 
 
 def cmd_check(args):
-    """zone-tool check [DIR]: run the guard's scope-cached check and print its result.
+    """zone-tool check [DIR]: run the guard's scope-cached check and print its result. With no DIR, the lane's
+    zone (CODETEAM_ZONE; . when it names none).
 
     ZONE_CHECK_CMD gets DIR's paths (root forms mean CODETEAM_OWNS matches); `make check`
     gets DIR in its environment. For ZONE_CHECK_CMD, empty root owns passes no paths and
@@ -1449,7 +1561,7 @@ def cmd_check(args):
     """
     root = top()
     g = _guards_load(root)
-    ok, tail, shown = run_check(root, args[0] if args else ".", code_hash(root, None, snapshot(root)), g)
+    ok, tail, shown = run_check(root, args[0] if args and args[0] else _zone_dir(), code_hash(root, None, snapshot(root)), g)
     _guards_save(root, g)
     if ok is None:
         print("zone-check: this team has no type-check (no `make check` and no ZONE_CHECK_CMD)")
@@ -1476,7 +1588,7 @@ def cmd_job_submit(args):
         return cmd_test(test_args)
     root = top()
     if o["cached"] or o["single"]:
-        hit, _, before, _, _ = record_hit(root, o["key"], o["salt"], o["scope"])
+        hit, _, before, _, _ = record_hit(root, o["key"], o["salt"], o["scope"], " ".join(o["cmd"]))
         if hit:
             answer_from_record(root, o["key"], hit, before)
             return (0 if hit["result"] == "PASS" else 1) if o["wait"] is not None else 0

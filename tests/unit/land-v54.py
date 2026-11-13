@@ -128,6 +128,88 @@ def test_review_findings_send_back_and_nothing_lands():
         assert json.loads((team.dir / "landed.log").read_text())["result"] == "review findings"
 
 
+def review_set(team, w_state="pending"):
+    """A --with set of w (zone A, under Kong's review) and g (zone B, whose own commits Kong passed earlier)."""
+    work(team, "w", "A", "T")
+    work(team, "g", "B", "G")
+    asked = "2026-11-10T12:00:00+00:00"
+    rows = {"w": {"stage": 3, "wo": "w", "zone": "A", "feature": "w", "tip": "T", "seen": {"Kong": []},
+                  "reviewers": {"Kong": w_state}, "commits": {"Kong": ["T"]}, "requested": asked,
+                  "state": "pending" if w_state == "pending" else "land",
+                  "with": [{"wo": "g", "zone": "B", "tip": "G"}]},
+            "g": {"stage": 3, "wo": "g", "zone": "B", "feature": "g", "tip": "G", "seen": {"Kong": ["G0"]},
+                  "reviewers": {}, "commits": {}, "requested": asked, "state": "land",
+                  "with": [{"wo": "w", "zone": "A", "tip": "T"}]}}
+    for wo, row in rows.items():
+        (team.dir / "reviews" / f"{wo}.json").write_text(json.dumps(row))
+    entry = {"wos": ["w", "g"], "wo": "w", "tip": "T", "tips": [["w", "T"], ["g", "G"]], "base": "B",
+             "zones": ["A", "B"], "queued": "now", "state": "waiting",
+             "review": "pending" if w_state == "pending" else "land"}
+    p = team.dir / "queue" / "w.json"
+    p.write_text(json.dumps(entry))
+    return p
+
+
+def file_finding(team, feature, wo, zone, who="Kong"):
+    a = SimpleNamespace(feature=feature, wo=[wo], zone=zone, where=f"{zone}/value:1", severity=2,
+                        kind="spec", what="refusal missing", belongs="", same_as=None)
+    with patch.dict(os.environ, CODETEAM_SESSION=who), contextlib.redirect_stdout(io.StringIO()):
+        cl.cmd_finding(team, a)
+
+
+def test_finding_on_a_passed_set_member_is_held_while_the_set_is_under_review():
+    # Kong once read one member's code with its set and found it wrong, but finding refused it because
+    # only another member was under review, and his reviewed on that member landed the whole set.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = team_at(Path(tmp)); review_set(team)
+        file_finding(team, "g", "g", "B")
+        assert [f["id"] for f in cl.load_findings(team, "g")] == ["g#1"]
+        team.notify.assert_not_called()
+
+
+def test_partner_finding_sends_the_whole_set_back():
+    with tempfile.TemporaryDirectory() as tmp:
+        team = team_at(Path(tmp)); p = review_set(team)
+        file_finding(team, "g", "g", "B")
+        with patch.object(cl, "move_landing", create=True) as move, contextlib.redirect_stdout(io.StringIO()):
+            verdict(team)
+        assert not p.exists(), "a finding on any member must take the whole set out of the queue"
+        assert "queued" not in team.wo("w") and "queued" not in team.wo("g")
+        move.assert_not_called()
+        w = json.loads((team.dir / "reviews" / "w.json").read_text())
+        g = json.loads((team.dir / "reviews" / "g.json").read_text())
+        assert w["reviewers"]["Kong"] == "pass", "w's own commits had no finding"
+        assert (g["state"], g["reviewers"]["Kong"]) == ("findings", "findings")
+        assert "G" in g["seen"]["Kong"]
+        sent = [c.args for c in team.notify.call_args_list]
+        assert [(to, kind) for to, kind, _ in sent] == [("Coord-B", "REQUEST")], sent
+        assert all(s in sent[0][2] for s in ("g#1", "B/value:1", "refusal missing", "same tree", "w"))
+
+
+def test_partner_finding_is_refused_once_the_reviewer_owes_no_verdict_in_the_set():
+    with tempfile.TemporaryDirectory() as tmp:
+        team = team_at(Path(tmp)); review_set(team, w_state="pass")
+        try:
+            file_finding(team, "g", "g", "B")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("with every verdict in, a late finding waits for landing (a fix work order)")
+        assert cl.load_findings(team, "g") == []
+
+
+def test_partner_finding_needs_the_filer_to_owe_a_verdict_in_the_set():
+    with tempfile.TemporaryDirectory() as tmp:
+        team = team_at(Path(tmp)); review_set(team)
+        try:
+            file_finding(team, "g", "g", "B", who="Perkins")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("Perkins owes no verdict in this set, so no verdict of his would send it back")
+        assert cl.load_findings(team, "g") == []
+
+
 def test_verdict_survives_landing_moving():
     with tempfile.TemporaryDirectory() as tmp:
         team = team_at(Path(tmp)); work(team); p = review(team)

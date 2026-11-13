@@ -89,6 +89,7 @@ def test_own_changes_and_request_text():
         assert f"codeteam-land {team.manifest} reviewed w1" in text
         assert "finding <feature> --wo <wo>" in text
         assert "Stage 3 review before landing" in text
+        assert "run `reviewed` for each work order in every case: with findings filed it sends them" in text
 
 
 def test_after_landing_records_feature_rounds_without_guard_handoff():

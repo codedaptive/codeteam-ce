@@ -391,6 +391,7 @@ class FakeTeam:
         self.herdr_session = "test"
         self.cfg = {}
         self.cap, self.swap_idle_min, self.blocked_alert_min, self.poll_s, self.gather_s = 16, 20, 2, 2, 0
+        self.disk_check_s = 0       # the loop's disk check reads the real volume; test_disk_watch covers it
         self.t = SimpleNamespace(manifest="/m.toml", inbox=lambda k: self.dir / "no-inbox" / k,
                                  orc_name=lambda: "Orc-Fake", root=self.dir)
         self._sessions = [SimpleNamespace(key=k, display=f"Coord-{k}", kind="lane", agent=k, cwd=self.dir)
@@ -1295,6 +1296,56 @@ class BetweenTurnsTests(unittest.TestCase):
             finally:
                 store.db.close()
 
+    def test_between_turns_clears_awaiting_when_a_delivered_compact_ran(self):
+        """A /compact typed between turns is no [codeteam] prompt and joins no queue; Claude Code records it, and
+        its output, only when the compaction ends. Those records clear awaiting_turn, and the session is between
+        turns again (2026-11-12: a coordinator's /compact at 15:53:50Z was typed twice more and compacted
+        twice). A task notification or a tool result after the delivery does not count as the command."""
+        t0 = dt.datetime(2026, 11, 12, 15, 53, 50, tzinfo=dt.timezone.utc).timestamp()
+        compact = "<command-name>/compact</command-name>\n<command-message>compact</command-message>"
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s-a.jsonl"
+            _jsonl(path, [_record("user", "2026-11-12T15:50:00Z", "[codeteam] #1 NOTE from Orc to a:\nold"),
+                          _record("assistant", "2026-11-12T15:53:49Z", [{"type": "text", "text": "report"}]),
+                          _record("system", "2026-11-12T15:53:50Z", subtype="turn_duration")])
+            store = Store(Path(d) / "m.db")
+            try:
+                rt = Runtime(FakeTeam(d, ["a"]), log=lambda *_: None, herdr=FakeHerdr({"a": "working"}), store=store)
+                rec = {"sid": "s-a", "transcript": str(path), "awaiting_turn": True, "delivered_at": t0 + 0.4}
+                self.assertTrue(rt.between_turns("a", rec, NOW))
+                self.assertTrue(rec["awaiting_turn"])          # still compacting: nothing written yet
+                _jsonl(path, [_record("user", "2026-11-12T15:54:00Z", "<task-notification> lead done"),
+                              _record("user", "2026-11-12T15:54:01Z",
+                                      [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]),
+                              _record("user", "2026-11-12T15:54:02Z", "skill text", isMeta=True)], mode="a")
+                rt.between_turns("a", rec, NOW)
+                self.assertTrue(rec["awaiting_turn"])
+                _jsonl(path, [
+                    _record("system", "2026-11-12T15:54:24Z", subtype="compact_boundary",
+                            content="Conversation compacted", compactMetadata={"trigger": "manual"}),
+                    {"type": "user", "timestamp": "2026-11-12T15:54:24Z", "isCompactSummary": True,
+                     "message": {"role": "user", "content": "This session is being continued"}},
+                    _record("user", "2026-11-12T15:53:50Z", compact),
+                    _record("user", "2026-11-12T15:54:24Z", "<local-command-stdout>Compacted</local-command-stdout>"),
+                ], mode="a")
+                self.assertTrue(rt.between_turns("a", rec, NOW))
+                self.assertFalse(rec["awaiting_turn"])
+            finally:
+                store.db.close()
+
+    def test_a_delivered_compact_gets_the_longer_grace(self):
+        """A /compact awaiting its turn is not typed again after TURN_GRACE_S, only after COMPACT_GRACE_S; other
+        prompts keep TURN_GRACE_S."""
+        from codeteam2 import scheduler
+        self.assertGreater(scheduler.COMPACT_GRACE_S, scheduler.TURN_GRACE_S)
+        for compacting, waited, expect in ((True, scheduler.TURN_GRACE_S, False),
+                                           (True, scheduler.COMPACT_GRACE_S, True),
+                                           (False, scheduler.TURN_GRACE_S, True)):
+            st = {"a": {"awaiting_turn": True, "delivered_at": NOW - waited, "last_mids": [4],
+                        "compacting": compacting}}
+            acts = P(status={"a": "working"}, pending={}, st=st, between_turns={"a"})
+            self.assertEqual(bool([x for x in acts if x[0] == "redeliver"]), expect, (compacting, waited))
+
 
 class ScreenTests(unittest.TestCase):
     def test_draft(self):
@@ -1805,6 +1856,51 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(self.store.get(mids[0])["attempts"], attempts)
         self.assertEqual({self.store.get(m)["state"] for m in mids + [new]}, {"delivered"})
 
+    def test_episode_ends_on_a_turn_ending_in_the_transcript(self):
+        """A session herdr keeps at working (a background lead) can still run turns of its own, here one a task
+        notification started: a turn ending in its transcript after the episode began ends the episode and its
+        held mail is prompted (2026-11-12: a coordinator's turn at 16:01Z left its mail held). The turn that
+        ended before the episode does not."""
+        path = self.episode_transcript()
+        clock = self.patch_clock()
+        mids = self.stuck_bundle(clock)
+        self.rt.tick()
+        self.assertEqual(len(self.herdr.prompts), 3)
+        self.assertEqual({self.store.get(m)["state"] for m in mids}, {"held"})
+        later = dt.datetime.fromtimestamp(clock[0] + 5, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        _jsonl(path, [_record("user", later, "<task-notification> lead done"),
+                      _record("system", later, subtype="turn_duration")], mode="a")
+        self.rt.tick()
+        self.assertEqual(len(self.herdr.prompts), 4)
+        self.assertEqual({self.store.get(m)["state"] for m in mids}, {"delivered"})
+        self.assertFalse(self.team.state["a"].get("no_turn"))
+
+    def test_a_delivered_compact_is_not_typed_again_within_its_grace(self):
+        """deliver marks a /compact runtime command as compacting: it is not put back after TURN_GRACE_S, so it
+        is typed once, and the resume line queued behind it waits; other mail is not compacting."""
+        from codeteam2 import scheduler
+        clock = self.patch_clock()
+        c = self.store.add("runtime", "codeteam", RUNTIME, "Coord-a", "a",
+                           "/compact Keep the Refocus report and the handoff above verbatim as the working state.")
+        resume = self.store.add("runtime", "codeteam", RUNTIME, "Coord-a", "a", "Compaction done. Carry on.")
+        self.rt.tick()
+        self.assertEqual([t for _, t in self.herdr.prompts], [self.store.get(c)["body"]])
+        self.assertTrue(self.team.state["a"]["compacting"])
+        clock[0] += scheduler.TURN_GRACE_S
+        self.rt.tick()
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual(self.store.get(c)["state"], "delivered")
+        self.assertEqual(self.store.get(resume)["state"], "queued")
+        clock[0] += scheduler.COMPACT_GRACE_S
+        self.rt.tick()
+        self.assertEqual(self.store.get(c)["state"], "queued")    # no compaction seen in all that time: put back
+        mail = self.store.add("general", "Orc", "REQUEST", "Coord-a", "a", "x")
+        self.store.mark(c, "dropped")
+        self.store.mark(resume, "dropped")
+        self.rt.tick()
+        self.assertEqual(self.store.get(mail)["state"], "delivered")
+        self.assertFalse(self.team.state["a"]["compacting"])
+
     def episode_transcript(self):
         """A transcript for session a whose last [codeteam] prompt ran before the episode; its path."""
         tmp = tempfile.TemporaryDirectory()
@@ -2266,6 +2362,46 @@ class LaunchParityTests(unittest.TestCase):
         self.assertEqual(set(v2_settings), set(v1_settings))
         self.assertEqual(v2_settings["promptCacheTtl"], v1_settings["promptCacheTtl"])
         self.assertEqual(v2_settings["autoMode"], v1_settings["autoMode"])
+
+    def launch_exports(self, d, key, kind):
+        """The `export NAME=value` lines of the launch script v2 writes for one session."""
+        import shlex
+        from unittest.mock import patch
+        from codeteam2.team import Session, v1
+        t = self.stub(d)
+        t.lab, t.isolate, t.repo_name, t.target = False, False, "repo", "main"
+        team = object.__new__(Team)
+        team.t, team.cfg, team.product, team.retry_watchdog = t, {"mcp": False}, "smoke", False
+        team.dir = Path(d) / "v2"
+        (team.dir / "launch").mkdir(parents=True, exist_ok=True)
+        team.team_json = lambda: {"lanes": {"alpha": {"path": "pkg/alpha"}}}
+        team.session_env = lambda k: {}
+        team.ctx_env = lambda k, model: {}
+        target = (Path(d), "Orc-Test" if key == "orc" else "Coord-alpha", "", Path(d) / "role.md", "", "")
+        with patch.object(v1, "launch_target", return_value=target):
+            path, _ = team.write_launch_script(Session(key, target[1], kind, key, Path(d)))
+        out = {}
+        for line in path.read_text().splitlines():
+            if line.startswith("export ") and "=" in line:
+                name, value = line[len("export "):].split("=", 1)
+                out[name] = shlex.split(value)[0] if value else ""
+        return out
+
+    def test_every_session_gets_zone_mk_and_only_a_lane_gets_its_walls(self):
+        """An orchestrator's or a staff session's work order tree builds and tests through zone.mk too
+        (2026-11-12: an orc lead's tree had no zone targets until MAKEFILES was passed by hand). Only a lane
+        names a lane worktree: CODETEAM_SWT is what turns the zone guard on."""
+        from codeteam2.team import CT_HOME
+        zone_mk = str(CT_HOME / "zone" / "zone.mk")
+        with tempfile.TemporaryDirectory() as d:
+            orc = self.launch_exports(d, "orc", "staff")
+            lane = self.launch_exports(d, "alpha", "lane")
+        self.assertEqual(orc.get("MAKEFILES"), zone_mk)
+        self.assertNotIn("CODETEAM_SWT", orc)
+        self.assertNotIn("CODETEAM_ZONE", orc)
+        self.assertEqual(lane.get("MAKEFILES"), zone_mk)
+        self.assertIn("CODETEAM_SWT", lane)
+        self.assertEqual(lane.get("CODETEAM_ZONE"), "pkg/alpha")
 
 
 class RoleRewriteTests(unittest.TestCase):

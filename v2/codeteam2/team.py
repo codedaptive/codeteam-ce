@@ -462,7 +462,10 @@ Lanes tell their orchestrator, then carry on with the product. Writes to the har
             env["CODETEAM_SWT"] = str(v1.lane_wt(t, s.key, r))
             if not t.lab:
                 env["CODETEAM_EXCHANGE"] = str(t.ex_wt())
-            env["MAKEFILES"] = str(CT_HOME / "zone" / "zone.mk")
+        # GNU make reads MAKEFILES before the repo's Makefile, so zone-test-one, zone-check and warm work in every
+        # tree of the repo, the work order trees of the orchestrator and staff included
+        # (2026-11-12: an orc lead's tree had no zone targets). It turns no guard on: CODETEAM_SWT above does that.
+        env["MAKEFILES"] = str(CT_HOME / "zone" / "zone.mk")
         lines = ["#!/bin/bash -l", f"# codeteam v2 launch script for {display} (written by codeteam2; do not edit)",
                  f"cd {shlex.quote(str(cwd))} || {{ echo 'missing {cwd}'; exit 1; }}",
                  "[ \"$(cat .claude/.gitignore 2>/dev/null)\" = '*' ] && rm -f .claude/settings.local.json",

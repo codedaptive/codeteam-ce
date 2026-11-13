@@ -3813,12 +3813,46 @@ def _order_age_min(t, n, name, now):
         return None
 
 
+# In a v5 team, a ledger row whose stage starts with one of these words waits on something outside the lane (a
+# decision, a promote, a landing). Nothing clears such a wait by itself there (no push-up await), and what ends it
+# reaches the lane as mail, which stages the row again (2026-11-12: a 'blocked-guard' row was a
+# DEAD LEAD, and so IDLE WITH WORK, every patrol round while it waited for the owner). A row whose lead has handed back
+# ('handed-back', 'accepted') waits on its coordinator, not on a lead (e.g. a --with set member waiting for
+# the rest of its set); a coordinator idle on it is STALLED WORK ORDER's to report.
+WAIT_STAGE = re.compile(r"(blocked|waits|waiting|held|handed|accepted)\b", re.I)
+
+
+def _landing_holds(t, tree: Path) -> bool:
+    """v5: the landing tool holds the work order this tree belongs to, so no lead is at work in it: queued for
+    landing, held (wo-hold), landed or retired, or sent back by a landing conflict (<wo>.bounce.txt) with nothing done
+    in the tree since. The bounce file is never removed, so a tree that moved after it is judged as usual: a lead
+    resolving the conflict that then dies is still a DEAD LEAD (a set bounced at Stage 4 waits for a
+    promote, and its members were DEAD LEAD every round)."""
+    if not getattr(t, "root", None):
+        return False
+    d = Path(t.root) / "land" / "wo"
+    wo = tree.name
+    if (d / f"{wo}.landed.json").exists() or (d / f"{wo}.retired.json").exists():
+        return True
+    rec = load_json(d / f"{wo}.json", None)
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("queued") or rec.get("held"):
+        return True
+    try:
+        return (d / f"{wo}.bounce.txt").stat().st_mtime >= _last_activity(tree)
+    except OSError:
+        return False
+
+
 def lane_work(t, n, r, now):
     """The lane's ledger rows, split: (rows, active, dead, parked, queued). active also holds a
     past-queued row with no worktree whose order is under a day old. A non-queued row with
     an awaited feature as a [A-Za-z0-9._-]+ stage token is skipped before worktree judgment:
     it is neither active, dead, parked nor queued. Both patrols use these classifications.
-    Once push-up clears the feature, the row is judged by its worktree and order."""
+    Once push-up clears the feature, the row is judged by its worktree and order. In a v5 team
+    a row whose stage starts with a WAIT_STAGE word is skipped the same way, and so is a row whose work order the
+    landing tool holds (_landing_holds)."""
     rows = []
     led = lane_ledger_dir(t, n, r) / ".ledger.md"
     if led.exists():
@@ -3828,10 +3862,11 @@ def lane_work(t, n, r, now):
                 rows.append(parts)
     active, dead, parked = [], [], 0
     waits = awaited(t, n)
+    v5 = landing(t)
     for name, stage, wts in rows:
         if stage == "queued":
             continue
-        if waits.intersection(re.findall(r"[A-Za-z0-9._-]+", stage)):
+        if waits.intersection(re.findall(r"[A-Za-z0-9._-]+", stage)) or (v5 and WAIT_STAGE.match(stage)):
             continue
         ps = _lead_paths(t, n, [w for w in wts.split(",") if w and w != "-"])
         if not ps:
@@ -3846,6 +3881,8 @@ def lane_work(t, n, r, now):
                 active.append(name)
             else:
                 parked += 1
+            continue
+        if v5 and any(_landing_holds(t, x) for x in ps):
             continue
         ages = [(now - _last_activity(x)) / 60 for x in ps]
         if any(_someone_inside(x) for x in ps) or any(a < PATROL_DEAD_MIN for a in ages):
@@ -4253,11 +4290,16 @@ def cmd_branch_audit(t: Team, args):
 
 def kept_branches(t, team):
     """The team's permanent branches under the branch rule: its base, exchange and
-    integration (factory teams), one branch per lane, and the manifest's `branch_keep`
-    (e.g. stable/1.0.x)."""
+    integration (factory teams), landing (non-lab landing teams, v5.4), local lane branches,
+    and the manifest's `branch_keep` (e.g. stable/1.0.x).
+    A local landing branch whose name starts with the lane prefix also enters
+    sweep_landed_branches' squash-trailer search: work on landing has landed.
+    """
     keep = {t.base, *t.m.get("branch_keep", [])}
     if not t.lab:
         keep |= {t.exchange, t.integration}
+        if landing(t):
+            keep.add(landing_branch(t))
     keep |= {lane_branch(t, n, r) for n, r in team["lanes"].items() if not r.get("ref")}
     return keep
 
@@ -4287,10 +4329,12 @@ def branch_leftovers(t, team):
 
 
 # Branch kinds codeteam itself makes, and so may delete once their work has landed:
-# a request lead's worktree-<name> (the WorktreeCreate hook) and a feature's unit/<lane>/<f>.
+# a request lead's worktree-<name> (the WorktreeCreate hook), a feature's unit/<lane>/<f>, and a v5.4 work order's
+# wo/<zone>/<wo> (codeteam-land cuts it, and the loop's backup mirrors it to GitHub; landing and wo-retire delete only
+# the local branch).
 # Every other branch outside the rule (release lines, snap/*, pin/*, hand-made ones) is only
 # reported (patrol, branch-audit); a person decides.
-SWEEP_BRANCH_KINDS = ("worktree-*", "unit/*")
+SWEEP_BRANCH_KINDS = ("worktree-*", "unit/*", "wo/*")
 
 
 def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
@@ -4300,7 +4344,9 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
     squash with the trailer `Worktree: <id>` is in a lane or exchange (last 60 days), or, for
     unit/<lane>/<f>, its lane or the team's target holds the branch's version of every file it
     changed (a squash). Its GitHub copy goes too when
-    that copy has landed as well. A branch whose work has not landed stays."""
+    that copy has landed as well. A branch whose work has not landed stays.
+    A wo/<zone>/<wo> branch is judged by the landing tool's record of <wo> (wo_landed), not by walking every kept
+    branch: one team's sweep over 228 such GitHub copies took over ten minutes that way."""
     import fnmatch
     repo = str(t.repo)
     def git_lines(*a):
@@ -4308,6 +4354,9 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
         return [l for l in r.stdout.splitlines() if l] if r.returncode == 0 else []
     local = {l.split()[1]: l.split()[0] for l in git_lines("for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads")}
     keep = [b for b in sorted(kept_branches(t, team)) if b in local]
+    # A copy of landing kept before a history rewrite is landed work too, as codeteam-land's landed_refs says: a
+    # branch made before a trailer rewrite of landing holds the old hashes, which only the archive keeps.
+    archives = git_lines("for-each-ref", "--format=%(refname)", "refs/archive/landing*")
     checked_out = {l.split(" ", 1)[1].replace("refs/heads/", "") for l in git_lines("worktree", "list", "--porcelain")
                    if l.startswith("branch ")}
     github = t.backup and subprocess.run(["git", "-C", repo, "remote", "get-url", "origin"],
@@ -4338,7 +4387,62 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
         changed = names(base, sha)
         return not changed or not (changed & names(k, sha))
 
+    wo_dir = Path(t.root) / "land" / "wo" if landing(t) and getattr(t, "root", None) else None
+    landing_ref = landing_branch(t) if landing(t) and landing_branch(t) in local else t.base
+
+    def ok(*a):
+        return subprocess.run(["git", "-C", repo, *a], capture_output=True).returncode == 0
+
+    retired = {}               # a retired wo/* branch -> its archive ref, pushed to GitHub before the branch goes there
+
+    def clean_merge(c):
+        """c merges two parents and its tree is exactly git's merge of them: no hand edit, no conflict resolved."""
+        parents = (git_lines("rev-list", "--parents", "-n1", c) or [""])[0].split()[1:]
+        if len(parents) != 2:
+            return False
+        r = subprocess.run(["git", "-C", repo, "merge-tree", "--write-tree", *parents], capture_output=True, text=True)
+        tree = (r.stdout.splitlines() or [""])[0]
+        return r.returncode == 0 and tree == (git_lines("rev-parse", f"{c}^{{tree}}") or [None])[0]
+
+    def wo_landed(name, sha):
+        """A work order branch has landed or been retired, by the landing tool's own record of it. Landed
+        (<wo>.landed.json): the tip is the recorded tip, an older state of it, or on an archived landing (a copy made
+        before a rewrite of the landing chain); or every commit outside the tip, landing and the archives is a clean
+        merge (integration merged in after it landed); or, for a copy rebased since, every commit of its own has its
+        patch in the recorded tip (`git cherry <tip>`, the work order's own range) or, failing that, on landing. A copy
+        that predates a rewrite with no archive kept walks the whole old chain in `git cherry` (about 17 s
+        each), once: it goes on its first sweep.
+        Retired (<wo>.retired.json): wo-retire kept the tip under refs/archive/wo/<wo>, and this tip is that or an older
+        state of it. No record: the generic test."""
+        wo = name.rsplit("/", 1)[-1]
+        if not ok("cat-file", "-e", f"{sha}^{{commit}}"):
+            return False       # GitHub holds a commit this repo lacks: never delete it unseen
+        rec = load_json(wo_dir / f"{wo}.landed.json", None)
+        if isinstance(rec, dict) and rec.get("tip"):
+            if sha == rec["tip"] or any(ok("merge-base", "--is-ancestor", sha, k) for k in (rec["tip"], *archives)):
+                return True
+            # Integration merged in after it landed: every commit outside the recorded tip, landing and the archived
+            # landings is a merge whose tree is git's own merge of its parents, so it holds nothing of its own. Landing
+            # squashes a work order, so `git cherry landing` never matches its commits one by one.
+            own = git_lines("rev-list", sha, "--not", rec["tip"], landing_ref, *archives)
+            if own and len(own) <= 50 and all(clean_merge(c) for c in own):
+                return True
+            return any(r.returncode == 0 and not any(l.startswith("+") for l in r.stdout.splitlines())
+                       for r in (subprocess.run(["git", "-C", repo, "cherry", up, sha], capture_output=True, text=True)
+                                 for up in (rec["tip"], landing_ref)))
+        if (wo_dir / f"{wo}.retired.json").exists():
+            archive = f"refs/archive/wo/{wo}"
+            if not ok("merge-base", "--is-ancestor", sha, archive):
+                return False
+            retired[name] = archive
+            return True
+        return None
+
     def landed(name, sha):
+        if wo_dir and name.startswith("wo/"):
+            verdict = wo_landed(name, sha)
+            if verdict is not None:
+                return verdict
         if name.startswith("worktree-") and name.removeprefix("worktree-") in squashed:
             return True
         if local.get(name) == sha and name in merged:
@@ -4346,7 +4450,7 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
         if subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"], capture_output=True).returncode:
             return False       # GitHub holds a commit this repo lacks: never delete it unseen
         if any(subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", sha, k]).returncode == 0
-               for k in keep):
+               for k in (*keep, *archives)):
             return True
         if name.startswith("unit/"):
             parts = name.split("/")
@@ -4364,6 +4468,15 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
         if not (go_local or go_remote):
             continue
         where = " and ".join(w for w, on in (("here", go_local), ("GitHub", go_remote)) if on)
+        if go_remote and b in retired:
+            # The backup mirrors branches only, so a retired work order's GitHub branch is its one copy off this
+            # machine: its archive ref goes to GitHub first, and the branch stays there if that push fails.
+            where += f"; {retired[b]} kept on GitHub"
+            if not dry_run and not ok("push", "-q", "origin", f"{retired[b]}:{retired[b]}"):
+                say_line(f"kept {b} on GitHub: pushing {retired[b]} there failed")
+                if not go_local:
+                    continue
+                go_remote, where = False, "here"
         if dry_run:
             say_line(f"would delete landed branch {b} ({where})"); n += 1; continue
         if go_local:
@@ -4480,6 +4593,32 @@ def sweep_orphan_worktrees(t: Team, team, dry_run: bool):
                 continue
             if remove_inside(d, entry, dry_run):
                 say_line(f"{n}: {'would remove' if dry_run else 'removed'} unregistered worktree folder {entry.name}")
+
+
+# The landing tool's TMPDIR (codeteam-land team_env: <worktree_root>/land/tmp) keeps whatever its test runs leave behind.
+# An entry untouched for a day goes (once 9,065 folders, 2.1 GB, the oldest two days old,
+# on one team alone). Lock files stay however old: a build tool may hold one there (SwiftPM's per-build-folder locks).
+LAND_TMP_AGE_HOURS = 24
+
+
+def sweep_land_tmp(t: Team, dry_run: bool):
+    """Remove the entries of <worktree_root>/land/tmp untouched for LAND_TMP_AGE_HOURS, lock files excepted."""
+    tmp = t.root / "land" / "tmp"
+    if not tmp.is_dir() or tmp.is_symlink():
+        return
+    cutoff = time.time() - LAND_TMP_AGE_HOURS * 3600
+    gone = 0
+    for entry in tmp.iterdir():
+        if entry.name.endswith(".lock"):
+            continue
+        try:
+            if newest_mtime(entry) < cutoff and remove_inside(tmp, entry, dry_run):
+                gone += 1
+        except FileNotFoundError:
+            continue
+    if gone:
+        say_line(f"land/tmp: {'would clear' if dry_run else 'cleared'} {gone} entr{'y' if gone == 1 else 'ies'} "
+                 f"untouched for {LAND_TMP_AGE_HOURS} h")
 
 
 BUILD_DIRS = ("cargo-target", ".build")
@@ -4889,10 +5028,13 @@ def _remove_wt(t, rp, why, dry_run, drop_branch=False, branch="") -> int:
 
 def sweep_builds_and_units(t: Team, team, dry_run: bool, builds_only: bool = False):
     """Remove unit worktrees idle for BUILD_IDLE_HOURS whose branch is in their
-    lane's standing worktree, and build output in worktrees idle for BUILD_IDLE_HOURS. Standing worktrees,
-    snapshots and worktrees a process is working in are left as they are."""
+    lane's standing worktree, and build output in request, unit and v5.4 work order trees idle for
+    REQUEST_BUILD_IDLE_HOURS. Standing worktrees, snapshots and worktrees a process is working in are left as they are."""
     standing = {str(lane_wt(t, n, r).resolve()): n for n, r in team["lanes"].items()}
     lane_dirs = {str(t.lane_dir(n).resolve()): n for n in team["lanes"]}
+    # codeteam-land's work order trees, <worktree_root>/wo/<zone>/<wo>: v5.4's request worktrees. Only their build
+    # output goes (2026-11-11: 66 trees held 189 GB and the disk filled; the sweep had skipped them).
+    wo_root = str((t.root / "wo").resolve()) + "/"
     cutoff = time.time() - BUILD_IDLE_HOURS * 3600
     for tr in _worktrees(t.repo):
         path = Path(tr.get("worktree", ""))
@@ -4906,7 +5048,8 @@ def sweep_builds_and_units(t: Team, team, dry_run: bool, builds_only: bool = Fal
             continue
         rp = str(path.resolve())
         lane = next((n for d, n in lane_dirs.items() if rp.startswith(d + "/")), None)
-        if not lane and "/.claude/worktrees/" not in rp:
+        work_order = rp.startswith(wo_root)
+        if not lane and not work_order and "/.claude/worktrees/" not in rp:
             continue        # a worktree outside the team's folders belongs to someone else
         try:
             if _someone_inside(path):
@@ -4932,11 +5075,21 @@ def sweep_builds_and_units(t: Team, team, dry_run: bool, builds_only: bool = Fal
             # Build output in an idle worktree.
             if _last_activity(path) < time.time() - REQUEST_BUILD_IDLE_HOURS * 3600:
                 for d in _build_dirs(path):
-                    say_line(f"{lane or 'request'}: {'would clear' if dry_run else 'cleared'} {d.relative_to(path)} in {path.name}")
+                    say_line(f"{lane or ('work order' if work_order else 'request')}: "
+                             f"{'would clear' if dry_run else 'cleared'} {d.relative_to(path)} in {path.name}")
                     if not dry_run:
                         shutil.rmtree(d, ignore_errors=True)
         except (OSError, ValueError):
             continue
+
+
+def tm_exclude_team(t: Team) -> None:
+    """Keep the team's land trees and its trees' build output out of Time Machine. A tree's build
+    output is made after the tree is cut, and zone-clean deletes it with its mark, so the hourly sweep marks what
+    exists; share/codeteam_tm.py says why."""
+    sys.path.insert(0, str(TOOL_DIR / "share"))
+    import codeteam_tm
+    codeteam_tm.exclude_team(t.root, t.repo)
 
 
 def cmd_sweep(t: Team, args):
@@ -5003,10 +5156,13 @@ def cmd_sweep(t: Team, args):
         left.setdefault(owners[0] if len(owners) == 1 else "", []).append(wid)
 
     sweep_scratchpads(t, team, args.dry_run)
+    sweep_land_tmp(t, args.dry_run)
     sweep_orphan_worktrees(t, team, args.dry_run)
     sweep_landed_worktrees(t, team, args.dry_run)
     sweep_builds_and_units(t, team, args.dry_run)
     sweep_landed_branches(t, team, args.dry_run)
+    if not args.dry_run:
+        tm_exclude_team(t)
     if args.dry_run:
         for owner, wids in left.items():
             say_line(f"{owner or t.orc_name()}: would report {', '.join(wids)}")

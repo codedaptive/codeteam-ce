@@ -7,6 +7,8 @@
 # 4. Key parsing excludes test-group words while preserving real filters.
 # 5. Key group extraction returns sorted group words, or an empty tuple.
 # 6. A retry guard accepts a later narrower PASS only when its groups match the FAIL.
+# 7. A recorded FAIL answers a --cached run only for the command it ran: the same code with a corrected
+#    command runs, and the same command is still answered.
 set -u
 unset MAKEFLAGS MFLAGS MAKELEVEL MAKEOVERRIDES DIR MAKEFILES CODETEAM_ZONE CODETEAM_OWNS \
       ZONE ZONE_ROOT ZONE_TOOL ZONE_TEST ZONE_TEST_FLAGS CODETEAM_BUILDQ_TICKET CODETEAM_SLOT_HELD \
@@ -126,4 +128,20 @@ check('6 same group PASS unlocks retry', tool.guard_run(root, whole, 'test-hash'
 sys.exit(1 if failed else 0)
 PY
 then :; else fail=1; fi
+
+C="$tmp/cmd"
+mkdir -p "$C/pkg"
+git -C "$C" init -q
+printf 'scratch\n' > "$C/pkg/README"
+git -C "$C" add -A
+git -C "$C" -c user.email=t@t -c user.name=t commit --trailer 'Agent: repo-orchestrator' --trailer 'Model: claude-opus-5-5' --trailer 'Effort: xhigh' -qm init
+key7='one pkg/x.py test-group=validation'
+(cd "$C" && "$here/bin/zone-tool" test --cached --key "$key7" -- sh -c 'echo wrong-invocation; exit 1' >/dev/null 2>&1)
+out="$(cd "$C" && "$here/bin/zone-tool" test --cached --key "$key7" -- sh -c 'echo corrected-ran; exit 0' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qx 'corrected-ran' <<<"$out"; then ok '7 a corrected command runs on the same code'
+else bad '7 a corrected command runs on the same code' "exit $rc; output: $(tr '\n' '|' <<<"$out")"; fi
+out="$(cd "$C" && "$here/bin/zone-tool" test --cached --key "$key7" -- sh -c 'echo corrected-ran; exit 0' 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'already recorded for this exact code' <<<"$out" && ! grep -qx 'corrected-ran' <<<"$out"; then
+  ok '7 the same command is answered from its record'
+else bad '7 the same command is answered from its record' "exit $rc; output: $(tr '\n' '|' <<<"$out")"; fi
 exit "$fail"

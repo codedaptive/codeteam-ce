@@ -266,8 +266,10 @@ def cmd_say(team, rt, a):
             names.remove(n)
     if not names:
         return
+    taken = []                  # recorded already, as mail for the creator
     for n in names:
         if for_creator(a, kind, n, text):
+            taken.append(n)
             mid = rt.store.add(a.channel, a.sender, kind, n, "codeteam", text)
             rt.store.mark(mid, "delivered", f"for the creator: {CREATOR_INBOX}")
             team.mirror_to_channel_log(a.channel, a.sender, kind, n, text)
@@ -283,6 +285,8 @@ def cmd_say(team, rt, a):
         if s.key not in [t.key for t in targets]:
             targets.append(s)
     if not targets:
+        if len(taken) == len(names):
+            return              # each name was the creator's: recorded once there (it was twice before 2026-11-12)
         mid = rt.store.add(a.channel, a.sender, kind, a.to, "codeteam", text)
         rt.store.mark(mid, "delivered", "for codeteam; no session")
         team.mirror_to_channel_log(a.channel, a.sender, kind, a.to, text)
@@ -371,7 +375,9 @@ def cmd_sleep(team, rt, a):
             print(f"{s.display}: not ended (unsent text in its input box, its pane shows a subagent's view, or herdr refused); try again")
         team.save_state(st)
     else:
-        print(f"{s.display} is {status}; it is ended once idle (or use --force)")
+        # Nothing is recorded: the loop ends a lane only by its swap and idle-exit rules.
+        print(f"{s.display} is {status}: not ended, and nothing is queued; run sleep again once it is idle, "
+              f"or use --force to end it now (its background agents with it)")
 
 
 def cmd_status(team, rt, a):

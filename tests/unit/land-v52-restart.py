@@ -492,14 +492,16 @@ def runner_marker_case(command, halted):
                 patch.object(cl, "validate_one") as validate, patch.object(cl, "queue_maintenance", return_value=(0, 0)), \
                 patch.object(cl, "read_recheck", return_value=[]), patch.object(cl, "stage6_target", return_value=None), \
                 patch.object(cl, "alpha_cfg", return_value=None):
-            getattr(cl, RUNNERS[command][0])(team, SimpleNamespace(once=True))
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                getattr(cl, RUNNERS[command][0])(team, SimpleNamespace(once=True))
         assert not path.exists(), f"{command} did not consume marker"
         assert not queue.called and not recheck.called and not validate.called
         assert not halt.called, "restart check must precede halted check"
-        assert team.notify.call_count == 1
-        text = team.notify.call_args.args[2]
-        assert f"Restarted com.codeteam.codeteam-{RUNNERS[command][1]}.sample" in text
-        assert "main" in text and "0123456789" in text and "it had no job running" in text
+        # The runner's own log says it, not a NOTE to the orchestrator.
+        team.notify.assert_not_called()
+        text = log.getvalue()
+        assert f"restarting com.codeteam.codeteam-{RUNNERS[command][1]}.sample" in text, text
+        assert "codeteam 0123456789" in text and "it had no job running" in text, text
 
 
 def runner_no_marker_case(command):
@@ -530,6 +532,8 @@ def runner_waited_case(command, requested_ts, expected):
             marker(team, command, requested_ts)
             if command == "validate-run":
                 return {"commit": TIP, "result": "fail", "tests": []}
+            if command == "recheck-run":
+                return {"tests": []}            # recheck_one's result; run_recheck_tick reads its checkout
             return True
         # A second halted check is a bounded escape on the pre-change runner.
         with patch.object(cl, "halted", side_effect=[False, StopLoop()]), \
@@ -540,12 +544,15 @@ def runner_waited_case(command, requested_ts, expected):
                 patch.object(cl, "pending_recheck", return_value=0), patch.object(cl, "recheck_one", side_effect=job), \
                 patch.object(cl, "stage6_target", return_value=TIP), patch.object(cl, "alpha_cfg", return_value={"local": True}), \
                 patch.object(cl, "validate_due", return_value=True), patch.object(cl, "validate_one", side_effect=job):
-            try:
-                getattr(cl, RUNNERS[command][0])(team, SimpleNamespace(once=False))
-            except StopLoop:
-                pass
-        assert team.notify.call_count == 1, f"{command} did not announce restart after the job"
-        assert expected in team.notify.call_args.args[2]
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                try:
+                    getattr(cl, RUNNERS[command][0])(team, SimpleNamespace(once=False))
+                except StopLoop:
+                    pass
+        restarts = [line for line in log.getvalue().splitlines() if "restarting com.codeteam.codeteam-" in line]
+        assert len(restarts) == 1, f"{command} did not log its restart after the job: {log.getvalue()}"
+        assert expected in restarts[0], restarts
+        team.notify.assert_not_called()
         assert not (team.dir / "restart" / f"{command}.json").exists()
 
 

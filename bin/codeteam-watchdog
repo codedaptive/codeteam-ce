@@ -21,6 +21,7 @@ sys.path.insert(0, str(HERE.parent / "share"))
 import codeteam_launchd
 
 TEAMS = HERE.parent / "teams"
+WORKSPACE = Path(os.environ.get("CODETEAM_WORKSPACE") or Path.home() / "codeteam-work")   # every team-<x> folder
 STATE = HERE.parent / "run" / "watchdog.json"
 STALE_S = 600
 # Disk (the disk once reached 99% full: work order trees held 18-28 GB of build output each, and
@@ -30,7 +31,12 @@ DISK_MIN_GB = 150
 DISK_IDLE_S = 1800
 BUILD_DIRS = ("target", "cargo-target", ".build", "DerivedData")
 LAUNCHD_PREFIX = os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam"
-WORKSPACE = Path(os.environ.get("CODETEAM_WORKSPACE") or Path.home() / "codeteam-work")
+# Below this, the landing tool's own long-lived clones lose their idle build output too (2026-11-13: one team's
+# land/validate/target held 50 GiB and land/itest/target 23 GiB while the disk filled for the third time that day).
+# Stages 5 and 6 reuse that warm output, and new work order trees copy it from land/itest, so the clones are
+# cleared only below the deck's 50 GiB red line, not at DISK_MIN_GB.
+LAND_DISK_MIN_GB = 50 * 2 ** 30 / 1e9
+LAND_STAGES = {"Stage 5": "itest", "Stage 6": "validate"}
 LABEL = f"{LAUNCHD_PREFIX}.codeteam-watchdog"
 
 
@@ -155,16 +161,76 @@ def last_active(tree, dirs):
     return max(times or [0])
 
 
-def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None):
+def manifests(teams=None, workspace=None):
+    """Every team's manifest: production's teams/*.toml, then, for a team marked up (team-<x>/team/v2/up) with none
+    there, the one in its own clone (team-<x>/design/*/teams/<x>.toml). One team keeps its manifest there: its loop once died when the
+    disk filled and stayed down for three and a half hours, because only teams/*.toml were checked."""
+    found = sorted(Path(teams or TEAMS).glob("*.toml"))
+    named = {m.stem for m in found}
+    for up in sorted(Path(workspace or WORKSPACE).glob("team-*/team/v2/up")):
+        folder = up.parents[2]
+        name = folder.name.removeprefix("team-")
+        if name not in named:
+            found += sorted(folder.glob(f"design/*/teams/{name}.toml"))[:1]
+    return found
+
+
+def land_clones(cfg, root):
+    """{"itest": path, "validate": path}: the landing tool's long-lived clones of a team with [land]. Stage 5 rechecks
+    in land/itest. Stage 6 has a clone here unless it validates on another machine ([land.remote], or a
+    [land.validate] that is not local), as codeteam-land's validation tier says."""
+    land = cfg.get("land")
+    if not isinstance(land, dict):
+        return {}
+    clones = {"itest": root / "land" / "itest"}
+    tier = land.get("remote") or land.get("validate") or {}
+    if not tier:
+        clones["validate"] = root / "land" / "validate"
+    elif tier.get("local") and tier.get("path"):
+        clones["validate"] = Path(os.path.expanduser(tier["path"]))
+    return clones
+
+
+def command_of(pid):
+    r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(int(pid))], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def busy_land_clones(stages, command=None):
+    """{(manifest, "itest" | "validate")} for each live Stage 5 or 6 run, read from the landing tool's stage records
+    (run/restart/stages; codeteam-land stage_admit). A record holds its runner's pid, and the runner's command line
+    names its team's manifest. When that command cannot be read, the record holds that clone of every team ("*")."""
+    command = command or command_of
+    busy = set()
+    for f in Path(stages).glob("*.json"):
+        try:
+            row = json.loads(f.read_text())
+            kind, pid = LAND_STAGES.get(row.get("stage")), int(row["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if kind is None or not alive(pid):
+            continue
+        said = command(pid)
+        if said is None:
+            busy.add(("*", kind))
+            continue
+        busy |= {(os.path.realpath(os.path.expanduser(word)), kind) for word in said.split() if word.endswith(".toml")}
+    return busy
+
+
+def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None, land_min_gb=None, workspace=None):
     """When free disk is below min_gb: the build output of every work order tree with no queued or running build and
-    nothing touched for idle_s is moved to its team's .trash and removed in the background, oldest tree first.
-    Returns the lines it logged."""
+    nothing touched for idle_s is moved to its team's .trash and removed in the background, oldest tree first. Below
+    land_min_gb, the landing tool's own clones (land_clones) are swept the same way, except one a live Stage 5 or 6
+    run holds (busy_land_clones). Returns the lines it logged."""
     min_gb = float(os.environ.get("CODETEAM_DISK_MIN_GB", DISK_MIN_GB)) if min_gb is None else min_gb
+    land_min_gb = LAND_DISK_MIN_GB if land_min_gb is None else land_min_gb
     idle_s = DISK_IDLE_S if idle_s is None else idle_s
     have = (free or free_gb)()
     if have >= min_gb:
         return []
     q = Path(q or os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
+    land_busy = busy_land_clones(q.parent / "restart" / "stages") if have < land_min_gb else set()
     busy = set()
     for f in q.glob("*.json"):
         try:
@@ -174,13 +240,16 @@ def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None):
         if j.get("state") in ("queued", "running") and j.get("worktree"):
             busy.add(os.path.realpath(j["worktree"]))
     found = []
-    for m in sorted(Path(teams or TEAMS).glob("*.toml")):
+    for m in manifests(teams, workspace):
         try:
             cfg = tomllib.loads(m.read_text())
         except (OSError, ValueError):
             continue
         root = Path(os.path.expanduser(cfg.get("worktree_root") or str(WORKSPACE / f"team-{m.stem}")))
         trees = set()
+        if have < land_min_gb:
+            trees |= {clone for kind, clone in land_clones(cfg, root).items()
+                      if not {(os.path.realpath(m), kind), ("*", kind)} & land_busy}
         for f in (root / "land" / "wo").glob("*.json"):
             if f.name.endswith((".landed.json", ".retired.json")):
                 continue
@@ -234,12 +303,27 @@ def runner_problems(stem: str, run=subprocess.run, uid: int | None = None) -> li
 
 
 def check():
+    """One pass: the build queue sweep, the disk floor, then each team's loop and landing runners. Each part runs even
+    when one before it fails, and the failure is logged when the log can be written: on a full disk the state file
+    cannot be written, and the pass used to stop there, before the floor."""
+    for name, part in (("sweep_queue", sweep_queue), ("sweep_disk", sweep_disk), ("check_teams", check_teams)):
+        try:
+            part()
+        except Exception as e:
+            try:
+                print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {name} failed: {type(e).__name__}: {e}", flush=True)
+            except OSError:
+                pass                    # the log is on the full disk too
+
+
+def check_teams():
+    """Each running team's loop heartbeat and landing runners; a problem is notified once, when it starts."""
     try:
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
         state = {}
     now, seen = time.time(), {}
-    for m in sorted(TEAMS.glob("*.toml")):
+    for m in manifests():
         try:
             cfg = tomllib.loads(m.read_text())
         except (OSError, ValueError):
@@ -265,8 +349,6 @@ def check():
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {m.stem}: {p}", flush=True)
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(seen))
-    sweep_queue()
-    sweep_disk()
 
 
 def launchd_reinstall(label: str, plist: Path, uid: int, run=None, sleep=None,

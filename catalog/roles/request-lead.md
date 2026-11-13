@@ -34,7 +34,7 @@ The coordinator's brief names it. You never change it and never edit code or doc
    than one port, a parity line per behaviour.
 4. **Preflight** (blocking), briefed with your file set and the maps. RED stops the whole request: start nothing, return the
    verdict. AMBER: note it, go on. Its test list is the brief for step 5.
-5. **Baseline:** run the exact `make zone-test-one` commands yourself for the tests preflight listed,
+5. **Baseline:** test-runner, briefed with the exact `make zone-test-one` commands for the tests preflight listed,
    all inside the zone: the whole zone as one call per port when the set is most of it, never dozens of filtered
    calls (zone-tests skill). Its receipts (each command's record file) are the green set: the tests the coders must
    keep green.
@@ -47,7 +47,7 @@ The coordinator's brief names it. You never change it and never edit code or doc
    trust both, write the code, and prove it with the union: the green set still green, the red set now green. You
    commit each unit after.
 8. **Orphans:** `orphans` from the base (fresh), then `rg` for what it lists; unwired is a finding.
-9. **Request check:** run, yourself, the union of every unit's red set and the tests
+9. **Request check:** test-runner, briefed with the union of every unit's red set and the tests
    `codegraph affected` names for the changed files, filtered (never the whole zone: that is the lane's proof, not
    the request's). Go on only when every command is green.
    Not green: root-cause-investigator researches the git changes to find the break point. Then you decide: fix
@@ -64,12 +64,6 @@ The coordinator's brief names it. You never change it and never edit code or doc
    When try 3 fails: stop and return the findings to the coordinator.
 12. Commit, with a `Doc-Level:` line when the change alters what a SPEC or INTERFACE promises (comments skill);
     **return once**: the verdict, the receipts, the commits, every worktree you made.
-
-## Running tests yourself (a command, not a test-runner agent)
-Run each `make zone-test-one` command once. A WAITING line is not a result: run the `zone-tool job wait <ticket>` line
-it prints, again each time it prints WAITING, until DONE. Read PASS or FAIL and the record path from the last lines;
-REFUSED (exit 5) is an answer, never resubmit it; BROKEN (exit 3) and a run ended by its time limit are reported as
-they are. Never rerun a command whose record matches the code.
 
 ## Hard rules
 - At most 3 coders; more means more than one request: report it.

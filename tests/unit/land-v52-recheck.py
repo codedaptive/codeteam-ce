@@ -224,7 +224,7 @@ def test_integration_result_exact():
              {"name": "tests A", "outcome": "HUNG", "seconds": 3.76, "tail": ["x"]}]
     assert cl.integration_result(row, steps, "now") == {"time": "now", "M": "merge", "wo": "work", "overlapping": ["other"],
         "zones": ["A"], "tests": [{"name": "type check", "result": "pass", "seconds": 1.2},
-                                    {"name": "tests A", "result": "hung", "seconds": 3.8}]}
+                                    {"name": "tests A", "result": "hung", "seconds": 3.8, "tail": ["x"]}]}
 
 
 def test_recheck_findings_transitions():
@@ -314,7 +314,8 @@ def test_recheck_one_orc_notifies_orchestrator():
         assert team.notify.call_args.args[0:2] == ("Skippy", "REQUEST")
 
 
-def test_recheck_checkout_failure_records_notifies_completes_and_hands_off_set():
+def test_recheck_checkout_failure_records_notifies_once_and_stays_pending():
+    # A recheck that ran nothing is not done, for an ordinary row as for a move.
     with tempfile.TemporaryDirectory() as tmp:
         team = make_team(Path(tmp))
         row = {"M": "0123456789abcdef", "wo": "work-a", "set": ["work-a", "work-b"],
@@ -332,16 +333,18 @@ def test_recheck_checkout_failure_records_notifies_completes_and_hands_off_set()
                 patch.object(cl, "step_results") as steps, patch.object(cl, "apply_recheck_findings") as findings, \
                 patch.object(cl, "after_landing") as after, patch.object(cl, "now", return_value="now"):
             result = cl.recheck_one(team, row)
+            again = cl.recheck_one(team, cl.read_recheck(team)[0])      # the next poll rereads the row and fails again
         expected = {"time": "now", "M": "0123456789abcdef", "wo": "work-a", "set": ["work-a", "work-b"],
                     "overlapping": ["prior"], "zones": ["A"], "tests": [], "checkout": "failed", "error": "checkout refused"}
         assert result == expected
+        assert again["checkout"] == "failed"
         assert [json.loads(line) for line in (team.dir / "integration-results.jsonl").read_text().splitlines()] == [expected]
-        assert cl.read_recheck(team) == [{**row, "done": "now"}]
+        assert cl.read_recheck(team) == [{**row, "checkout_failed": "now"}]
         team.notify.assert_called_once()
         to, kind, text = team.notify.call_args.args
         assert (to, kind) == ("Skippy", "NOTE")
-        assert all(s in text for s in ("0123456789", "work-a", "work-b", "checkout refused"))
-        after.assert_called_once_with(team, recs)
+        assert all(s in text for s in ("0123456789", "work-a", "work-b", "checkout refused", "stays pending"))
+        after.assert_not_called()
         steps.assert_not_called()
         findings.assert_not_called()
 

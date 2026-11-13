@@ -27,8 +27,9 @@ Stage 6 and Stage 4 recovery:
      reinstalls it from this codeteam-land and the Stage 6 run passes, where the stale copy recorded "toolchain".
  11. A reused land/itest worktree with a tracked file a test changed and an untracked file where M has one:
      `recheck-run --once` recovers with the forced checkout, runs the recheck at M, and untracked build output stays.
- 12. Both checkouts fail (index.lock held): the result is recorded with checkout "failed", the orchestrator is told
-     once and the row is marked done; no review is asked, since Kong reviewed the work order before it landed.
+ 12. Both checkouts fail (index.lock held): the result is recorded once with checkout "failed", the orchestrator is
+     told once and the row stays pending through a second poll; no review is asked, since Kong reviewed the
+     work order before it landed. With the lock gone, the next poll runs the recheck at M and completes the row.
 Repo test folders:
  13. A tests/integration folder mixing a pytest file and plain scripts, one of which fails: Stage 2 fails with exit 3
      on that step, and the scripts after the failing one still ran.
@@ -415,6 +416,43 @@ def test_a_set_whose_second_member_conflicts_bounces_every_member(team):
             and "B/value" in line], told
 
 
+def test_a_finding_on_a_passed_member_sends_the_set_back(team):
+    # b1's verdict stands from the first round, so the second asks only for a1's new commit.
+    # Reading the set, Kong finds b1 wrong: the finding is recorded, and his verdict on a1 sends the set back.
+    team.cut("A", "a1")
+    team.cut("B", "b1")
+    team.edit("a1", "A/value", "4")
+    team.edit("b1", "B/value", "4")
+    r = team.land("land", "a1", "--with", "b1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    team.review("b1")
+    r = team.land("finding", "a1", "--wo", "a1", "--zone", "A", "--where", "A/value:1", "--severity", "3",
+                  "--kind", "comment", "--what", "first round", session="Kong")
+    assert r.returncode == 0, r.stdout + r.stderr
+    team.review("a1")
+    assert team.queued() == []
+    team.edit("a1", "A/other", "fixed")
+    before = team.tip()
+    r = team.land("land", "a1", "--with", "b1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = {wo: json.loads((team.w / "team" / "land" / "reviews" / f"{wo}.json").read_text()) for wo in ("a1", "b1")}
+    assert (rows["a1"]["state"], rows["b1"]["state"]) == ("pending", "land"), rows
+    r = team.land("finding", "b1", "--wo", "b1", "--zone", "B", "--where", "B/value:1", "--severity", "2",
+                  "--kind", "spec", "--what", "refusal missing", session="Kong")
+    assert r.returncode == 0, r.stdout + r.stderr
+    team.review("a1")
+    r = team.land("queue-run", "--once")
+    assert "Traceback" not in r.stderr, r.stderr
+    assert team.queued() == [] and team.tip() == before
+    for wo in ("a1", "b1"):
+        assert subprocess.run(["git", "rev-parse", "--verify", "-q", f"refs/landed/{wo}"], cwd=team.repo,
+                              capture_output=True).returncode != 0
+        assert "queued" not in team.wo(wo)
+    told = team.notices()
+    assert [line for line in told if line.startswith("REQUEST Coord-B b1: Stage 3 findings by Kong: b1#1")
+            and "refusal missing" in line and "went back at the verdict on a1" in line], told
+
+
 @pytest.fixture
 def repo_itest_team(tmp_path):
     """A team whose repo has tests/integration/check.sh, which logs the group it ran under; the step goes through
@@ -528,22 +566,24 @@ def test_a_dirty_itest_tree_is_recovered_by_the_forced_checkout(team):
     assert feature["rounds"], feature                                      # handed to review
 
 
-def test_a_checkout_that_cannot_be_forced_is_recorded_and_asks_no_review(team):
+def test_a_checkout_that_cannot_be_forced_stays_pending_until_it_can(team):
     M, itest = landed_with_recheck(team)
     asked_before = kong_requests(team)
     (itest / "A" / "value").write_text("a test wrote here\n")
     lock = team.repo / ".git" / "worktrees" / "itest" / "index.lock"
     lock.write_text("")                                                   # git cannot write the index at all
     before = len(team.gate_runs())
-    r = team.land("recheck-run", "--once")
-    assert r.returncode == 0 and "Traceback" not in r.stderr, r.stdout + r.stderr
+    land = team.w / "team" / "land"
+    for _ in range(2):                                                    # the second poll fails the same way
+        r = team.land("recheck-run", "--once")
+        assert r.returncode == 0 and "Traceback" not in r.stderr, r.stdout + r.stderr
     assert sh("git rev-parse HEAD", itest).strip() != M
-    rows, results, feature = recheck_state(team)
-    assert "done" in rows[0]
+    rows = [json.loads(line) for line in (land / "recheck.jsonl").read_text().splitlines()]
+    results = [json.loads(line) for line in (land / "integration-results.jsonl").read_text().splitlines()]
+    assert "done" not in rows[0] and "checkout_failed" in rows[0], rows   # a recheck that ran nothing is not done
     assert len(results) == 1, results
     assert (results[0]["checkout"], results[0]["set"]) == ("failed", ["o2"]) and "index.lock" in results[0]["error"]
     assert team.gate_runs()[before:] == []                                # no test ran at a commit not checked out
-    assert feature["rounds"], feature
     told = team.notices()
     assert len([line for line in told if line.startswith("NOTE orc ") and "Recheck checkout failed" in line
                 and M[:10] in line]) == 1, told
@@ -551,8 +591,15 @@ def test_a_checkout_that_cannot_be_forced_is_recorded_and_asks_no_review(team):
     assert kong_requests(team) == asked_before, told
     review = json.loads((team.w / "team" / "land" / "reviews" / "o2.json").read_text())
     assert (review["wo"], review["stage"], review["state"]) == ("o2", 3, "land"), review
-    r = team.land("recheck-run", "--once")                                # done: not tried again
-    assert len(recheck_state(team)[1]) == 1
+    lock.unlink()                                                         # the cause is cleared: the next poll runs it
+    r = team.land("recheck-run", "--once")
+    assert r.returncode == 0 and "Traceback" not in r.stderr, r.stdout + r.stderr
+    assert sh("git rev-parse HEAD", itest).strip() == M
+    assert "A integration" in team.gate_runs()[before:], team.gate_runs()
+    rows, results, feature = recheck_state(team)
+    assert "done" in rows[0]
+    assert len(results) == 2 and "checkout" not in results[1], results
+    assert feature["rounds"], feature
 
 
 # ---------------------------------------------------------------- repo test folders

@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -99,5 +100,10 @@ finally:
     Path.stat = real_stat
 t("no file under an ignored folder is looked at", not any("junk" in str(p) for p in calls), len(calls))
 
-print(f"\n{'all passed' if not fails else f'{fails} failed'}  ({W})")
+if fails:
+    print(f"\n{fails} failed  ({W} kept for a look)")
+else:
+    # 8 MB a run, left in the landing tool's TMPDIR every time: kept only on a failure.
+    shutil.rmtree(W, ignore_errors=True)
+    print("\nall passed")
 sys.exit(1 if fails else 0)

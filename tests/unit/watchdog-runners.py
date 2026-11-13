@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -101,6 +102,7 @@ class RunnerProblemsTests(unittest.TestCase):
             problems = ["landing queue runner not running", "recheck runner not running",
                         "validation runner not running"]
             with (patch.object(self.watchdog, "TEAMS", teams), patch.object(self.watchdog, "STATE", state),
+                  patch.object(self.watchdog, "WORKSPACE", root),
                   patch.object(self.watchdog.time, "time", return_value=(v2 / "heartbeat").stat().st_mtime),
                   patch.object(self.watchdog, "runner_problems", return_value=problems, create=True),
                   patch.object(self.watchdog.subprocess, "run", return_value=SimpleNamespace(returncode=0,
@@ -111,6 +113,135 @@ class RunnerProblemsTests(unittest.TestCase):
             self.assertEqual([call.args[1] for call in notify.call_args_list], problems)
             self.assertEqual(set(json.loads(state.read_text())),
                              {"demo: landing queue", "demo: recheck runner", "demo: validation runner"})
+
+
+class FullDiskTests(unittest.TestCase):
+    """On a full disk the state file cannot be written, and the pass once stopped there, before the
+    disk floor ran; build folders idle since 08:52 were cleared only at 09:39."""
+
+    def test_a_state_write_that_fails_on_a_full_disk_still_lets_the_floor_and_the_queue_sweep_run(self):
+        watchdog, _ = load_watchdog()
+        ran = []
+
+        class FullState:
+            def __init__(self, folder):
+                self.parent = folder
+
+            def read_text(self):
+                raise FileNotFoundError(2, "No such file or directory")
+
+            def write_text(self, text):
+                raise OSError(28, "No space left on device")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with (patch.object(watchdog, "TEAMS", Path(tmp)), patch.object(watchdog, "STATE", FullState(Path(tmp))),
+                  patch.object(watchdog, "WORKSPACE", Path(tmp)),
+                  patch.object(watchdog, "sweep_queue", side_effect=lambda: ran.append("queue")),
+                  patch.object(watchdog, "sweep_disk", side_effect=lambda: ran.append("disk")),
+                  contextlib.redirect_stdout(out)):
+                watchdog.check()
+        self.assertEqual(ran, ["queue", "disk"])
+        self.assertIn("failed: OSError: [Errno 28] No space left on device", out.getvalue())
+
+    def test_a_failing_floor_does_not_stop_the_team_checks(self):
+        watchdog, _ = load_watchdog()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            out = io.StringIO()
+            with (patch.object(watchdog, "TEAMS", Path(tmp)), patch.object(watchdog, "STATE", state),
+                  patch.object(watchdog, "WORKSPACE", Path(tmp)),
+                  patch.object(watchdog, "sweep_queue"),
+                  patch.object(watchdog, "sweep_disk", side_effect=OSError(28, "No space left on device")),
+                  contextlib.redirect_stdout(out)):
+                watchdog.check()
+            self.assertEqual(json.loads(state.read_text()), {})
+        self.assertIn("sweep_disk failed: OSError: [Errno 28] No space left on device", out.getvalue())
+
+
+class LandCloneFloorTests(unittest.TestCase):
+    """The landing tool's own clones (one team's land/validate/target held 50 GiB, land/itest/target
+    23 GiB) are swept below the 50 GiB red line when no Stage 5 or 6 run holds them; a team's manifest that
+    lives in its own clone is checked too."""
+
+    def setUp(self):
+        self.watchdog, _ = load_watchdog()
+
+    def test_manifests_adds_an_up_team_whose_manifest_lives_in_its_own_clone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            teams, workspace = root / "teams", root / "workspace"
+            teams.mkdir()
+            (teams / "a.toml").write_text("")
+            for name in ("a", "gizmos"):
+                (workspace / f"team-{name}" / "team" / "v2").mkdir(parents=True)
+                (workspace / f"team-{name}" / "team" / "v2" / "up").touch()
+            own = workspace / "team-gizmos" / "design" / "gizmos" / "teams"
+            own.mkdir(parents=True)
+            for name in ("gadgets", "gizmos"):     # gizmos' clone holds every team's manifest
+                (own / f"{name}.toml").write_text("")
+            (workspace / "team-down" / "design" / "down" / "teams").mkdir(parents=True)
+            (workspace / "team-down" / "design" / "down" / "teams" / "down.toml").write_text("")
+            self.assertEqual(self.watchdog.manifests(teams, workspace), [teams / "a.toml", own / "gizmos.toml"])
+
+    def test_land_clones_follow_the_validation_tier(self):
+        root = Path("/t")
+        clones = self.watchdog.land_clones
+        self.assertEqual(clones({}, root), {})
+        self.assertEqual(clones({"land": {"enabled": True}}, root),
+                         {"itest": root / "land" / "itest", "validate": root / "land" / "validate"})
+        self.assertEqual(clones({"land": {"remote": {"host": "remote-box", "path": "~/x"}}}, root),
+                         {"itest": root / "land" / "itest"})
+        self.assertEqual(clones({"land": {"validate": {"local": True, "path": "/v"}}}, root),
+                         {"itest": root / "land" / "itest", "validate": Path("/v")})
+        self.assertEqual(clones({"land": {"validate": {"host": "box", "path": "/v"}}}, root),
+                         {"itest": root / "land" / "itest"})
+
+    def test_busy_land_clones_are_the_live_stage_5_and_6_runs_by_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stages = Path(tmp)
+            rows = {"1": {"stage": "Stage 6", "name": "validation at abc", "pid": 111},
+                    "2": {"stage": "Stage 5", "name": "recheck of w at M 1", "pid": 222},     # dead
+                    "3": {"stage": "Stage 2", "name": "check of w", "pid": 333},              # not a clone of its own
+                    "4": {"stage": "Stage 5", "name": "recheck of v at M 2", "pid": 444}}     # command unreadable
+            for name, row in rows.items():
+                (stages / f"{name}.json").write_text(json.dumps(row))
+            (stages / "5.json").write_text("{")
+            commands = {111: "python3 /x/codeteam-land /m/teams/t.toml validate-run\n", 444: None}
+            with patch.object(self.watchdog, "alive", side_effect=lambda pid: pid != 222):
+                busy = self.watchdog.busy_land_clones(stages, command=commands.get)
+            self.assertEqual(busy, {(os.path.realpath("/m/teams/t.toml"), "validate"), ("*", "itest")})
+
+    def test_an_idle_land_clone_loses_its_build_output_only_below_the_red_line_and_never_while_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            teams, q, root = base / "teams", base / "queue", base / "team-t"
+            teams.mkdir()
+            q.mkdir()
+            manifest = teams / "t.toml"
+            manifest.write_text(f'worktree_root = "{root}"\n[land]\nenabled = true\n')
+            for kind in ("itest", "validate"):
+                (root / "land" / kind / "target" / "debug").mkdir(parents=True)
+            stages = base / "restart" / "stages"
+            stages.mkdir(parents=True)
+            (stages / "9-0.json").write_text(json.dumps({"stage": "Stage 6", "name": "validation at abc", "pid": 9}))
+            ran = {9: f"python3 codeteam-land {manifest} validate-run"}
+            with (patch.object(self.watchdog, "last_active", return_value=0.0),
+                  patch.object(self.watchdog, "alive", side_effect=lambda pid: pid in ran),
+                  patch.object(self.watchdog, "command_of", side_effect=ran.get),
+                  patch.object(self.watchdog.subprocess, "Popen"), patch.object(self.watchdog, "notify"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                above = self.watchdog.sweep_disk(teams, q, min_gb=150, idle_s=1800, free=lambda: 100.0,
+                                                 land_min_gb=53.7, workspace=base / "none")
+                self.assertEqual(above, [])
+                self.assertTrue((root / "land" / "itest" / "target").is_dir())
+                below = self.watchdog.sweep_disk(teams, q, min_gb=150, idle_s=1800, free=lambda: 20.0,
+                                                 land_min_gb=53.7, workspace=base / "none")
+            self.assertEqual(len(below), 1, below)
+            self.assertIn(str(root / "land" / "itest" / "target"), below[0])
+            self.assertFalse((root / "land" / "itest" / "target").exists())
+            self.assertTrue((root / "land" / "validate" / "target").is_dir(), "Stage 6 holds the validate clone")
+            self.assertTrue((root / "land" / "itest" / ".." / "itest").is_dir(), "the clone itself stays")
 
 
 if __name__ == "__main__":

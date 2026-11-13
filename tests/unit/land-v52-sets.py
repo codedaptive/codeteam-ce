@@ -307,7 +307,7 @@ class StageTwoSet(unittest.TestCase):
         stack.enter_context(patch.object(cl, "queue_notices"))
         stack.enter_context(patch.object(cl, "now", return_value="now"))
         stack.enter_context(patch.object(cl.time, "strftime", return_value="20000101-000000"))
-        stack.enter_context(patch.object(cl, "stage3_record", side_effect=lambda t, r: {"wo": r["wo"], "state": "land", "reviewers": {}, "seen": {}}))
+        stack.enter_context(patch.object(cl, "stage3_record", side_effect=lambda t, r, **kw: {"wo": r["wo"], "state": "land", "reviewers": {}, "seen": {}}))
         stack.enter_context(patch.object(cl, "out", side_effect=self.fake_out))
         self.git = stack.enter_context(patch.object(cl, "git", side_effect=self.fake_git))
 
@@ -338,7 +338,8 @@ class StageTwoSet(unittest.TestCase):
         with self.assertRaises(SystemExit) as ex:
             cl.cmd_land(self.obj, self.args)
         self.assertEqual(ex.exception.code, 2)
-        self.assertIn(call("tree1", "merge", "--abort"), self.git.call_args_list)
+        # check=False: when git refused to start the merge there is nothing to abort.
+        self.assertIn(call("tree1", "merge", "--abort", check=False), self.git.call_args_list)
         tree_calls = [c for c in self.git.call_args_list if c.args[0] == "tree1"]
         self.assertEqual(tree_calls[-1], call("tree1", "checkout", "-q", "wo/A/w1"))
         self.assertFalse(self.queue_file.exists())
@@ -347,12 +348,54 @@ class StageTwoSet(unittest.TestCase):
         # Never a member alone, so halves that build only together land.
         self.current.return_value = False
         cl.cmd_land(self.obj, self.args)
-        self.assertEqual([(c.args[0], c.args[1]["zone"], c.args[1]["tree"]) for c in self.units.call_args_list],
-                         [(self.obj, "A", "tree1"), (self.obj, "B", "tree1")])
+        self.assertEqual([(c.args[0], c.args[1]["tree"], c.args[2]) for c in self.units.call_args_list],
+                         [(self.obj, "tree1", "A"), (self.obj, "tree1", "B")])
+
+    def test_a_set_tests_other_zones_in_the_first_record_itself_never_a_copy_with_their_zone(self):
+        # dict(first, zone=zone) once was saved by stage2_steps over the first member's record.
+        self.current.return_value = False
+        cl.cmd_land(self.obj, self.args)
+        self.assertTrue(all(c.args[1] is self.records["w1"] for c in self.units.call_args_list))
+        self.assertEqual(self.records["w1"]["zone"], "A")
+
+    def test_a_set_checks_its_merged_files_without_putting_them_in_the_first_record(self):
+        with patch.object(cl, "check_integration", return_value=["A", "B"]) as check:
+            cl.cmd_land(self.obj, self.args)
+        self.assertIs(check.call_args.args[1], self.records["w1"])
+        self.assertEqual(check.call_args.kwargs["files"], ["a/x.py"])
 
     def test_a_set_whose_merged_units_are_current_runs_none(self):
         cl.cmd_land(self.obj, self.args)
         self.units.assert_not_called()
+
+
+class StoppedLand(unittest.TestCase):
+    """A land a live land of the same team holds is refused before any check, and an interrupted concurrent run
+    stops its running steps. The two cases that send this process a real SIGTERM or SIGHUP are integration
+    tests: tests/integration/land-stopped-by-signal.py."""
+
+    def test_a_land_of_a_member_a_live_land_holds_is_refused_before_any_check(self):
+        # The second land once read the live set's merge in the tree; now it never reaches it.
+        stages = cl.buildq_dir().parent / "restart" / "stages"
+        stages.mkdir(parents=True, exist_ok=True)
+        row = stages / "holder.json"
+        row.write_text(json.dumps({"stage": "Stage 2", "name": "check of two", "pid": os.getppid(), "started": "t",
+                                   "team": str(Path("/team.toml")), "wos": ["two"]}))
+        self.addCleanup(row.unlink, missing_ok=True)
+        args = SimpleNamespace(wo="one", with_=["two"], untested=False)
+        with patch.object(cl, "check_and_queue") as check, redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as ex:
+            cl.cmd_land(team(), args)
+        self.assertEqual(ex.exception.code, cl.REFUSED)
+        check.assert_not_called()
+        self.assertIn("two: a land of it is already running", err.getvalue())
+
+    def test_an_interrupted_concurrent_run_stops_each_running_steps_process_group(self):
+        running, ended = Mock(pid=101), Mock(pid=102)
+        running.poll.return_value, ended.poll.return_value = None, 0
+        with patch.object(cl.os, "killpg") as killpg:
+            cl.stop_steps([("a", 0.0, running), ("b", 0.0, ended)])
+        killpg.assert_called_once_with(101, cl.signal.SIGTERM)
 
 
 class LandingSet(unittest.TestCase):

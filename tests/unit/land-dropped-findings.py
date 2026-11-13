@@ -58,6 +58,25 @@ def test_new_commits_go_to_review_as_before():
     assert ranges([finding("open")], new=["n" * 40]) == {"Kong": ["n" * 40]}
 
 
+def test_a_merge_only_fix_goes_back_to_review():
+    """wo-pull merged promoted work that fixes the finding: no own commit is new, but the tip moved."""
+    moved = dict(PREVIOUS, tip="o" * 40)
+    with patch.object(cl, "review_range", side_effect=[[], ["c" * 40]]), \
+            patch.object(cl, "all_findings", return_value=[finding("open")]):
+        assert cl.reviewer_ranges(SimpleNamespace(), REC, moved, ["Kong"]) == {"Kong": ["c" * 40]}
+
+
+def test_the_same_tip_with_an_open_finding_is_still_refused():
+    same = dict(PREVIOUS, tip=REC["tip"])
+    with patch.object(cl, "review_range", return_value=[]), \
+            patch.object(cl, "all_findings", return_value=[finding("open")]):
+        try:
+            cl.reviewer_ranges(SimpleNamespace(), REC, same, ["Kong"])
+        except SystemExit:
+            return
+    raise AssertionError("not refused")
+
+
 if __name__ == "__main__":
     import inspect
     failed = 0

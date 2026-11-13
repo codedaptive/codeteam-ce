@@ -29,6 +29,9 @@
 #     environment, unchanged code: OWNS=pkg passes, pkg:bad runs again and fails naming
 #     test_bad, empty is refused naming CODETEAM_OWNS (no replayed PASS); each run writes
 #     .test-record.json (the suite record, not a keyed one) with salt "owns=<CODETEAM_OWNS>".
+# 15. Repo C, plain scripts in tests/unit and tests/integration named by owns globs: in the
+#     unit group tests/unit's run as python3 FILE and tests/integration's are skipped with a line
+#     saying so; a failing one fails the run naming it; in the integration group tests/integration's run.
 # The outer session's make, zone and queue variables are cleared first, and group variables are kept from
 # children, so the live checkout's zone.mk (MAKEFILES), an outer DIR in MAKEFLAGS, a job's own queue variables
 # (CODETEAM_BUILDQ_TICKET, CODETEAM_SLOT_HELD) and outer group keys cannot leak into the scratch runs.
@@ -195,6 +198,31 @@ zmake_owns pkg:bad zone-test CODETEAM_ZONE=. ZONE_TEST_FLAGS=--cached
 expect14 "14 zone-test --cached CODETEAM_OWNS=pkg:bad, unchanged code: runs again, fails naming test_bad" nz FAIL test_bad "owns=pkg:bad"
 zmake_owns "" zone-test CODETEAM_ZONE=. ZONE_TEST_FLAGS=--cached
 expect14 "14 zone-test --cached CODETEAM_OWNS empty, unchanged code: refused, names CODETEAM_OWNS" nz FAIL CODETEAM_OWNS "owns="
+
+# --- repo C: no Makefile; plain scripts in tests/unit and tests/integration -------
+# 15: Stage 2 runs a .py that is not a pytest file by name in tests/unit (unit step) and tests/integration
+# (integration step) as `python3 <file>`; an owns list naming them by glob runs them the same way, each in its group.
+C="$tmp/c"; newrepo "$C"
+mkdir -p "$C/tests/unit" "$C/tests/integration"
+printf 'open("%s/c-unit-ran", "w").close()\n' "$mk" > "$C/tests/unit/land-ok.py"
+printf 'import sys\nsys.exit(1)\n' > "$C/tests/unit/land-bad.py"
+printf 'open("%s/c-int-ran", "w").close()\n' "$mk" > "$C/tests/integration/land-int.py"
+commit "$C"
+zmake_c() {  # $1 CODETEAM_OWNS, $2 CODETEAM_TEST_GROUP, rest: make arguments
+  local owns=$1 group=$2; shift 2
+  out="$(cd "$C" && env CODETEAM_OWNS="$owns" CODETEAM_TEST_GROUP="$group" MAKEFILES="$ZONE_MK" make --no-print-directory "$@" 2>&1)"; rc=$?
+}
+rm -f "$mk/c-unit-ran" "$mk/c-int-ran"
+zmake_c "tests/unit/land-ok.py:tests/integration/land-*.py" unit zone-test-one DIR=.
+if [ "$rc" -eq 0 ] && [ -e "$mk/c-unit-ran" ] && [ ! -e "$mk/c-int-ran" ] && grep -q "skipped 1 script(s) in tests/integration" <<<"$out"
+then ok "15 owned scripts, unit group: tests/unit's ran, tests/integration's skipped and said so"
+else bad "15 owned scripts, unit group" "exit $rc, unit ran: $([ -e "$mk/c-unit-ran" ] && echo yes || echo no), integration ran: $([ -e "$mk/c-int-ran" ] && echo yes || echo no); output tail: $(tail -3 <<<"$out" | tr '\n' '|')"; fi
+zmake_c "tests/unit/land-*.py" unit zone-test-one DIR=.
+expect "15 an owned failing script: non-zero, names land-bad.py" nz - - land-bad.py
+rm -f "$mk/c-int-ran"
+zmake_c "tests/integration/land-*.py" integration zone-test-one DIR=.
+if [ "$rc" -eq 0 ] && [ -e "$mk/c-int-ran" ]; then ok "15 owned scripts, integration group: tests/integration's ran"
+else bad "15 owned scripts, integration group" "exit $rc, integration ran: $([ -e "$mk/c-int-ran" ] && echo yes || echo no); output tail: $(tail -3 <<<"$out" | tr '\n' '|')"; fi
 
 # --- repo B: its own Makefile defines test-one -----------------------------------------
 B="$tmp/b"; newrepo "$B"

@@ -83,7 +83,7 @@ def lock_held(team):
 
 
 
-def review_output(has_line):
+def review_output(has_line, after=None):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         team = make_team(root)
@@ -92,6 +92,8 @@ def review_output(has_line):
         ledger = root / "ledger"
         (ledger / "changelog").mkdir(parents=True)
         team.cfg["guard_ledger"] = str(ledger)
+        if after:
+            team.cfg["docs"] = {"enabled": True, "after": after}
         if has_line:
             (ledger / "changelog" / "w1.md").write_text("A line")
         return cl.review_entry_notice(team, "w1"), str(ledger)
@@ -100,6 +102,14 @@ def review_output(has_line):
 def test_review_with_changelog_describes_promotion_entry():
     output, _ = review_output(True)
     assert output.endswith("your changelog line is the entry when a promotion stamps its documents"), output
+
+
+def test_review_with_changelog_says_the_line_is_published_through_the_after_step():
+    # 2026-11-12: Kong's line for a work order named `docs/_public`, and the stamp's
+    # `make public-docs` refused it, so no promotion could stamp its documents.
+    output, _ = review_output(True, after="make public-docs")
+    assert output.endswith("your changelog line is the entry when a promotion stamps its documents; it is published "
+                           "with them and must pass `make public-docs`"), output
 
 
 def test_review_without_changelog_describes_subject_fallback():
@@ -122,6 +132,164 @@ def test_stage_admission_creates_and_removes_record():
             row = json.loads(files[0].read_text())
             assert row["stage"] == "Stage 2" and row["name"] == "check of a" and row["pid"] == os.getpid() and row["started"]
         assert not files[0].exists()
+
+
+def holder_row(stages, pid, team_key, wos, name="hold"):
+    stages.mkdir(parents=True, exist_ok=True)
+    (stages / f"{name}.json").write_text(json.dumps({"stage": "Stage 2", "name": f"check of {', '.join(wos)}",
+                                                     "pid": pid, "started": "06:10", "team": team_key, "wos": wos}))
+
+
+def test_stage_admission_refuses_a_work_order_a_live_land_of_the_team_holds():
+    # A second land of w2, the --with member of a live land mid Stage 2, read the set's merge
+    # in the tree and was refused for the other member's files; it is refused by name, before any record is read.
+    with tempfile.TemporaryDirectory() as tmp:
+        qdir = Path(tmp) / "queue"
+        stages = qdir.parent / "restart" / "stages"
+        holder_row(stages, os.getppid(), "/t.toml", ["w1", "w2"])
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err), cl.stage_admit("Stage 2", "check of w2", qdir=qdir,
+                                                                  holds=("/t.toml", ["w2"])):
+                raise AssertionError("admitted while a live land holds w2")
+        except SystemExit as exc:
+            assert exc.code == cl.REFUSED
+        assert err.getvalue().startswith(f"w2: a land of it is already running (pid {os.getppid()}, Stage 2 check of "
+                                         "w1, w2, since 06:10)"), err.getvalue()
+        assert f"kill -TERM {os.getppid()}" in err.getvalue()
+        assert [p.name for p in stages.glob("*.json")] == ["hold.json"]
+
+
+def test_stage_admission_admits_beside_another_teams_land_or_other_work_orders_and_records_its_own():
+    with tempfile.TemporaryDirectory() as tmp:
+        qdir = Path(tmp) / "queue"
+        stages = qdir.parent / "restart" / "stages"
+        holder_row(stages, os.getppid(), "/other.toml", ["w2"], "other-team")
+        holder_row(stages, os.getppid(), "/t.toml", ["w9"], "other-wo")
+        with cl.stage_admit("Stage 2", "check of w2", qdir=qdir, holds=("/t.toml", ["w2"])):
+            mine = [json.loads(p.read_text()) for p in stages.glob("*.json") if p.stem.startswith(f"{os.getpid()}-")]
+            assert [(r["team"], r["wos"]) for r in mine] == [("/t.toml", ["w2"])]
+
+
+def test_stage_holders_skips_a_dead_holder_and_its_own_process():
+    with tempfile.TemporaryDirectory() as tmp:
+        rdir = Path(tmp) / "restart"
+        holder_row(rdir / "stages", 10, "/t.toml", ["w1"], "dead")
+        holder_row(rdir / "stages", os.getpid(), "/t.toml", ["w1"], "own")
+        holder_row(rdir / "stages", 12, "/t.toml", ["w1"], "live")
+        assert [r["pid"] for r in cl.stage_holders(rdir, "/t.toml", ["w1"], alive=lambda pid: pid != 10)] == [12]
+
+
+def test_stage_holders_reads_a_land_recorded_before_d394_by_its_name():
+    # A land started by an older landing tool recorded no team or wos, only "check of a, b". The next land puts a set merge
+    # back on its branch, so such a land, still running, must hold its work orders too. A Stage 5 record holds none.
+    with tempfile.TemporaryDirectory() as tmp:
+        rdir = Path(tmp) / "restart"
+        (rdir / "stages").mkdir(parents=True)
+        (rdir / "stages" / "old.json").write_text(json.dumps({"stage": "Stage 2", "name": "check of w1, w2", "pid": 12,
+                                                              "started": "05:48"}))
+        (rdir / "stages" / "recheck.json").write_text(json.dumps({"stage": "Stage 5", "name": "recheck of w2 at M 1",
+                                                                  "pid": 13, "started": "05:50"}))
+        assert [r["pid"] for r in cl.stage_holders(rdir, "/t.toml", ["w2"], alive=lambda pid: True)] == [12]
+        assert cl.stage_holders(rdir, "/t.toml", ["w3"], alive=lambda pid: True) == []
+
+
+def test_stopped_by_reads_each_tools_full_disk_error_on_a_step_that_did_not_pass():
+    # Python, Rust (cargo, rustc), git and the shell each say ENOSPC their own way.
+    for said in ("OSError: [Errno 28] No space left on device: '/team-acme/land/tmp/x'",
+                 "error: failed to write `target/debug/deps/x.rmeta`: No space left on device (os error 28)",
+                 "fatal: write error: No space left on device",
+                 "sh: line 1: echo: write error: ENOSPC"):
+        assert cl.stopped_by("FAIL", said) == "disk", said
+        assert cl.stopped_by("HUNG", said) == "disk", said
+    assert cl.stopped_by("PASS", "test_enospc_is_reported ... No space left on device ... ok") is None
+    assert cl.stopped_by("FAIL", "assertion failed: left == right (3 != 4)") is None
+
+
+def test_stopped_by_reads_the_swift_compile_cache_error_on_a_step_that_did_not_pass():
+    # Xcode's shared compile cache once failed a package's check with this line;
+    # the cache, not the work order. A full disk named in the same output is the cause, so it reads as "disk".
+    said = ("<unknown>:0: error: cannot create CAS filesystem: not a IncludeFileList node kind "
+            "[#CompilationCaching]")
+    assert cl.stopped_by("FAIL", said) == "cache"
+    assert cl.stopped_by("HUNG", said) == "cache"
+    assert cl.stopped_by("PASS", said) is None
+    assert cl.stopped_by("FAIL", said + "\nerror: No space left on device") == "disk"
+    assert cl.stopped_by("FAIL", "note: see [#CompilationCaching] for how the cache works") is None
+    # A stored result that cannot be read back, then cannot be replaced; neither line is tagged.
+    for said in ("error: CAS error: unsupported compile result schema found",
+                 "error: failed to update cache: cache poisoned for 'e37ee2e9c191648a' (new='llvmcas://05026ffa' vs. "
+                 "existing 'llvmcas://85fa99d3')"):
+        assert cl.stopped_by("FAIL", said) == "cache", said
+        assert cl.stopped_by("PASS", said) is None, said
+    assert cl.stopped_by("FAIL", "XCTAssertEqual failed: the cache poisoned flag was not set") is None
+
+
+def test_stage2_steps_records_a_full_disk_step_as_disk_and_says_it_is_no_test_failure():
+    # Two Stage 2 runs once died of ENOSPC and read as test failures. The exit stays 3 (SPEC v5.4
+    # Stage 2 step 7); the record and the words say what stopped it.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        rec = {"wo": "w1", "zone": "A", "tree": str(Path(tmp) / "no-tree")}
+        results = [{"name": "unit A", "outcome": "FAIL", "seconds": 3.04, "tail": ["[Errno 28]"], "stopped_by": "disk"},
+                   {"name": "unit B", "outcome": "FAIL", "seconds": 1.0, "tail": ["assert 3 == 4"]}]
+
+        def run_steps(tree, steps, env, *, concurrent=True, on_result=None):
+            for result in results:
+                on_result(result)
+            return False, ["FAIL unit A (3 s)", "FAIL unit B (1 s)"]
+
+        out = io.StringIO()
+        with patch.object(cl, "run_steps", side_effect=run_steps), contextlib.redirect_stdout(out):
+            ok = cl.stage2_steps(team, rec, [("unit A", "a"), ("unit B", "b")], "unit")
+        assert ok is False
+        assert rec["stage2"] == [{"step": "unit A", "result": "disk", "seconds": 3.0},
+                                 {"step": "unit B", "result": "fail", "seconds": 1.0}], rec["stage2"]
+        said = out.getvalue()
+        assert "DISK: unit A stopped on a full disk (No space left on device)" in said, said
+        assert "not a test failure" in said and "unit B" not in said.split("DISK:", 1)[1], said
+        assert "CACHE:" not in said, said
+
+
+def test_stage2_steps_records_a_compile_cache_step_as_cache_and_says_it_is_no_test_failure():
+    # The shared Swift compile cache stopped a step; the exit stays 3, the record and the
+    # words name the cache.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        rec = {"wo": "w1", "zone": "A", "tree": str(Path(tmp) / "no-tree")}
+        results = [{"name": "unit A", "outcome": "FAIL", "seconds": 3.04, "tail": ["[#CompilationCaching]"],
+                    "stopped_by": "cache"},
+                   {"name": "unit B", "outcome": "PASS", "seconds": 1.0, "tail": ["ok"]}]
+
+        def run_steps(tree, steps, env, *, concurrent=True, on_result=None):
+            for result in results:
+                on_result(result)
+            return False, ["FAIL unit A (3 s)", "PASS unit B (1 s)"]
+
+        out = io.StringIO()
+        with patch.object(cl, "run_steps", side_effect=run_steps), contextlib.redirect_stdout(out):
+            ok = cl.stage2_steps(team, rec, [("unit A", "a"), ("unit B", "b")], "unit")
+        assert ok is False
+        assert rec["stage2"] == [{"step": "unit A", "result": "cache", "seconds": 3.0},
+                                 {"step": "unit B", "result": "pass", "seconds": 1.0}], rec["stage2"]
+        said = out.getvalue()
+        assert "CACHE: unit A stopped on an error in the machine's shared Swift compile cache" in said, said
+        assert "not a test failure" in said and "Orc-Codeteam" in said and "DISK:" not in said, said
+
+
+def test_checked_members_puts_each_tree_back_before_it_reads_one():
+    # A tree a dead land left on its set's merge is put back before the walls check reads
+    # its files, or the partner's file is refused as outside the zone's walls.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        for wo in ("w1", "w2"):
+            team.save_wo({"wo": wo, "zone": "A", "tree": f"/trees/{wo}", "branch": f"wo/A/{wo}"})
+        calls = []
+        with patch.object(cl, "put_back_set_merge", side_effect=lambda rec: calls.append(("put back", rec["wo"]))), \
+                patch.object(cl, "check_work_order", side_effect=lambda team, rec: calls.append(("check", rec["wo"]))
+                             or ["docs/x.md"]):
+            cl.checked_members(team, ["w1", "w2"])
+        assert calls == [("put back", "w1"), ("put back", "w2"), ("check", "w1"), ("check", "w2")], calls
 
 
 def test_stage_admission_refuses_marker():
@@ -160,6 +328,15 @@ def test_team_environment_marks_landing_jobs():
     with tempfile.TemporaryDirectory() as tmp:
         team = make_team(Path(tmp))
         assert cl.team_env(team)["CODETEAM_LANDING"] == "1"
+
+
+def test_landing_runs_write_no_bytecode_unless_the_team_says():
+    # A test that imported vendored code left __pycache__ in land/validate for the next run.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        assert cl.team_env(team)["PYTHONDONTWRITEBYTECODE"] == "1"
+        team.m["env"] = {"PYTHONDONTWRITEBYTECODE": ""}
+        assert cl.team_env(team)["PYTHONDONTWRITEBYTECODE"] == ""
 
 
 def test_restart_request_records_tip_files_and_waited():

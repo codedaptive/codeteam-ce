@@ -283,6 +283,9 @@ def test_remote_group_and_hang_settings_and_hung_result():
             result = cl.run_land_check(team, a, "abc", "validation")
         command = ssh.call_args.args[1]
         assert "CODETEAM_TEST_GROUP=validation" in command
+        # A repo Makefile reads GROUP (e.g. a product's test script): Stage 6 sets it too, as Stage 2 does. A whole
+        # word: "GROUP=validation" is also a substring of CODETEAM_TEST_GROUP=validation.
+        assert "GROUP=validation" in command.split()
         assert "CODETEAM_HANG_WINDOW=420" in command
         assert "CODETEAM_HANG_CPU_PCT=3" in command
         assert result["result"] == "hung"
@@ -290,7 +293,13 @@ def test_remote_group_and_hang_settings_and_hung_result():
 
 def test_remote_script_preserves_ignored_files_and_logs_while_running():
     assert "git clean -q -fd " in cl.REMOTE_CHECK
-    assert "git clean -q -fdx" not in cl.REMOTE_CHECK
+    # The one clean of ignored files is limited to Python's bytecode caches.
+    script = cl.REMOTE_CHECK
+    assert script.count("git clean -q -fdx") == 1, script
+    limited = script[script.index("git clean -q -fdx"):].split("||")[0]
+    assert limited.rstrip().endswith("-- ':(glob)**/__pycache__/' ':(glob)**/*.pyc'"), limited
+    assert "$build" in limited and "$keep" in limited and "-e DerivedData" in limited
+    assert script.index("export PYTHONDONTWRITEBYTECODE=1") < script.index('sh -c "$suite"')
     assert "hung" in cl.REMOTE_CHECK
     assert "land-check-logs" in cl.REMOTE_CHECK
     assert cl.REMOTE_CHECK.index("land-check-logs") < cl.REMOTE_CHECK.index('sh -c "$suite"')
@@ -363,7 +372,8 @@ def test_df_free_gib_uses_available_kib():
 def test_floor_clean_command_only_ignored_and_excludes_keep():
     import shlex
     command = cl.floor_clean_command("/clone", ["keep"])
-    assert shlex.split(command) == ["cd", "/clone", "&&", "git", "clean", "-q", "-f", "-d", "-X", "--", ".", ":!.codegraph", ":!keep"]
+    assert shlex.split(command) == ["cd", "/clone", "&&", "git", "clean", "-q", "-f", "-d", "-X", "-e", "!/.codegraph",
+                                    "-e", "!/keep", "--", "."]
 
 
 def test_stage4_does_not_close_validation_findings():
@@ -551,8 +561,8 @@ def test_disk_check_below_floor_cleans_and_reports_after():
             disk = cl.disk_check(team, a)
         assert disk == {"free_gib": 50.0, "floor_gib": 60, "cleaned": True, "free_after_gib": 70.0}
         assert "-X" in ssh.call_args_list[1].args[1]
-        assert ":!.codegraph" in ssh.call_args_list[1].args[1]
-        assert ":!keep" in ssh.call_args_list[1].args[1]
+        assert "-e '!/.codegraph'" in ssh.call_args_list[1].args[1]
+        assert "-e '!/keep'" in ssh.call_args_list[1].args[1]
 
 
 def test_disk_check_above_floor_does_not_clean():
@@ -586,6 +596,9 @@ def test_validation_findings_open_add_close_and_route():
         recipient, kind, text = team.notify.call_args.args
         assert (recipient, kind) == ("Coord-a", "REQUEST")
         assert "FIX-FORWARD validation#1" in text and "--fixes validation#1" in text
+        # A fix tree stays cut from integration and merges the failing landing
+        # commit when the cause lives only on landing (Stage 4 step 3 was once read as forbidding it).
+        assert "merge 1234567890 into the fix tree" in text
         team.notify.reset_mock()
         cl.apply_validation_findings(team, "bbbbbbbbbbcccc", failed, "t2")
         items = json.loads(path.read_text())

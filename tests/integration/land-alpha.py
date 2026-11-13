@@ -181,6 +181,15 @@ t("a toolchain mismatch refuses the run and says why", last.get("result") == "to
 t("the orchestrator and the owner are told it was not run", wait_for(lambda: "could not run on" in notes() and "OWNER" in notes()))
 (W / "team.toml").write_text(MANIFEST)
 
+print("== a missing local clone is made by Stage 6")
+FRESH = W / "alpha-fresh"
+(W / "team.toml").write_text(MANIFEST.replace(f'path = "{ALPHA}"', f'path = "{FRESH}"'))
+wo("A", "fresh", "A/fresh", "a new clone")
+r = land("validate-run", "--once")
+t("Stage 6 makes the clone it pushes to and runs the suite in it", results()[-1]["result"] == "pass" and
+  (FRESH / ".git" / "land-check").exists(), (results()[-1:], r.stdout + r.stderr))
+(W / "team.toml").write_text(MANIFEST)
+
 print("== interface rule (A1)")
 src = ["pub fn open(path: &str,", "           timeout: u32) -> Store {", "    let x = 1;", "    x", "}"]
 seed = {"path": "s.rs", "span": "L1-L5", "kind": "function", "name": "open"}

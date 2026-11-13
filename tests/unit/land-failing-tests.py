@@ -86,7 +86,7 @@ def test_an_unreachable_machine_falls_back_to_the_tail():
 
 
 def test_the_finding_text_names_the_failing_tests():
-    team = SimpleNamespace(c=lambda k, d: d, notify=lambda *a: sent.append(a), manifest="m.toml",
+    team = SimpleNamespace(c=lambda k, d: d, notify=lambda *a: sent.append(a), manifest="m.toml", landing="landing",
                            zones={"WidgetCoreKit": ["WidgetCoreKit"]})
     sent, saved = [], []
     with patch.object(cl, "load_findings", return_value=[]), \

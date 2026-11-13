@@ -54,7 +54,10 @@ TURN_GRACE_S = 50            # after a delivery, wait this long for the turn to 
                              # Claude Code writes a prompt to the transcript only after its UserPromptSubmit
                              # hooks finish, and they may take their whole 30 s timeout (2026-11-06: a team's
                              # prompt-hook under load; 25 s here put back prompts that were running)
-STOP_GRACE_S = 90            # after /exit, the lane counts as leaving for this long
+COMPACT_GRACE_S = 600        # the same wait after a delivered /compact: Claude Code writes the command to the
+                             # transcript only when the compaction ends (34 to 40 s on 2026-11-12, longer for a
+                             # big context), and a second /compact compacts the summary again
+STOP_GRACE_S = 90           # after /exit, the lane counts as leaving for this long
 GATHER_S = 30                # a message waits this long for others to join its prompt (bounded)
 WARM_S = 240                 # a session whose turn ended this recently is prompted at once: its prompt
                              # cache is still warm, so a wake is cheap and waiting only adds delay
@@ -114,6 +117,56 @@ def last_enqueue(path, tail=400_000):
         except (ValueError, KeyError, AttributeError):
             continue
     return None
+
+
+def _epoch(r):
+    """A transcript record's timestamp as an epoch, or None when it has none or it does not parse."""
+    try:
+        return dt.datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError, AttributeError):
+        return None
+
+
+def _typed(r):
+    """True when a user record shows that a prompt typed into the pane ran: its text, a slash command (/compact
+    is recorded as `<command-name>/compact</command-name>` and its output only once the compaction ends), or a
+    local command's output. A tool result, a task notification, a skill's expansion (isMeta) and a compaction
+    summary are not typed prompts."""
+    if r.get("type") != "user" or r.get("isMeta") or r.get("isCompactSummary"):
+        return False
+    c = (r.get("message") or {}).get("content")
+    if isinstance(c, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+            return False
+        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return isinstance(c, str) and bool(c.strip()) and not c.lstrip().startswith("<task-notification>")
+
+
+def _last_epoch(path, match, tail=400_000):
+    """The epoch of the last record in the transcript tail for which match(record) is true, or None."""
+    import json
+    for line in reversed(_tail_lines(path, tail) or []):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if match(r):
+            return _epoch(r)
+    return None
+
+
+def last_typed(path, tail=400_000):
+    """The epoch of the transcript's last typed prompt (_typed), or None. Between turns it is the only sign that
+    a runtime command ran: /compact and the resume line are not [codeteam] prompts, nothing is queued when the
+    session's own turn has ended, and a background lead keeps herdr's status and state_change_seq still
+    (a coordinator once compacted twice and its mail was held)."""
+    return _last_epoch(path, _typed, tail)
+
+
+def last_turn_end(path, tail=400_000):
+    """The epoch of the transcript's last turn end (a stop_hook_summary or turn_duration record), or None."""
+    return _last_epoch(path, lambda r: r.get("type") == "system"
+                       and r.get("subtype") in ("turn_duration", "stop_hook_summary"), tail)
 
 
 def transcript_usage(path, tail=400_000):
@@ -315,6 +368,8 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
     # awake/n_awake, so when every idle lane is on hold or refuses /exit, the waiting lane waits.
     viewed = lambda k: bool(g(k, "view"))
     drafted = lambda k: bool(g(k, "draft_since"))
+    # A delivered /compact shows in the transcript only when the compaction ends: it gets the longer wait.
+    grace = lambda k: COMPACT_GRACE_S if g(k, "compacting") else TURN_GRACE_S
     st = {k: (v if k not in held else {**v, "wake_requested": None}) for k, v in st.items()}
     starting = {k for k in kinds if status.get(k) == "absent" and now - (g(k, "starting_at") or 0) < START_GRACE_S}
     # Sent /exit recently and still there: leaving. Not counted against the cap, never stopped twice;
@@ -389,7 +444,7 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
                 # still being detected: restart test, 2026-10-26); "a moment" idle before the turn is not that.
                 if not (now - g(k, "state_since", now) >= READY_STABLE_S and now - g(k, "starting_at") >= 2 * READY_STABLE_S):
                     continue
-            if g(k, "awaiting_turn") and (now - (g(k, "delivered_at") or 0) < TURN_GRACE_S or last_mids(st.get(k, {}))):
+            if g(k, "awaiting_turn") and (now - (g(k, "delivered_at") or 0) < grace(k) or last_mids(st.get(k, {}))):
                 continue        # still waiting for the turn, or the last prompt is being put back first
             # Gather only for a session idle long enough that its cache has gone cold (a costly wake,
             # worth sharing); one that just ended its turn is prompted at once (factory smoke run,
@@ -404,7 +459,7 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
     # episode).
     for k in kinds:
         mids = last_mids(st.get(k, {}))
-        if g(k, "awaiting_turn") and mids and now - (g(k, "delivered_at") or 0) >= TURN_GRACE_S \
+        if g(k, "awaiting_turn") and mids and now - (g(k, "delivered_at") or 0) >= grace(k) \
                 and (status.get(k) in READY or k in between_turns):
             acts.append(("redeliver", k, mids))
 
@@ -748,8 +803,9 @@ class Runtime:
         """True when the transcript's last relevant record says the session's own turn has ended.
         Records with no _record_state verdict are skipped, including compaction summaries. A background agent
         can keep herdr at working after the session's turn has ended, so transcript state can permit delivery.
-        When awaiting_turn, the last [codeteam] prompt or last enqueue with a nonzero epoch at least
-        delivered_at minus two seconds clears the flag; this tolerance allows for delivery timing differences.
+        When awaiting_turn, the last [codeteam] prompt, last enqueue or last typed prompt (last_typed: a runtime
+        command such as /compact or the resume line) with a nonzero epoch at least delivered_at minus two seconds
+        clears the flag; this tolerance allows for delivery timing differences.
         The return value depends only on transcript state. plan applies the awaiting_turn hold to deliveries.
         """
         p = self.transcript(rec)
@@ -762,6 +818,10 @@ class Runtime:
             enq = last_enqueue(p)
             if enq and enq >= (rec.get("delivered_at") or 0) - 2:
                 rec["awaiting_turn"] = False     # a recent enqueue indicates a prompt joined Claude Code's queue
+        if rec.get("awaiting_turn"):
+            typed = last_typed(p)
+            if typed and typed >= (rec.get("delivered_at") or 0) - 2:
+                rec["awaiting_turn"] = False     # a runtime command ran: /compact once its compaction has ended
         return state == "ended"
 
     def refresh_idle(self, status, pending, st, now, held, sessions):
@@ -838,7 +898,8 @@ class Runtime:
             self.store.mark(m["id"], "delivered")
         rec = st.setdefault(s.key, {})
         rec.update({"delivered_at": ts(), "awaiting_turn": True, "last_mids": [m["id"] for m in msgs],
-                    "last_mid": None, "delivered_seq": rec.get("seq")})
+                    "last_mid": None, "delivered_seq": rec.get("seq"),
+                    "compacting": msgs[0]["kind"] == RUNTIME and msgs[0]["body"].startswith("/compact")})
         self.log(f"deliver {', '.join('#%d %s' % (m['id'], m['kind']) for m in msgs)} to {s.display}")
 
     def redeliver(self, s: Session, mids, st):
@@ -988,8 +1049,10 @@ class Runtime:
             # (rec["no_turn"], opened by redeliver: ) ends on the same changes: the loop starting
             # (this process's first sighting of it: held mail gets one more chance, so none is stranded by a
             # restart), its herdr status, a turn completed on the same terminal, and, for an open episode, its
-            # state_change_seq moving from the recorded one (compared only when both are known) or a [codeteam]
-            # prompt in its transcript later than the recorded one (read only for an open episode). If that
+            # state_change_seq moving from the recorded one (compared only when both are known), a [codeteam]
+            # prompt in its transcript later than the recorded one, or a turn ending in its transcript after the
+            # episode began (both read only for an open episode; a background lead keeps herdr at working, so its
+            # count of completed turns does not move). If that
             # prompt ends the episode, held mail its headers name is delivered; the rest goes back in the queue
             #. Every other ending releases all held mail, and delivery resumes.
             # A session counts as seen only once settlement and release have returned: a release that raises
@@ -1009,6 +1072,8 @@ class Runtime:
                     _, prompt, prompt_text = _transcript_scan(p) if p else ("?", None, None)
                     if prompt is not None and (episode.get("prompt") is None or prompt > episode["prompt"]):
                         why = "a [codeteam] prompt ran in its transcript"
+                    elif p and (last_turn_end(p) or 0) > (episode.get("since") or 0):
+                        why = "a turn ended in its transcript"
             if why:
                 if why == "a [codeteam] prompt ran in its transcript":
                     named = [m["id"] for m in self.store.pending(k, held=True)
@@ -1129,6 +1194,7 @@ class Runtime:
             except Exception as e:          # a refresh is an economy: it never stops the loop
                 self.log(f"refresh_idle: {type(e).__name__}: {e}")
         self.patrol(status, st, now)
+        self.disk_watch(st, now)
         self.backup(st, now)
         self.show_in_herdr(obs, waiting_n, st)
         self.team.save_state(st)
@@ -1154,17 +1220,27 @@ class Runtime:
                            msg + ". It takes mail as usual; codeteam reports this only once.", ride=True)
 
     def backup_branches(self):
-        """Every branch to mirror on GitHub: the lane branches, exchange and integration, and any other
-        branch checked out in one of the team's worktrees (work in progress). Never the base (shipped by
-        the session that owns shipping), other teams' pins, or request leads' worktree-* branches."""
+        """Branches to mirror on GitHub: lane branches, exchange, integration, the landing branch for
+        non-lab teams that land, and branches checked out in the team's worktrees (work in progress).
+        Under branch flow v5.4, a landed work order's tree is deleted, so until promotion its commits
+        exist only on landing. Never the base (shipped by the session that owns shipping), other teams'
+        pins, codeteam-land's land/ tree branches, or request leads' worktree-* branches."""
         from .team import v1
         t = self.team.t
         repo = str(t.repo)
         heads = v1.git(repo, "for-each-ref", "--format=%(refname:short)", f"refs/heads/{t.prefix}",
                        check=False).stdout.split()
         heads += [b for b in (t.exchange, t.integration) if b]
+        if not t.lab and v1.landing(t):
+            heads.append(v1.landing_branch(t))
         wt = v1.git(repo, "worktree", "list", "--porcelain", check=False).stdout
         heads += [l.split("refs/heads/", 1)[1] for l in wt.splitlines() if l.startswith("branch refs/heads/")]
+        return self._mirrorable(repo, heads, t.base)
+
+    @staticmethod
+    def _mirrorable(repo: str, heads: list[str], base: str) -> list[str]:
+        """Filter candidate heads to existing mirrorable branches in input order, without duplicates."""
+        from .team import v1
         out = []
         for b in heads:
             if b.startswith("pin/"):
@@ -1174,7 +1250,7 @@ class Runtime:
             if b.startswith("worktree-"):
                 continue        # a request lead's branch: its work reaches GitHub through the lane once accepted,
                                 # and Time Machine holds it meanwhile (2026-10-28: these piled up on GitHub)
-            if b and b != t.base and b not in out and v1.git(repo, "rev-parse", "--verify", "-q",
+            if b and b != base and b not in out and v1.git(repo, "rev-parse", "--verify", "-q",
                                                               f"refs/heads/{b}", check=False).returncode == 0:
                 out.append(b)
         return out
@@ -1246,6 +1322,34 @@ class Runtime:
         dead = [x for x in new if "DEAD LEAD" in x]
         if dead:
             self.herdr.notify(f"codeteam {self.team.product}: a request lead died", "; ".join(dead)[:300])
+
+    def disk_watch(self, st, now):
+        """Every disk_check_s (60 s), whatever patrol_min says: a disk can fill in minutes. A low disk wakes the
+        orchestrator and tells the owner through herdr, once per level until free space has stayed above the re-arm level for
+        2 h (patrol.disk_warning; "above_since" is when it last rose there). 0 turns it off."""
+        every_s = getattr(self.team, "disk_check_s", 60)
+        if not every_s:
+            return
+        meta = st.setdefault("_disk", {})
+        if now - (meta.get("at") or 0) < every_s:
+            return
+        meta["at"] = now
+        try:
+            free = patrol_mod.free_gib(self.team.t.root)
+        except OSError as e:
+            self.log(f"disk check skipped: {e}")
+            return
+        meta["free_gib"] = round(free, 1)
+        if free >= patrol_mod.DISK_REARM_GIB:
+            meta.setdefault("above_since", now)
+        else:
+            meta.pop("above_since", None)
+        meta["warned"], text = patrol_mod.disk_warning(free, meta.get("warned"), self.team.t.manifest,
+                                                       above_s=now - meta.get("above_since", now))
+        if text:
+            self.store.add("general", "codeteam", "REQUEST", self.team.t.orc_name(), "orc", text)
+            self.herdr.notify(f"codeteam {self.team.product}: disk low", text[:300])
+            self.log(f"disk: {free:.0f} GiB free; the orchestrator is told")
 
     def show_in_herdr(self, obs, waiting_n, st):
         """herdr's sidebar shows each pane as `Coord-alpha` with its waiting mail (waiting_n: key -> count of

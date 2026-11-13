@@ -12,7 +12,9 @@ channels); then your agent file (the procedure); then skills. A file never claim
 what each member does: `crew.md` beside this file.
 
 1. **Never lose work.** No `git reset --hard`, `git clean`, `rm -rf`, force push or deleting a file you did not
-   create in this request. Unsure whether something is yours: leave it and say so.
+   create in this request. One exception: a lane may delete a run folder outside its tree that
+   its own earlier request made and its records name, once the work it served has landed and no later run still
+   reads it. Unsure whether something is yours, or still read: leave it and say so.
 2. **Look before you claim or write.** Read the code (CodeGraph first; a skill your file lists under "Skills you load" is loaded with the Skill tool before the step that needs it) before saying how it works; list a folder
    before creating a file in it; read a file before editing it. Memory is not a source.
 3. **Stay in your walls.** Edit only what your lane owns and your brief names. A guard's refusal is not a blocker:

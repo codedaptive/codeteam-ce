@@ -14,7 +14,10 @@ ZONE_ROOT   := $(shell git rev-parse --show-toplevel 2>/dev/null || pwd)
 ZONE_TOOL   ?= $(CODETEAM_HOME)/bin/zone-tool
 ZONE_TEST   ?= $(MAKE) --no-print-directory -C $(ZONE_ROOT) test-one DIR=$(ZONE) && $(MAKE) --no-print-directory -C $(ZONE_ROOT) test-one DIR=$(ZONE)/rust
 EXCHANGE    ?= $(CODETEAM_EXCHANGE)
-WARM_FROM   ?= $(or $(CODETEAM_SWT),$(EXCHANGE))
+# With neither (an orchestrator's or a staff session's work order tree), the tree itself: zone-tool warm keeps a
+# build already there (codeteam-land's wo-cut clones one in) and otherwise clones the freshest sibling tree's
+# (2026-11-12: warm refused in an orc work order tree).
+WARM_FROM   ?= $(or $(CODETEAM_SWT),$(EXCHANGE),$(ZONE_ROOT))
 # Copied in by warm (APFS copy-on-write: near-instant, no extra disk until a file changes).
 # A Rust build folder stays valid when copied; a Swift one does not (SwiftPM ties a build
 # to its folder), so Swift is warmed by building through Xcode's compile cache instead.
@@ -49,14 +52,22 @@ zone_skip_no_exec = skip=; first=1; for w in $$MAKEFLAGS; do case "$$w" in --|*=
 # covered check and test-status compare it in sessions without CODETEAM_OWNS), so OWNS goes
 # in as a salt: a record answers --cached or --single only for the same OWNS. A repo with its
 # own Makefile gets no salt and its zone-tool arguments are as they were.
-ZONE_TEST_SALT = $(if $(ZONE_ROOT_MAKEFILE),,--salt "owns=$(CODETEAM_OWNS)")
+# Opt-in variables: an environment variable that turns tests on (e.g.
+# ACME_LIVE_PUMP=1 runs a live twin of a test, which skips without it) changes what a run proves but not its
+# command, so a record of the run with it off would answer the run with it on. A product names such variables in
+# ZONE_TEST_KEY_VARS (its own Makefile, after zone.mk is read, or the manifest's [env]); each one set and non-empty,
+# on make's command line or in the environment, adds the word env:NAME=value to zone-test-one's key and to
+# zone-test's salt. Names unset or empty add nothing, so every other record keeps its key byte for byte. A value is
+# one word with no quotes or $.
+ZONE_TEST_ENV_WORDS = $(strip $(foreach v,$(ZONE_TEST_KEY_VARS),$(if $(strip $($(v))),env:$(v)=$(strip $($(v))))))
+ZONE_TEST_SALT = $(if $(ZONE_ROOT_MAKEFILE),$(if $(ZONE_TEST_ENV_WORDS),--salt "$(ZONE_TEST_ENV_WORDS)"),--salt "owns=$(CODETEAM_OWNS)$(if $(ZONE_TEST_ENV_WORDS), $(ZONE_TEST_ENV_WORDS))")
 
 zone-test:
 	@test -n "$(ZONE)" || { echo "zone-test: set CODETEAM_ZONE"; exit 2; }
 	@$(zone_skip_no_exec) cd $(ZONE_ROOT) && $(ZONE_TOOL) job submit --class $(or $(CLASS),full) --wait $(ZONE_JOB_WAIT) $(ZONE_TEST_SALT) $(ZONE_TEST_FLAGS) -- sh -c '$(ZONE_TEST)'
 
-# One package or a filter, through the same record and lock: a repeat on unchanged
-# code answers from its record. make zone-test-one DIR=<pkg> [SWIFT_TEST_ARGS=...] [CARGO_TEST_ARGS=...] [PYTEST_ARGS=...] [CLASS=...]
+# One package or a filter, through the same record and lock: a repeat of the same command on
+# unchanged code answers from its record (a changed ZONE_TEST_ONE_CMD runs). make zone-test-one DIR=<pkg> [SWIFT_TEST_ARGS=...] [CARGO_TEST_ARGS=...] [PYTEST_ARGS=...] [CLASS=...]
 # Class dev by default (the first class to hold back when the machine is busy); CLASS=pre or CLASS=post
 # queues the run in that class instead.
 # --scope: the record stands until something DIR's tests can touch changes.
@@ -86,7 +97,7 @@ ZONE_TEST_GROUP_KEY = $(if $(filter-out unit,$(GROUP)), group=$(GROUP))$(if $(fi
 # still collide, and zone-tool job submit collapses whitespace in --key, so values differing
 # only in inner whitespace share a record.
 ZONE_TEST_ARGS_KEY = $(if $(strip $(PYTEST_ARGS)), pytest=$(strip $(PYTEST_ARGS)))$(if $(strip $(PYTEST_ADDOPTS)), pytest-addopts=$(strip $(PYTEST_ADDOPTS)))
-ZONE_TEST_ONE_KEY = $(if $(ZONE_ROOT_MAKEFILE),one $(DIR) $(SWIFT_TEST_ARGS) $(CARGO_TEST_ARGS),$(strip one $(DIR) $(SWIFT_TEST_ARGS) $(CARGO_TEST_ARGS) owns=$(CODETEAM_OWNS)))$(ZONE_TEST_ARGS_KEY)$(ZONE_TEST_GROUP_KEY)
+ZONE_TEST_ONE_KEY = $(if $(ZONE_ROOT_MAKEFILE),one $(DIR) $(SWIFT_TEST_ARGS) $(CARGO_TEST_ARGS),$(strip one $(DIR) $(SWIFT_TEST_ARGS) $(CARGO_TEST_ARGS) owns=$(CODETEAM_OWNS)))$(ZONE_TEST_ARGS_KEY)$(ZONE_TEST_GROUP_KEY)$(if $(ZONE_TEST_ENV_WORDS), $(ZONE_TEST_ENV_WORDS))
 ZONE_TEST_ONE_FLAGS ?= --cached --single
 # The command that tests one DIR: the repo's own `make test-one` by default. A team whose repo has no test-one (a Makefile without one, or a different way to test) sets
 # ZONE_TEST_ONE_CMD in its manifest's [env] (e.g. a Swift package team: codeteam's swift-test-xcode on the package),
@@ -100,6 +111,9 @@ zone-test-one:
 
 # zone-check: the type-check zone-tool runs before every test run (the product's `make check`, or the manifest's
 # ZONE_CHECK_CMD); a test run on code that fails it is refused. Run it after each batch of edits.
+# A command-line GROUP (make zone-check GROUP=integration) reaches the check in its environment, so a product whose
+# test targets exist only for their GROUP compiles them; zone-tool keeps each group's clean result apart.
+# Which groups a plain zone-check compiles is the product's `make check`.
 zone-check:
 	@cd $(ZONE_ROOT) && $(ZONE_TOOL) check $(DIR)
 
@@ -109,7 +123,8 @@ zone-test-status:
 # test-one for a repo with no Makefile of its own (a repo zone.mk reaches only through
 # MAKEFILES). Any of GNUmakefile, makefile or Makefile at the root counts as having one;
 # then this rule is not defined and the repo's own test-one is the only one.
-# zone-tool test-one runs pytest and the tests/*.sh of DIR, from the root. DIR=. (or any DIR
+# zone-tool test-one runs pytest and the tests/*.sh of DIR, from the root, and the scripts in
+# tests/unit, tests/integration and tests/validation as the landing tool does, each in its own group. DIR=. (or any DIR
 # that resolves to the root, such as ./) means the lane's owned paths (CODETEAM_OWNS, colon-separated): in a repo shared by several lanes a
 # lane's zone path is `.`, so a zone-test of `.` must run only the paths that lane owns, not
 # every lane's tests. With CODETEAM_OWNS empty zone-tool refuses rather than pass on no
@@ -138,7 +153,6 @@ CLEAN_DIRS ?= cargo-target target .build
 zone-clean:
 	@cd $(ZONE_ROOT) && for d in $(CLEAN_DIRS); do if [ -d "$$d" ]; then du -sh "$$d" | sed 's/^/removing /'; rm -rf "$$d"; fi; done; echo "zone-clean: done"
 warm:
-	@test -n "$(WARM_FROM)" || { echo "warm: set CODETEAM_SWT or CODETEAM_EXCHANGE"; exit 2; }
 	@cd $(ZONE_ROOT) && for d in $(WARM_DIRS); do $(ZONE_TOOL) warm --from $(WARM_FROM) --target $$d; done
 	@if [ "$(WARM_BUILD)" = 1 ]; then $(MAKE) --no-print-directory -C $(ZONE_ROOT) warm-build; fi
 

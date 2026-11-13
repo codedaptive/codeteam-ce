@@ -36,7 +36,8 @@ def _log(text):
 
 def _parse(argv):
     ap = argparse.ArgumentParser(prog="codeteam2 deck", description=__doc__.strip().splitlines()[0])
-    ap.add_argument("teams", nargs="*", help="team products to show (default: every manifest in teams/)")
+    ap.add_argument("teams", nargs="*", help="team products to show (default: every manifest in teams/, and each "
+                                             "$CODETEAM_WORKSPACE/team-<x> that keeps its own in design/*/teams/<x>.toml)")
     ap.add_argument("--json", action="store_true", help="print one snapshot as JSON and exit")
     ap.add_argument("--pane", action="store_true", help="run the deck in herdr's `deck` workspace and pane")
     ap.add_argument("--no-motion", action="store_true", help="keep the live deck still")

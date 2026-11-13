@@ -133,7 +133,9 @@ def test_missing_checkout_failure_reports_git_error():
         git.assert_called_once_with(team.repo, "worktree", "add", "--detach", str(team.dir / "itest"), "merge3", check=False)
 
 
-def test_runner_once_advances_past_failed_checkout():
+def test_runner_keeps_a_failed_checkout_pending_and_retries_it():
+    # A recheck that ran nothing is not done. Its row stays pending, the failure is recorded
+    # and told once, and the next poll tries the same row again; the rows after it wait their turn.
     with tempfile.TemporaryDirectory() as tmp:
         team = make_team(Path(tmp))
         rows = [{"M": "first123456789", "wo": "one", "zones": ["A"], "overlapping": []},
@@ -141,17 +143,53 @@ def test_runner_once_advances_past_failed_checkout():
         for wo in ("one", "two"):
             (team.dir / "wo" / f"{wo}.landed.json").write_text(json.dumps({"wo": wo, "zone": "A"}))
         (team.dir / "recheck.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-        responses = [SimpleNamespace(returncode=1, stderr="failed"), SimpleNamespace(returncode=0, stderr="")]
-        with patch.object(cl, "git", side_effect=responses), patch.object(cl, "halted", return_value=False), \
+        failed, worked = SimpleNamespace(returncode=1, stderr="failed"), SimpleNamespace(returncode=0, stderr="")
+        results = team.dir / "integration-results.jsonl"
+        with patch.object(cl, "git", side_effect=[failed, failed, worked, worked]) as git, \
+                patch.object(cl, "halted", return_value=False), patch.object(cl.codeteam_tm, "exclude"), \
                 patch.object(cl, "recheck_steps", return_value=([], [])), patch.object(cl, "step_results", return_value=[]), \
                 patch.object(cl, "apply_recheck_findings"), patch.object(cl, "after_landing"), \
                 patch.object(cl, "now", return_value="now"):
             cl.cmd_recheck_run(team, SimpleNamespace(once=True))
-            assert cl.read_recheck(team) == [{**rows[0], "done": "now"}, rows[1]]
-            first_result = json.loads((team.dir / "integration-results.jsonl").read_text())
-            assert first_result.get("checkout") == "failed"
+            assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now"}, rows[1]]
+            assert [json.loads(line).get("checkout") for line in results.read_text().splitlines()] == ["failed"]
+            assert team.notify.call_count == 1
+            assert "stays pending" in team.notify.call_args.args[2]
+            cl.cmd_recheck_run(team, SimpleNamespace(once=True))          # still failing: no new row, no new notice
+            assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now"}, rows[1]]
+            assert len(results.read_text().splitlines()) == 1 and team.notify.call_count == 1
+            assert git.call_args_list[1].args[-1] == "first123456789"      # the same row was tried again
+            cl.cmd_recheck_run(team, SimpleNamespace(once=True))          # the checkout works: the row completes
+            assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now", "done": "now"}, rows[1]]
             cl.cmd_recheck_run(team, SimpleNamespace(once=True))
-        assert cl.read_recheck(team) == [{**rows[0], "done": "now"}, {**rows[1], "done": "now"}]
+        assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now", "done": "now"}, {**rows[1], "done": "now"}]
+        assert [json.loads(line).get("checkout") for line in results.read_text().splitlines()] == ["failed", None, None]
+
+
+def test_a_missing_but_registered_itest_tree_is_added_again_with_force():
+    # land/itest was once deleted while git still listed it, so every `worktree add` failed.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        tree = team.dir / "itest"
+        stale = SimpleNamespace(returncode=128, stderr=f"fatal: '{tree}' is a missing but already registered worktree;\n"
+                                                       "use 'add -f' to override, or 'prune' or 'remove' to clear\n")
+        with patch.object(cl, "git", side_effect=[stale, SimpleNamespace(returncode=0, stderr="")]) as git, \
+                patch.object(cl.codeteam_tm, "exclude") as exclude:
+            assert cl.itest_checkout(team, "merge4") == tree
+        assert git.call_args_list == [call(team.repo, "worktree", "add", "--detach", str(tree), "merge4", check=False),
+                                      call(team.repo, "worktree", "add", "-f", "--detach", str(tree), "merge4", check=False)]
+        exclude.assert_called_once_with([tree])
+
+
+def test_run_recheck_tick_returns_none_after_a_failed_checkout():
+    # The runner sleeps a poll only when the tick returns None; a pending row that returned a job would spin.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        row = {"M": "first123456789", "wo": "one", "zones": ["A"], "overlapping": []}
+        with patch.object(cl, "recheck_one", return_value={"checkout": "failed"}):
+            assert cl.run_recheck_tick(team, row) is None
+        with patch.object(cl, "recheck_one", return_value={"tests": []}):
+            assert cl.run_recheck_tick(team, row) is not None
 
 
 def test_land_check_digest_is_sha256_of_script():
@@ -228,6 +266,55 @@ def test_local_stale_install_failure_never_runs_script():
         assert result == {"hash": "hash", "result": "toolchain", "detail": "stale: write denied; alpha-install", "time": "now"}
         assert not (team.dir / "results.jsonl").exists()
         run.assert_not_called()
+
+
+def test_missing_local_clone_is_made_before_the_push():
+    # Only install_land_check made a local tier's clone, so pushing to a missing one
+    # failed every validate-run and the clone was never made.
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        a = {"local": True, "host": "local", "path": str(Path(tmp) / "clone"), "suite": "tests"}
+        order = Mock()
+        order.ensure.return_value = None
+        order.git.return_value = SimpleNamespace(returncode=0, stderr="")
+        order.run.return_value = {"hash": "hash", "result": "pass"}
+        with patch.object(cl, "ensure_land_check", order.ensure), patch.object(cl, "git", order.git), \
+                patch.object(cl, "run_land_check", order.run), patch.object(cl, "now", return_value="now"):
+            result = cl.check_at(team, a, "hash", "validation")
+        assert result == {"hash": "hash", "result": "pass", "time": "now"}
+        names = [c[0] for c in order.mock_calls if c[0] in ("ensure", "git", "run")]
+        assert names[:2] == ["ensure", "git"] and names[-1] == "run", names
+        assert "push" in order.git.call_args.args
+
+
+def test_missing_local_clone_install_failure_is_toolchain_without_a_push():
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        a = {"local": True, "host": "local", "path": str(Path(tmp) / "clone"), "suite": "tests"}
+        with patch.object(cl, "ensure_land_check", return_value="stale: clone failed; alpha-install"), \
+                patch.object(cl, "git") as git, patch.object(cl, "run_land_check") as run, \
+                patch.object(cl, "now", return_value="now"):
+            result = cl.check_at(team, a, "hash", "validation")
+        assert result == {"hash": "hash", "result": "toolchain", "detail": "stale: clone failed; alpha-install",
+                          "time": "now"}
+        git.assert_not_called()
+        run.assert_not_called()
+
+
+def test_existing_local_clone_is_pushed_before_the_freshness_check():
+    with tempfile.TemporaryDirectory() as tmp:
+        team = make_team(Path(tmp))
+        clone = Path(tmp) / "clone"
+        (clone / ".git").mkdir(parents=True)
+        a = {"local": True, "host": "local", "path": str(clone), "suite": "tests"}
+        order = Mock()
+        order.ensure.return_value = None
+        order.git.return_value = SimpleNamespace(returncode=0, stderr="")
+        order.run.return_value = {"hash": "hash", "result": "pass"}
+        with patch.object(cl, "ensure_land_check", order.ensure), patch.object(cl, "git", order.git), \
+                patch.object(cl, "run_land_check", order.run), patch.object(cl, "now", return_value="now"):
+            cl.check_at(team, a, "hash", "validation")
+        assert [c[0] for c in order.mock_calls if c[0] in ("ensure", "git", "run")] == ["git", "ensure", "run"]
 
 
 def test_current_remote_digest_before_run_does_not_install():

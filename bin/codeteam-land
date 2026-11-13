@@ -12,6 +12,7 @@ admitted runs and landing-marked queued or running jobs drain; Stage 2 waits, wh
   codeteam-land MANIFEST wo-pull WO              merge integration into the work order tree (exit 2: conflict)
   codeteam-land MANIFEST land WO [--with WO2 ...] check against integration, then queue the tested set
   codeteam-land MANIFEST queue                   what waits and since when
+  codeteam-land MANIFEST wo-hold [WO --because WHY | WO --release]  patrol skips a work order held on purpose
   codeteam-land MANIFEST queue-run [--once]      land oldest unheld entries, one at a time
   codeteam-land MANIFEST recheck-run [--once]    recheck overlapping landings in landing order
   codeteam-land MANIFEST validate-run [--once]   validate the newest landing commit, then run Stage 7 on a pass
@@ -55,6 +56,7 @@ HERE = Path(__file__).resolve().parent
 # Prefer this checkout's shared module over one in the working directory.
 sys.path.insert(0, str(HERE.parent / "share"))
 import codeteam_launchd
+import codeteam_tm
 
 # Called from launchd, hooks and loops with a bare PATH: git's hooks need git-lfs, the gate needs make and cargo.
 os.environ["PATH"] = ":".join(dict.fromkeys([str(Path.home() / ".cargo" / "bin"), "/opt/homebrew/bin",
@@ -65,7 +67,11 @@ LAUNCHD_PREFIX = os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam"
 TRAILER = "Landed-By: codeteam land-one"
 MADE_BY = "Made-By: codeteam-land"
 LAND_TOOL_ENV = "CODETEAM_LAND_TOOL"
-WARM_DIRS = ("cargo-target", "target", ".build", "node_modules")
+# Build output a new work order tree is warm-cloned with: only folders lanes build into (zone.mk's WARM_DIRS is
+# cargo-target). Never `target`: land/itest's target/ is the landing tool's own cargo output, lanes build into
+# cargo-target/, and each clone pinned a 30 GB generation of it (2026-11-12: the disk filled).
+WARM_DIRS = ("cargo-target", ".build", "node_modules")
+BUILD_OUTPUT_DIRS = ("cargo-target", "target", ".build", "node_modules")
 CONFLICT, GATE, REFUSED = 2, 3, 5
 NOT_MOVED = "not moved to v5.4: run migrate-v54"
 
@@ -628,6 +634,7 @@ def cmd_wo_cut(team, a):
         die(f"work order {wo} exists")
     path = team.root / "wo" / zone / wo
     branch = f"wo/{zone}/{wo}"
+    clear_stale_branch(team, branch, wo, path)
     root_links(team, path)
     git(team.repo, "worktree", "add", "-q", "-b", branch, str(path), team.integration)
     source = warm_source(team.root)
@@ -637,6 +644,9 @@ def cmd_wo_cut(team, a):
         if lt_mark.exists():            # its prepared folders came with the clone: same lockfile, same state
             shutil.copy(lt_mark, Path(out(path, "rev-parse", "--path-format=absolute", "--git-dir")) / "codeteam-prepared")
     prepare(team, path)
+    # The build output the warm clone and prepare brought stays out of Time Machine; the hourly sweep
+    # marks what the tree's builds make later.
+    codeteam_tm.exclude(codeteam_tm.build_dirs(path))
     # The record first: a step after it that fails or is killed leaves a work order that can be retired, not a tree
     # nobody knows (the index step once ran past 120 s twice and left two unregistered trees).
     team.save_wo({"wo": wo, "zone": zone, "tree": str(path), "branch": branch, "cut": now(),
@@ -657,6 +667,24 @@ def cmd_wo_cut(team, a):
     print(path)
 
 
+def clear_stale_branch(team, branch: str, wo: str, path: Path) -> None:
+    """A branch a cut left with no record and no tree (a checkout that died: 2026-11-11, the disk was
+    full) holds nothing beyond integration: it is kept as refs/archive/wo/<wo> and removed, so the cut can go on.
+    One with commits of its own, or with a tree, is refused by name."""
+    tip = git(team.repo, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False).stdout.strip()
+    if not tip:
+        return
+    on_integration = git(team.repo, "merge-base", "--is-ancestor", tip, team.integration, check=False).returncode == 0
+    if path.exists() or not on_integration:
+        die(f"branch {branch} exists with {'a tree at ' + str(path) if path.exists() else 'commits of its own'} and no "
+            f"work order record; retire or rename it first (codeteam-land {team.manifest} wo-retire {wo}).")
+    git(team.repo, "update-ref", f"refs/archive/wo/{wo}", tip)
+    git(team.repo, "worktree", "prune", check=False)
+    git(team.repo, "branch", "-D", branch)
+    print(f"{wo}: an earlier cut left branch {branch} with nothing of its own; it is kept as refs/archive/wo/{wo} "
+          "and cut again", file=sys.stderr)
+
+
 def cmd_wo_pull(team, a):
     sys.exit(wo_pull(team, team.wo(a.wo)))
 
@@ -667,9 +695,8 @@ def wo_pull(team, rec):
         die(f"{rec['wo']}: the tree has uncommitted changes; commit them first")
     r = git(tree, "merge", "--no-edit", "-q", team.integration, check=False)
     if r.returncode:
-        files = out(tree, "diff", "--name-only", "--diff-filter=U")
-        print(f"{rec['wo']}: merging {team.integration} conflicts in:\n{files}\n"
-              "Resolve them in the work order tree and commit, then queue it again.")
+        print(f"{rec['wo']}: merging {team.integration} {merge_failure(tree, r)}\n"
+              "Resolve it in the work order tree and commit, then queue it again.")
         return CONFLICT
     return 0
 
@@ -752,8 +779,9 @@ def check_work_order(team: Team, rec: dict) -> list[str]:
     if out(rec["tree"], "status", "--porcelain", "--untracked-files=no"):
         die(f"{rec['wo']}: the tree has uncommitted changes; commit them first")
     files = work_order_files(team, rec)
-    if not files:
-        die(f"{rec['wo']}: nothing to land: no change against {team.integration}")
+    if not files and not declares_doc_level(team, rec):
+        die(f"{rec['wo']}: nothing to land: no change against {team.integration}. A work order that only states a "
+            "document's level lands with `Doc-Level: <repo path> <level>` in its own commit.")
     if rec["zone"] == "orc":
         return files
     own_docs = set(zone_docs(team, rec["tree"], rec["zone"]))
@@ -764,6 +792,17 @@ def check_work_order(team: Team, rec: dict) -> list[str]:
         die(f"{rec['wo']}: changes files outside zone {rec['zone']} (walls):\n  " + "\n  ".join(outside) +
             "\nThose go to their zone as a work order of its own.")
     return files
+
+
+def declares_doc_level(team: Team, rec: dict) -> bool:
+    """Its own commits (or a land --doc-level --doc already recorded) state a level for a named document that exists on integration (a
+    fix-forward for a missing Doc-Level line). Such a work order changes no file and lands as docs only;
+    docs_pass records the level for the next stamp."""
+    text = out(rec["tree"], "log", "--no-merges", "--format=%B", f"{team.integration}..HEAD")
+    named = [m.group(1) for m in DOC_LEVEL.finditer(text) if m.group(1)]
+    named += [x["doc"] for x in rec.get("doc_level", []) if x.get("doc")]
+    return any(git(team.repo, "cat-file", "-e", f"{team.integration}:{path}", check=False).returncode == 0
+               for path in named)
 
 
 def work_order_files(team: Team, rec: dict) -> list[str]:
@@ -811,25 +850,86 @@ def current_units(team: Team, tree: Path, zone: str) -> bool:
     return units_pass(commit_record(tree, commit, key) for key in keys)
 
 
-def test_units(team: Team, rec: dict) -> None:
-    if not stage2_steps(team, rec, zone_tests(team, rec["tree"], rec["zone"], "land"), "unit"):
+def test_units(team: Team, rec: dict, zone: str | None = None) -> None:
+    """The units of zone (default the record's own) in rec's tree; the results are saved in rec, whose zone stays
+    its own. A set tests each member's zone in the first member's tree (a copy of the first
+    record carrying another member's zone was saved over the first one's record)."""
+    if not stage2_steps(team, rec, zone_tests(team, rec["tree"], zone or rec["zone"], "land"), "unit"):
         sys.exit(GATE)
 
 
 def stage2_record(results: list[dict]) -> list[dict]:
-    return [{"step": result["name"], "result": result["outcome"].lower(), "seconds": round(result["seconds"], 1)}
-            for result in results]
+    """A step the machine stopped is recorded by what stopped it, "disk" or "cache", not "fail"."""
+    return [{"step": result["name"], "result": result.get("stopped_by") or result["outcome"].lower(),
+             "seconds": round(result["seconds"], 1)} for result in results]
+
+
+# What Stage 2 prints for each infrastructure stop, after the steps it names (stage2_steps).
+STOP_NOTICES = {
+    "disk": ("DISK: {steps} stopped on a full disk (No space left on device): the machine, not the work order, and "
+             "not a test failure. Nothing was queued and there is nothing to fix. Run land again once `df -h` shows "
+             "space (Time Machine's hourly snapshot holds deleted files from :00 until its backup ends); if it fails "
+             "the same way with space free, it is a test failure."),
+    "cache": ("CACHE: {steps} stopped on an error in the machine's shared Swift compile cache: "
+              "the machine, not the work order, and not a test failure. Nothing was queued and there is nothing to "
+              "fix. Run land again; if it fails the same way twice, tell Orc-Codeteam."),
+}
 
 
 def stage2_steps(team: Team, rec: dict, steps: list[tuple[str, str]], group: str, *, concurrent: bool = True) -> bool:
-    """Persist the batch in submission order, including failures, before returning its gate result."""
+    """Persist the batch in submission order, including failures, before returning its gate result. Committed files
+    the batch changed are restored as committed (restore_build_changes). A step whose output reports a full disk or
+    a compile cache error is named as an infrastructure stop; the land still exits 3, as SPEC v5.4 Stage 2 step 7
+    says."""
     results = []
+    before = changed_tracked(rec["tree"])
     ok, lines = run_steps(rec["tree"], steps, team_env(team, group), concurrent=concurrent, on_result=results.append)
     order = {name: i for i, (name, _) in enumerate(steps)}
-    rec.setdefault("stage2", []).extend(stage2_record(sorted(results, key=lambda result: order[result["name"]])))
+    results.sort(key=lambda result: order[result["name"]])
+    rec.setdefault("stage2", []).extend(stage2_record(results))
     team.save_wo(rec)
     print("\n".join(lines))
+    for kind, notice in STOP_NOTICES.items():
+        stopped = [result["name"] for result in results if result.get("stopped_by") == kind]
+        if stopped:
+            print(notice.format(steps=", ".join(stopped)), flush=True)
+    restore_build_changes(rec, before)
     return ok
+
+
+def changed_tracked(tree: str | Path) -> set[str]:
+    """Committed files changed in the tree; none when git cannot read it (the restore must never fail a gate)."""
+    if not Path(tree).is_dir():
+        return set()
+    try:
+        r = git(tree, "diff", "--name-only", "HEAD", check=False)
+    except OSError:
+        return set()
+    return set(r.stdout.splitlines()) if r.returncode == 0 else set()
+
+
+def restore_build_changes(rec: dict, before: set[str]) -> list[str]:
+    """Put back committed files a Stage 2 build changed: a cargo build rewrites a stale Cargo.lock, and the change
+    then stops `git merge integration` in the tree, or a set's checkout back to its branch (2026-11-12: a
+    work order's merge failed with no conflict to act on). Landing takes the commit, never the
+    tree, so nothing the build wrote could land; files changed before the batch are left alone."""
+    changed = sorted(changed_tracked(rec["tree"]) - before)
+    if changed:
+        git(rec["tree"], "checkout", "-q", "HEAD", "--", *changed)
+        print(f"{rec['wo']}: the build changed {', '.join(changed)}, which the commit holds; restored as committed. "
+              f"A build that rewrites a committed file means the file is stale at "
+              f"{out(rec['tree'], 'rev-parse', '--short=10', 'HEAD')}: the zone that owns it commits the regenerated one.")
+    return changed
+
+
+def merge_failure(tree: str | Path, result: subprocess.CompletedProcess) -> str:
+    """Why a merge in a work order tree failed: its conflicted files, or, when there are none (git refused to start,
+    say over a local change), git's own words. An empty 'conflicts in:' list once named nothing."""
+    files = out(tree, "diff", "--name-only", "--diff-filter=U")
+    if files:
+        return f"conflicts in:\n{files}"
+    said = "\n".join(f"  {line}" for line in f"{result.stderr or ''}\n{result.stdout or ''}".strip().splitlines()[-12:])
+    return f"failed with no conflicted file; git said:\n{said or '  nothing'}"
 
 
 def make_has_check(returncode: int, stderr: str) -> bool:
@@ -899,13 +999,15 @@ def repo_integration_steps(tree: str | Path, folder: str, cls: str, zone_tool: s
     return repo_test_steps(tree, folder, "integration", cls, zone_tool)
 
 
-def check_integration(team: Team, rec: dict, only_docs: bool) -> list[str]:
-    """Stage 2: check ruling numbers, compile, then run repo units and integration tests."""
+def check_integration(team: Team, rec: dict, only_docs: bool, files: list[str] | None = None) -> list[str]:
+    """Stage 2: check ruling numbers, compile, then run repo units and integration tests. files: what the check
+    reaches from, default the record's own; a set passes its merged files without saving them in the first member's
+    record."""
     if dup := duplicate_rulings(rec["tree"]):
         die(f"FAIL numbered entry used twice: {', '.join(dup)}", GATE)
     if only_docs:
         return []
-    zones = reach(team, rec["tree"], rec["files"])
+    zones = reach(team, rec["tree"], rec["files"] if files is None else files)
     if not stage2_steps(team, rec, compile_steps(team, rec["tree"], zones), "integration", concurrent=False):
         sys.exit(GATE)
     steps = repo_test_steps(rec["tree"], team.c("unit_tests", "tests/unit"), "unit", "land", str(HERE / "zone-tool"))
@@ -939,6 +1041,36 @@ def queue_notices(team: Team, rec: dict, a) -> None:
         rec.setdefault("doc_level", []).append({"level": a.doc_level, "doc": getattr(a, "doc", None)})
 
 
+def put_back_set_merge(rec: dict) -> None:
+    """Put a tree that a dead land left on its landing set's merge back on its branch, before this land reads it.
+    check_combined_members' finally does that when a land ends, SIGTERM and SIGHUP included, but not after SIGKILL, and
+    not when the checkout itself fails: in the 09:00 disk-full window it left server's and sync's trees on their
+    merges, and the next land of server was refused for its partner's docs file. Called
+    only inside stage_admit, which has refused every live land holding this work order, so no live run owns the
+    merge. Only a tree whose HEAD is its branch's tip, or merge commits along the first parent on top of it, with no
+    tracked change and no merge under way, is put back; any other state is left as it is."""
+    tree, branch = rec.get("tree"), rec.get("branch")
+    if not tree or not branch or not Path(tree).is_dir():
+        return
+    if git(tree, "symbolic-ref", "-q", "HEAD", check=False).returncode == 0:
+        return                                          # on a branch: the usual case
+    tip = git(tree, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False).stdout.strip()
+    head = git(tree, "rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip()
+    if not tip or not head:
+        return
+    if head != tip:
+        line = [row.split() for row in
+                out(tree, "rev-list", "--first-parent", "--parents", "-n", "100", f"{tip}..{head}").splitlines()]
+        if not line or any(len(row) < 3 for row in line) or line[-1][1] != tip:
+            return
+    if (git(tree, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+            or out(tree, "status", "--porcelain", "--untracked-files=no")):
+        return
+    git(tree, "checkout", "-q", branch)
+    print(f"{rec['wo']}: its tree was left on a landing set's merge ({head[:10]}) by a land no longer running; "
+          f"put back on {branch} ({tip[:10]})", flush=True)
+
+
 def checked_members(team: Team, names: list[str]) -> list[tuple[dict, bool]]:
     if len(set(names)) != len(names):
         die("a work order occurs more than once in the landing set")
@@ -946,6 +1078,8 @@ def checked_members(team: Team, names: list[str]) -> list[tuple[dict, bool]]:
         if entry_path(team, wo):
             die(f"{wo} is already queued")
     records = [team.wo(wo) for wo in names]
+    for rec in records:
+        put_back_set_merge(rec)
     stage2 = []
     for rec in records:
         rec["stage2"] = stage2
@@ -953,7 +1087,8 @@ def checked_members(team: Team, names: list[str]) -> list[tuple[dict, bool]]:
     alone = len(records) == 1           # a set's unit tests run once, on its merged tips
     try:
         for rec in records:
-            only_docs = docs_only(check_work_order(team, rec), team.c("docs_only_suffixes", [".md"]))
+            files = check_work_order(team, rec)     # no files: a Doc-Level declaration only, which tests nothing
+            only_docs = not files or docs_only(files, team.c("docs_only_suffixes", [".md"]))
             if alone and not only_docs and not current_units(team, Path(rec["tree"]), rec["zone"]):
                 test_units(team, rec)
             members.append((rec, only_docs))
@@ -967,8 +1102,8 @@ def merge_checked_base(team: Team, rec: dict, base: str, only_docs: bool, test: 
     before = out(rec["tree"], "rev-parse", "HEAD")
     merged = git(rec["tree"], "merge", "--no-edit", base, check=False)
     if merged.returncode:
-        print(f"{rec['wo']}: merging {team.integration} conflicts in:\n"
-              f"{out(rec['tree'], 'diff', '--name-only', '--diff-filter=U')}\nResolve and commit, then run land again.")
+        print(f"{rec['wo']}: merging {team.integration} {merge_failure(rec['tree'], merged)}\n"
+              "Resolve it and commit, then run land again.")
         sys.exit(CONFLICT)
     if test and not only_docs and touches_zone(team.zones,
             out(rec["tree"], "diff", "--name-only", before, "HEAD").splitlines(), rec["zone"]):
@@ -980,9 +1115,9 @@ def merge_set_tips(tree: str | Path, members: list[tuple[dict, bool]]) -> None:
     for rec, _ in members[1:]:
         merged = git(tree, "merge", "--no-edit", rec["tip"], check=False)
         if merged.returncode:
-            files = out(tree, "diff", "--name-only", "--diff-filter=U")
-            git(tree, "merge", "--abort")
-            print(f"{rec['wo']}: combining the landing set conflicts in:\n{files}")
+            why = merge_failure(tree, merged)
+            git(tree, "merge", "--abort", check=False)      # nothing to abort when git refused to start
+            print(f"{rec['wo']}: combining the landing set {why}")
             sys.exit(CONFLICT)
 
 
@@ -997,10 +1132,10 @@ def check_combined_members(team: Team, members: list[tuple[dict, bool]], base: s
             # together (one zone's code, another's Cargo.lock) land as a set.
             for zone in dict.fromkeys(rec["zone"] for rec, docs in members if not docs):
                 if not current_units(team, Path(tree), zone):
-                    test_units(team, dict(first, zone=zone))
-        combined = dict(first, files=changed_files(tree, own_base(team, tree)))
-        zones = check_integration(team, combined, all(docs for _, docs in members))
-        return zones, reach(team, tree, combined["files"])
+                    test_units(team, first, zone)
+        files = changed_files(tree, own_base(team, tree))
+        zones = check_integration(team, first, all(docs for _, docs in members), files=files)
+        return zones, reach(team, tree, files)
     finally:
         if is_set:
             git(tree, "checkout", "-q", first["branch"])
@@ -1012,6 +1147,11 @@ def cmd_land(team, a):
 
     A pending build-queue restart delays admission. All-docs sets skip tests but still check duplicate rulings.
     The first branch keeps only its own work and integration, not the other members' commits.
+    SIGTERM or SIGHUP ends it as an exit (status 143 or 129), so the set's first tree goes back to its branch and
+    every member's record is saved as its own (a land stopped mid Stage 2 once left the first tree
+    detached on the set's merge commits). A land of a work order that a live land of the same
+    team already holds is refused before it reads a record or a tree. A tree that a dead
+    land left on its set's merge is put back on its branch before it is read (put_back_set_merge).
     """
     if v54_unmoved(team):
         die(NOT_MOVED)
@@ -1019,18 +1159,30 @@ def cmd_land(team, a):
         die("there is no --untested: the landing tool tests every landing")
     names = [a.wo, *(a.with_ or [])]
     announced = False
-    while True:
-        try:
-            with stage_admit("Stage 2", f"check of {', '.join(names)}"):
-                check_and_queue(team, a, names)
-            return
-        except RestartPending:
-            if not announced:
-                print(f"waiting for build queue restart: {buildq_dir().parent / 'restart' / 'buildq.json'}",
-                      file=sys.stderr, flush=True)
-                announced = True
-            drive_buildq_restart(team)
-            time.sleep(float(team.c("poll_s", 15)))
+    main = threading.current_thread() is threading.main_thread()   # only the main thread may set a handler
+    previous = {s: signal.signal(s, _exit_on_term) for s in (signal.SIGTERM, signal.SIGHUP)} if main else {}
+    try:
+        while True:
+            try:
+                with stage_admit("Stage 2", f"check of {', '.join(names)}", holds=(str(team.manifest), names)):
+                    check_and_queue(team, a, names)
+                return
+            except RestartPending:
+                if not announced:
+                    print(f"waiting for build queue restart: {buildq_dir().parent / 'restart' / 'buildq.json'}",
+                          file=sys.stderr, flush=True)
+                    announced = True
+                drive_buildq_restart(team)
+                time.sleep(float(team.c("poll_s", 15)))
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _exit_on_term(signum, frame):
+    """SIGTERM or SIGHUP as SystemExit, so the finally blocks of a stopped land still run."""
+    print(f"land: stopped ({signal.Signals(signum).name}); restoring the trees and records", file=sys.stderr, flush=True)
+    sys.exit(128 + signum)
 
 
 def check_and_queue(team: Team, a, names: list[str]) -> None:
@@ -1245,6 +1397,24 @@ def records_pass(text):
     return True
 
 
+# What stops a step that is the machine, not its tests, in the order they are judged: a full disk, as each tool
+# says it (the C library's words for git, the shell and Swift, Python's [Errno 28], Rust's (os error 28), the
+# errno's name), then an error from Xcode's shared compile cache, which a full disk can cause:
+# a tagged error ("cannot create CAS filesystem ... [#CompilationCaching]"), a stored result that
+# cannot be read back or replaced ("CAS error: unsupported compile result schema found", "failed to update cache: cache
+# poisoned for ...").
+STOPS = (("disk", re.compile(r"No space left on device|\[Errno 28\]|\(os error 28\)|\bENOSPC\b")),
+         ("cache", re.compile(r"error: (?:[^\n]*\[#CompilationCaching\]|failed to update cache: cache poisoned|CAS error:)")))
+
+
+def stopped_by(outcome: str, text: str) -> str | None:
+    """What stopped a step that did not pass, when its output says it was the machine: "disk" or "cache". Only
+    Stage 2 reads this (stage2_steps); the outcome itself stays PASS, FAIL or HUNG, which Stages 5 and 6 judge by."""
+    if outcome == "PASS":
+        return None
+    return next((kind for kind, said in STOPS if said.search(text)), None)
+
+
 def step_outcome(rc: int, text: str) -> str:
     # Nested zone-tool stderr can leak into the output, so use the last recognized HUNG, PASS, FAIL or BROKEN
     # verdict as the outer verdict rather than treating an earlier nested HUNG as decisive.
@@ -1259,8 +1429,11 @@ def step_outcome(rc: int, text: str) -> str:
 
 
 def step_results(tree: str | Path, steps: list[tuple[str, str]], env: dict[str, str], *,
-                 concurrent: bool = True, on_result: Callable[[dict], None] | None = None) -> list[dict]:
-    """Run every step, concurrently by default, and time each through its output closing."""
+                 concurrent: bool = True, on_result: Callable[[dict], None] | None = None,
+                 keep_text: bool = False) -> list[dict]:
+    """Run every step, concurrently by default, and time each through its output closing. keep_text keeps each
+    step's whole output under "text" (Stage 5 saves a failing step's log from it). A step that did not pass and
+    whose output says the machine stopped it carries "stopped_by"."""
     if not steps:
         return []
     procs = ((name, time.time(), subprocess.Popen(cmd, shell=True, cwd=tree, stdout=subprocess.PIPE,
@@ -1271,15 +1444,22 @@ def step_results(tree: str | Path, steps: list[tuple[str, str]], env: dict[str, 
         name, started, pr = job
         text = pr.communicate()[0] or ""
         seconds = time.time() - started
-        return {"name": name, "outcome": step_outcome(pr.returncode, text), "seconds": seconds,
-                "tail": text.splitlines()[-30:]}
+        outcome = step_outcome(pr.returncode, text)
+        result = {"name": name, "outcome": outcome, "seconds": seconds, "tail": text.splitlines()[-30:]}
+        if kind := stopped_by(outcome, text):
+            result["stopped_by"] = kind
+        return result | {"text": text} if keep_text else result
 
     # Compile batches run serially: zone-tool check saves one guard file per tree with a fixed temp name,
     # so two checks in the same tree race.
     if not concurrent:
         results = []
         for proc in procs:
-            result = finish(proc)
+            try:
+                result = finish(proc)
+            except BaseException:
+                stop_steps([proc])
+                raise
             if on_result is not None:
                 on_result(result)
             results.append(result)
@@ -1288,10 +1468,26 @@ def step_results(tree: str | Path, steps: list[tuple[str, str]], env: dict[str, 
     # A slow first step must not delay reading or timing the other steps.
     with ThreadPoolExecutor(max_workers=len(procs)) as pool:
         futures = [pool.submit(finish, proc) for proc in procs]
-        for future in as_completed(futures):
-            if on_result is not None:
-                on_result(future.result())
+        try:
+            for future in as_completed(futures):
+                if on_result is not None:
+                    on_result(future.result())
+        except BaseException:
+            stop_steps(procs)       # else the pool's shutdown waits for every running step to end
+            raise
         return [future.result() for future in futures]
+
+
+def stop_steps(procs) -> None:
+    """Stop the steps still running, each its whole process group (they start in their own sessions), when the run is
+    interrupted: a land stopped by SIGTERM or Ctrl-C. A step's queued build job is the build
+    queue's and is left to it."""
+    for _, _, pr in procs:
+        if pr.poll() is None:
+            try:
+                os.killpg(pr.pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def step_lines(result: dict) -> list[str]:
@@ -1367,6 +1563,10 @@ def team_env(team, group="unit"):
                 for k, v in explicit.items()})
     # [land]'s hang_min and hang_cpu_pct replace an inherited value but not one the team's [env] names itself.
     env.update({k: v for k, v in hang_settings(team.cfg).items() if k not in explicit})
+    if "PYTHONDONTWRITEBYTECODE" not in explicit:
+        # The landing tool's trees outlive a run: a bytecode cache one run writes, a later test that reads the tree
+        # finds.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     if group:
         env["GROUP"] = env["CODETEAM_TEST_GROUP"] = group
     else:
@@ -1489,6 +1689,26 @@ def read_landing_rows(team: Team) -> list[dict]:
     return [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
 
 
+def set_inner_commits(team: Team) -> set[str]:
+    """The landing commits of a --with set's members before its last. Stage 4 merges a set member by member and moves
+    landing once, to the last, so only that commit holds the whole set; Stages 6 and 7 never stop at the others
+    (Stage 7 once promoted a library's changed API without its app's caller change). A row
+    names its set; an older one is read from its work order's landed record."""
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for row in read_landing_rows(team):
+        if not row.get("hash") or not row.get("wos"):
+            continue
+        members = row.get("set")
+        if not members:
+            try:
+                members = (landed_rec(team, row["wos"][0]) or {}).get("set")
+            except (OSError, ValueError):
+                members = None
+        if members and len(members) > 1:
+            groups.setdefault(tuple(sorted(members)), []).append(row["hash"])
+    return {commit for commits in groups.values() for commit in commits[:-1]}
+
+
 LANDED_ARCHIVES = "refs/archive/landing*"      # a copy of landing kept before a history rewrite is landed work too
 
 
@@ -1550,7 +1770,7 @@ def review_files(team: Team, commits: list[str]) -> list[str]:
                              out(team.repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit).splitlines()))
 
 
-def stage3_record(team: Team, rec: dict) -> dict:
+def stage3_record(team: Team, rec: dict, members: list[dict] | None = None) -> dict:
     p = team.dir / "reviews" / f"{safe(rec['wo'])}.json"
     previous = json.loads(p.read_text()) if p.exists() else {}
     seen = previous.get("seen", {})
@@ -1558,7 +1778,7 @@ def stage3_record(team: Team, rec: dict) -> dict:
     made = tool_made_reason(rec, [out(team.repo, "show", "-s", "--format=%B", commit) for commit in commits])
     want = [] if made else stage3_reviewers(team, review_files(team, commits))
     want = list(dict.fromkeys([*want, *(name for name, result in previous.get("reviewers", {}).items() if result == "findings")]))
-    ranges = reviewer_ranges(team, rec, previous, want)
+    ranges = reviewer_ranges(team, rec, previous, want, members)
     for reviewer in ranges:
         seen.setdefault(reviewer, [])
     return {"stage": 3, "wo": rec["wo"], "zone": rec["zone"], "feature": feature_of(rec), "tip": rec["tip"],
@@ -1566,7 +1786,40 @@ def stage3_record(team: Team, rec: dict) -> dict:
             "requested": now(), "state": "pending" if ranges else "land"}
 
 
-def reviewer_ranges(team: Team, rec: dict, previous: dict, want: list[str]) -> dict[str, list[str]]:
+def commit_times(team: Team, commits: list[str]) -> dict[str, int]:
+    """Each commit's committer time, in seconds."""
+    if not commits:
+        return {}
+    lines = out(team.repo, "show", "-s", "--format=%H %ct", *commits).split()
+    return {lines[i]: int(lines[i + 1]) for i in range(0, len(lines) - 1, 2)}
+
+
+def fix_answered(team: Team, finding: dict, rec: dict, members: list[dict]) -> bool:
+    """A work order of the landing set that names the finding with --fixes has its own commit made after the finding.
+    A --with partner's commit counts only where the finding's reviewer reviews the partner's files, so the reviewer
+    sees the fix (a test fix carried in data's work order, tests/ being data's wall)."""
+    try:
+        when = dt.datetime.fromisoformat(finding["time"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return False
+    for member in members:
+        if finding["id"] not in (member.get("fixes") or []):
+            continue
+        commits = review_range(team, member["tip"], [])
+        later = [c for c, t in commit_times(team, commits).items() if t > when]
+        if not later:
+            continue
+        if member["wo"] == rec["wo"]:
+            return True
+        reviewers = set(stage3_reviewers(team, review_files(team, later)))
+        if {finding.get("by"), *finding.get("also", [])} <= reviewers:
+            return True
+    return False
+
+
+def reviewer_ranges(team: Team, rec: dict, previous: dict, want: list[str],
+                    members: list[dict] | None = None) -> dict[str, list[str]]:
+    """Each reviewer's unseen commits of the work order. `members` is its landing set (itself alone by default)."""
     ranges = {}
     for reviewer in want:
         new = review_range(team, rec["tip"], previous.get("seen", {}).get(reviewer, []))
@@ -1574,10 +1827,22 @@ def reviewer_ranges(team: Team, rec: dict, previous: dict, want: list[str]) -> d
         if had_findings and not new:
             # Findings dropped with finding-drop (judged not real) hold nothing: with no finding on this work
             # order still open, it lands as it is.
-            ids = [f["id"] for f in all_findings(team) if rec["wo"] in f.get("wos", []) and f["state"] == "open"]
-            if not ids:
+            found = [f for f in all_findings(team) if rec["wo"] in f.get("wos", []) and f["state"] == "open"]
+            if not found:
                 continue
-            die(f"{rec['wo']}: nothing committed since findings by {reviewer}: {', '.join(ids)}", GATE)
+            if previous.get("tip") and previous["tip"] != rec["tip"]:
+                # Only a merge since the findings (wo-pull brought promoted work that fixes them): the reviewer
+                # sees the work order's own commits again at the new tip.
+                new = review_range(team, rec["tip"], [])
+            if not new:
+                # A finding the set claims with --fixes and answered with a later commit holds nothing: the reviewer
+                # has seen this work order's commits, and reviews a partner's with the set.
+                ids = [f["id"] for f in found if not fix_answered(team, f, rec, members or [rec])]
+                if not ids:
+                    continue
+                die(f"{rec['wo']}: nothing committed since findings by {reviewer}: {', '.join(ids)}. A fix committed "
+                    "after a finding, in this work order or a --with partner, counts when land names it with --fixes",
+                    GATE)
         if not new:
             continue
         if reviewer == "Perkins" and not had_findings and reviewer not in stage3_reviewers(team, review_files(team, new)):
@@ -1587,7 +1852,12 @@ def reviewer_ranges(team: Team, rec: dict, previous: dict, want: list[str]) -> d
 
 
 def queue_stage3(team: Team, recs: list[dict], entry: dict, queued: str) -> dict[str, list[dict]]:
-    rows = [stage3_record(team, rec) for rec in recs]
+    rows = [stage3_record(team, rec, members=recs) for rec in recs]
+    if len(recs) > 1:
+        # A --with set lands in one step (Stage 4), so a member is judged beside the others' commits: a docs member
+        # describing a code member is true at the set's tip, not at landing.
+        for rec, row in zip(recs, rows):
+            row["with"] = [{"wo": o["wo"], "zone": o["zone"], "tip": o["tip"]} for o in recs if o is not rec]
     requests = {}
     for rec, row in zip(recs, rows):
         rec["queued"] = queued
@@ -1607,17 +1877,38 @@ def stage3_request(team: Team, items: list[dict]) -> str:
         seen = row["seen"].get(row["recipient"], [])
         command = shlex.join(["git", "-C", str(team.repo), "log", "--no-merges", "-p", row["tip"], "--not",
                               *landed, *seen])
-        lines.append(f"{row['wo']} (zone {row['zone']}, feature {row['feature']}): {command}; "
-                     f"codeteam-land {team.manifest} reviewed {row['wo']}")
+        line = (f"{row['wo']} (zone {row['zone']}, feature {row['feature']}): {command}; "
+                f"codeteam-land {team.manifest} reviewed {row['wo']}")
+        if row.get("with"):
+            others = ", ".join(f"{o['wo']} (zone {o['zone']}, tip {o['tip'][:10]})" for o in row["with"])
+            whole = shlex.join(["git", "-C", str(team.repo), "log", "--no-merges", "-p", row["tip"],
+                                *(o["tip"] for o in row["with"]), "--not", *landed])
+            line += (f". It lands in one step with {others} (land --with): judge what it says about their code at "
+                     f"their tips, not at landing. The set's commits together: {whole}. A finding may name any member "
+                     f"of the set, with that member's --wo and --zone; `reviewed {row['wo']}` then sends the whole set "
+                     "back. A member with no review line of its own here holds its verdict already and takes no "
+                     "`reviewed`")
+        lines.append(line)
+    # Spec v5.4 Stage 3 reviews a work order's own commits. A two-dot diff of its tip against landing also shows, as
+    # reverted, whatever landed after the tree's last merge, which the landing merge keeps (2026-11-12:
+    # a docs work order bounced for reverting a file it never touched).
     return ("Stage 3 review before landing: " + "; ".join(lines) +
-            f". Findings: codeteam-land {team.manifest} finding <feature> --wo <wo> --zone <zone> "
+            f". Judge each work order by these commits, its own changes. For a net view use three dots, "
+            f"`git diff {team.landing}...<tip>` (from its merge base), never a two-dot diff of the tip against "
+            f"{team.landing}: work landed after the tree's last merge shows there as reverted, and landing keeps it."
+            f" Findings: codeteam-land {team.manifest} finding <feature> --wo <wo> --zone <zone> "
             "--where <file:line> --severity 1|2|3 --kind <kind> --what <text>. "
-            "Fix findings in the same tree and run land again.")
+            "Then run `reviewed` for each work order in every case: with findings filed it sends them to the zone's "
+            "coordinator, with none the work order lands. The lead fixes findings in the same tree and runs land again.")
 
 
 def stage3_verdict(team: Team, path: Path, row: dict, reviewer: str) -> None:
-    findings = [f for f in all_findings(team) if reviewer_finding(f, row["wo"], [reviewer])
+    def filed(wo: str) -> list[dict]:
+        return [f for f in all_findings(team) if reviewer_finding(f, wo, [reviewer])
                 and f["state"] != "dropped" and f["time"] >= row["requested"]]
+    findings = filed(row["wo"])
+    # Findings this reviewer filed on another member of the set during this review (finding_work_orders).
+    partners = {o["wo"]: found for o in row.get("with", []) if (found := filed(o["wo"]))}
     row["seen"].setdefault(reviewer, []).append(row["tip"])
     row["reviewers"][reviewer] = "findings" if findings else "pass"
     if findings:
@@ -1627,9 +1918,26 @@ def stage3_verdict(team: Team, path: Path, row: dict, reviewer: str) -> None:
     elif all(value == "pass" for value in row["reviewers"].values()):
         accept_stage3(team, row)
     save_record(path, row)
-    if row["state"] == "land":
+    for wo, found in partners.items():
+        partner_review_back(team, wo, found, reviewer, row["wo"])
+    if row["state"] == "land" and not partners:
         release_reviewed_entry(team, row["wo"])
-    print(f"{row['wo']}: {row['reviewers'][reviewer]} by {reviewer}; {review_entry_notice(team, row['wo'])}")
+    print(f"{row['wo']}: {row['reviewers'][reviewer]} by {reviewer}; {review_entry_notice(team, row['wo'])}"
+          + (f"; the set went back with findings on {', '.join(partners)}" if partners else ""))
+
+
+def partner_review_back(team: Team, wo: str, findings: list[dict], reviewer: str, via: str) -> None:
+    """A set member's findings, filed while the reviewer judged `via`: the member's own record says findings, so its
+    next land needs a fix (reviewer_ranges), and the set leaves the queue as for findings on `via` itself."""
+    path = team.dir / "reviews" / f"{safe(wo)}.json"
+    other = json.loads(path.read_text())
+    other["reviewers"][reviewer] = "findings"
+    other["state"] = "findings"
+    seen = other.setdefault("seen", {}).setdefault(reviewer, [])
+    if other["tip"] not in seen:
+        seen.append(other["tip"])
+    save_record(path, other)
+    send_review_back(team, other, findings, reviewer, via=via)
 
 
 def reviewer_finding(finding: dict, wo: str, reviewers: Iterable[str]) -> bool:
@@ -1655,7 +1963,7 @@ def release_reviewed_entry(team: Team, wo: str) -> None:
         p.write_text(json.dumps(entry, indent=1) + "\n")
 
 
-def send_review_back(team: Team, row: dict, findings: list[dict], reviewer: str) -> None:
+def send_review_back(team: Team, row: dict, findings: list[dict], reviewer: str, via: str | None = None) -> None:
     p = entry_path(team, row["wo"])
     wos = json.loads(p.read_text())["wos"] if p else [row["wo"]]
     if p:
@@ -1667,7 +1975,8 @@ def send_review_back(team: Team, row: dict, findings: list[dict], reviewer: str)
     to = team.c("orchestrator", "orc") if row["zone"] == "orc" else f"Coord-{row['zone']}"
     text = "; ".join(f"{f['id']} {f['where']}: {f['what']}" for f in findings)
     team.notify(to, "REQUEST", f"{row['wo']}: Stage 3 findings by {reviewer}: {text}. "
-                "Nothing landed. Fix it in the same tree and run land again.")
+                + (f"Its --with set went back at the verdict on {via}. " if via else "")
+                + "Nothing landed. Fix it in the same tree and run land again.")
     team.log({"time": now(), "wos": wos, "result": "review findings", "findings": [f["id"] for f in findings]})
 
 
@@ -1842,7 +2151,7 @@ def notify_finding(team: Team, a, fid: str, me: str) -> None:
 def cmd_finding(team, a):
     """Store Stage 3 findings silently until verdict; route backlog and feature findings immediately."""
     me = os.environ.get("CODETEAM_SESSION") or die("set CODETEAM_SESSION to your session name")
-    in_feature, pending = finding_work_orders(team, a.feature, a.wo or [])
+    in_feature, pending = finding_work_orders(team, a.feature, a.wo or [], me)
     backlog = backlog_finding(team, a, me)
     if not in_feature and not backlog:
         die(f"feature {a.feature} has no work orders under review (codeteam-land {team.manifest} findings)")
@@ -1864,11 +2173,21 @@ def cmd_finding(team, a):
     print(fid)
 
 
-def finding_work_orders(team: Team, feature: str, wos: list[str]) -> tuple[set[str], dict[str, dict]]:
+def finding_work_orders(team: Team, feature: str, wos: list[str],
+                        me: str | None = None) -> tuple[set[str], dict[str, dict]]:
     in_feature = {item["wo"] for item in load_feature(team, feature)["landed"]}
     in_feature.update(wo for wo in wos if (rec := landed_rec(team, wo)) and feature_of(rec) == feature)
-    pending = {wo: row for wo, row in review_records(team).items()
-               if row["state"] == "pending" and row.get("feature", wo) == feature}
+    rows = review_records(team)
+    pending = {wo: row for wo, row in rows.items() if row["state"] == "pending" and row.get("feature", wo) == feature}
+    if me:
+        # A --with set lands in one step, and its Stage 3 request has the set's commits read together. While the filer
+        # still owes a verdict on one member, a finding may name any member, and that verdict sends the whole set
+        # back (Kong once found a member's classifier wrong, finding refused it, and the set landed).
+        for path in entries(team):
+            members = json.loads(path.read_text())["wos"]
+            if any(rows.get(m, {}).get("state") == "pending" and rows[m]["reviewers"].get(me) == "pending"
+                   for m in members):
+                pending.update({m: rows[m] for m in members if m in rows and rows[m].get("feature", m) == feature})
     return in_feature | pending.keys(), pending
 
 
@@ -1925,6 +2244,35 @@ def cmd_wo_tag(team, a):
     print(f"{a.wo}: feature {feature_of(rec)}" + (f"; fixes {', '.join(rec['fixes'])}" if rec.get("fixes") else ""))
 
 
+def cmd_wo_hold(team, a):
+    """Mark an open work order as held on purpose, with the ruling or reason, so patrol stops calling it stalled
+    (2026-11-12: a work order with a major change, kept on its branch until the owner decides, woke the orchestrator
+    every patrol round). --release lifts the mark. With no work order:
+    list the held ones. The mark changes nothing else: the work order can still be pulled, landed or retired."""
+    if not a.wo:
+        for f in sorted((team.dir / "wo").glob("*.json")):
+            if f.name.endswith((".landed.json", ".retired.json")):
+                continue
+            try:
+                rec = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if rec.get("held"):
+                print(f"{rec['wo']}  {rec['zone']}  held {rec['held']['at']}: {rec['held']['because']}")
+        return
+    rec = team.wo(a.wo)
+    if a.release:
+        if not rec.pop("held", None):
+            die(f"{a.wo} is not held", 2)
+        team.save_wo(rec)
+        print(f"{a.wo}: released; patrol reports it again when it stalls")
+        return
+    because = (a.because or "").strip() or die("say why with --because (the ruling numbers, or what it waits for)", 2)
+    rec["held"] = {"because": because, "at": now()}
+    team.save_wo(rec)
+    print(f"{a.wo}: held ({because}); patrol skips it until wo-hold {a.wo} --release")
+
+
 def cmd_feature_done(team, a):
     with Lock(team):
         fr = load_feature(team, a.feature)
@@ -1965,7 +2313,11 @@ def review_entry_notice(team: Team, wo: str) -> str:
     if not ledger:
         return "no guard ledger found"
     if Path(os.path.expanduser(ledger), "changelog", f"{wo}.md").exists():
-        return "your changelog line is the entry when a promotion stamps its documents"
+        # The line is published with the documents, so the team's after step judges it (a line naming
+        # `docs/_public` failed `make public-docs` and held every stamp).
+        after = (team.cfg.get("docs") or {}).get("after")
+        return ("your changelog line is the entry when a promotion stamps its documents"
+                + (f"; it is published with them and must pass `{after}`" if after else ""))
     return (f"no changelog/{wo}.md in {ledger}: a promotion that stamps its documents uses "
             "the work order's first commit subject")
 
@@ -2200,6 +2552,7 @@ def record_landing_members(team: Team, entry: dict, old: str, recs: dict[str, di
                            commits: list[tuple[str, str]], recheck: bool) -> list[dict]:
     rows = []
     tips = dict(entry_members(entry))
+    whole = [wo for wo, _ in entry_members(entry)]
     for wo, commit in commits:
         rec = recs[wo]
         git(team.repo, "update-ref", f"refs/landed/{wo}", tips[wo])
@@ -2208,6 +2561,8 @@ def record_landing_members(team: Team, entry: dict, old: str, recs: dict[str, di
         row = {"time": now(), "wos": [wo], "zone": rec["zone"], "hash": commit, "range": f"{old}..{commit}",
                "base": entry["base"], "zones": entry["zones"], "recheck": recheck, "review": "before", "stage2": rec.get("stage2", []),
                "feature": feature_of(rec), "fixes": rec.get("fixes") or []}
+        if len(whole) > 1:
+            row["set"] = whole              # only the set's last commit holds all of it
         rec["landed_base"] = entry["base"]
         rec["landed_at"] = row["time"]
         team.save_wo(rec)
@@ -2282,7 +2637,7 @@ def clean_idle(team):
                 newest = max(newest, (tree / line[3:].split(" -> ")[-1].strip('"')).stat().st_mtime)
             except OSError:
                 newest = time.time()
-        if time.time() - max(last, newest) > limit and any((tree / d).exists() for d in WARM_DIRS):
+        if time.time() - max(last, newest) > limit and any((tree / d).exists() for d in BUILD_OUTPUT_DIRS):
             env = dict(os.environ, MAKEFILES=str(HERE.parent / "zone" / "zone.mk"), CODETEAM_HOME=str(HERE.parent))
             subprocess.run(["make", "--no-print-directory", "zone-clean"], cwd=tree, env=env, capture_output=True)
             rec["cleaned"] = now()
@@ -2345,6 +2700,24 @@ def run_with_heartbeat(tree: Path, steps: list[tuple[str, str]], env: dict[str, 
 # INTERFACE move together; public API removals or changes imply MAJOR, and additions imply MINOR.
 
 FRONT_VERSION = re.compile(r"^version:\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", re.M)
+EXTERNAL_MARK = "<!-- external -->"     # on a Markdown line: its file names are not this repository's
+
+
+def missing_file_refs(lines, tracked, names):
+    """File names on these added Markdown lines that name no tracked file. A line with EXTERNAL_MARK is skipped: it
+    cites another repository's files or a package's own file list (2026-11-12: a package SPEC
+    named another repository's files and a finder package's contents, and each NOTE cost a lane turn)."""
+    broken = []
+    for line in lines:
+        if EXTERNAL_MARK in line.lower():
+            continue
+        for ref in FILE_REF.findall(line):
+            if ref in tracked or (("/" not in ref) and ref in names) or any(t_.endswith("/" + ref) for t_ in tracked):
+                continue
+            broken.append(ref)
+    return broken
+
+
 FILE_REF = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:swift|rs|py|ts|js|md|toml|json|ya?ml|sh|c|h|m|mm|sql))(?![\w-])(?::\d+(?:-\d+)?)?")
 # (?![\w-]) after the extension: `AuditGate.contentID` is not a file AuditGate.c, nor `Substrate.mutate` Substrate.m,
 # nor `[package.metadata.acme-test]` package.metadata.m (every zone documenting Swift API was once told so).
@@ -2382,14 +2755,17 @@ def _add_entry(text, ver, date, entry):
 def guard_walls(team, zone):
     """The zone guard's own walls for a zone (share/claude-hooks/lane_walls.py), so landing and the guard give a
     reference doc to the same zone (a SPEC.md was once one zone's to the guard
-    and nobody's to landing). None when they cannot be read."""
+    and nobody's to landing). None when they cannot be read. A zone from a manifest glob (`apps/*`) has no lane record
+    of its own, so its folder comes from team.zones, as the guard's CODETEAM_ZONE does (with an empty zone, a
+    zone-docs.json claim such as INSTALLER -> apps/<app> matched nobody and landing refused the app's own doc)."""
     hooks = str(HERE.parent / "share" / "claude-hooks")
     if hooks not in sys.path:
         sys.path.append(hooks)
     try:
         import lane_walls
         lane = lane_rec(team, zone)
-        return lane_walls.load_walls(lane=zone, zone=lane.get("path", ""), owns=lane.get("owns") or [],
+        path = lane.get("path", "") if lane else next(iter(team.zones.get(zone) or []), "")
+        return lane_walls.load_walls(lane=zone, zone=path, owns=lane.get("owns") or [],
                                      team_json=team.root / "team" / "team.json", codeteam_home=HERE.parent,
                                      manifest=team.manifest)
     except Exception:
@@ -2439,14 +2815,38 @@ def changelog_path(doc):
     return os.path.join(d, re.sub(r"(_SPEC|_INTERFACE)?\.md$", "", b, flags=re.I) + "_CHANGELOG.md")
 
 
+def section_heads(text):
+    """(line index, line) of each `## ` heading outside fenced code blocks (``` or ~~~, closed by a run of the same
+    character at least as long), in order."""
+    heads, fence = [], None
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        s = line.lstrip(" ")
+        if fence:
+            if s.rstrip().startswith(fence) and not s.rstrip().strip(fence[0]):
+                fence = None
+            continue
+        m = re.match(r"(`{3,}|~{3,})", s)
+        if m:
+            fence = m.group(1)
+        elif line.startswith("## "):
+            heads.append((i, line))
+    return heads
+
+
 def take_changelog_section(text):
-    """(the document without its `## Changelog` section, that section's body or '')."""
-    m = re.search(r"^## Changelog[^\n]*\n", text, re.M)
-    if not m:
+    """(the document without its `## Changelog` section, that section's body or ''). The section is the last
+    `## Changelog` heading outside fenced code blocks, up to the next such `## ` heading (a VERSIONING.md's
+    example heading inside a code block was taken, and the text after it went with it)."""
+    heads = section_heads(text)
+    found = [i for i, line in heads if line.startswith("## Changelog") and line.endswith("\n")]
+    if not found:
         return text, ""
-    nxt = re.search(r"^## ", text[m.end():], re.M)
-    end = m.end() + nxt.start() if nxt else len(text)
-    return (text[:m.start()].rstrip("\n") + "\n" + ("\n" + text[end:] if nxt else "")), text[m.end():end].strip()
+    lines = text.splitlines(keepends=True)
+    start = found[-1]
+    nxt = next((i for i, _ in heads if i > start), None)
+    end = nxt if nxt is not None else len(lines)
+    before = "".join(lines[:start]).rstrip("\n") + "\n"
+    return before + ("\n" + "".join(lines[end:]) if nxt is not None else ""), "".join(lines[start + 1:end]).strip()
 
 
 def tell_dependents(team, rec, landed, docs):
@@ -2499,16 +2899,14 @@ def docs_pass(team, row, rec):
     names = {}
     for t_ in tracked:
         names.setdefault(os.path.basename(t_), []).append(t_)
-    broken = []
-    for line in out(team.repo, "diff", "-U0", prev, landed, "--", "*.md").splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            for ref in FILE_REF.findall(line):
-                if ref in tracked or (("/" not in ref) and ref in names) or any(t_.endswith("/" + ref) for t_ in tracked):
-                    continue
-                broken.append(ref)
+    added = [line[1:] for line in out(team.repo, "diff", "-U0", prev, landed, "--", "*.md").splitlines()
+             if line.startswith("+") and not line.startswith("+++")]
+    broken = missing_file_refs(added, tracked, names)
     if broken:
         team.notify(f"Coord-{rec['zone']}", "NOTE", f"{rec['wo']} landed with Markdown naming files that do not exist: "
-                    f"{', '.join(sorted(set(broken))[:12])}. A file name or path is enough; fix them in your next work order.")
+                    f"{', '.join(sorted(set(broken))[:12])}. A file name or path is enough; fix them in your next work order. A name "
+                    f"that is not this repository's (another repository's file, one inside a package) is right as written: "
+                    f"put {EXTERNAL_MARK} on its line and this check skips the line.")
 
     def ver(ref, f):
         return _version(git(team.repo, "show", f"{ref}:{f}", check=False).stdout)
@@ -2564,6 +2962,7 @@ def stamp_docs(team: Team, h: str, base: str) -> str | None:
     take = collect_stamps(team, h, base_hash, pend)
     if not take:
         return None
+    owe_stamps(team, pend, take)
     tip = commit_stamp(team, wo, h, take, base_hash)
     settle_stamp(team, pend, take, tip)
     if tip is None:
@@ -2572,8 +2971,40 @@ def stamp_docs(team: Team, h: str, base: str) -> str | None:
     return wo
 
 
+class StampFailed(Exception):
+    """Why a stamp could not be committed, for the orchestrator's note."""
+
+
+def owe_stamps(team: Team, pend: list[dict], take: list[dict]) -> None:
+    """A late row (a stated level with no pending row) joins land/docs-pending.jsonl before the stamp is tried: after
+    this promotion it is below base, and collect_stamps never looks there again (2026-11-11: a stamp
+    failed and a work order's level was lost)."""
+    late = [row for row in take if row not in pend]
+    if late:
+        pend.extend(late)
+        (team.dir / "docs-pending.jsonl").write_text("".join(json.dumps(row) + "\n" for row in pend))
+
+
 def commit_stamp(team: Team, wo: str, h: str, take: list[dict], base_hash: str) -> str | None:
+    """The stamp commit in a work order of its own. A failure retires that work order (the next promotion cuts a
+    fresh one; the rows stay owed) and raises StampFailed with the step's own output."""
     cmd_wo_cut(team, argparse_ns(zone="orc", wo=wo, staff_as_orc=True))
+    try:
+        return write_stamp_commit(team, wo, h, take, base_hash)
+    except BaseException:
+        try:
+            cmd_wo_retire(team, argparse_ns(wo=wo, force=True, reason="stamp failed"))
+        except BaseException:           # the stamp's own failure is the one to report
+            pass
+        raise
+
+
+def stamp_step_output(done) -> str:
+    text = ((done.stdout or "") + (done.stderr or "")).strip()
+    return text[-1500:] if len(text) > 1500 else text
+
+
+def write_stamp_commit(team: Team, wo: str, h: str, take: list[dict], base_hash: str) -> str | None:
     rec = team.wo(wo)
     rec["made_by"] = "codeteam-land"
     team.save_wo(rec)
@@ -2585,15 +3016,24 @@ def commit_stamp(team: Team, wo: str, h: str, take: list[dict], base_hash: str) 
     write_stamp_changelogs(team, tree, logs)
     after = (team.cfg.get("docs") or {}).get("after")
     if after:
-        subprocess.run(after, shell=True, cwd=tree, env=team_env(team), capture_output=True, text=True)
+        # Stage first: an after step that works from tracked files (e.g. a `make public-docs`) must see the
+        # changelog files this stamp creates (three new *_CHANGELOG.md had no docs/_public copy).
+        git(tree, "add", "-A")
+        done = subprocess.run(after, shell=True, cwd=tree, env=team_env(team), capture_output=True, text=True)
+        if done.returncode:
+            # Its refusal is the cause; the commit hook that would refuse next says less.
+            raise StampFailed(f"[land.docs] after `{after}` exited {done.returncode}:\n{stamp_step_output(done)}\n"
+                              f"{stamp_sources(team, logs)}")
     git(tree, "add", "-A")
     if not out(tree, "status", "--porcelain"):
         cmd_wo_retire(team, argparse_ns(wo=wo, force=True, reason="nothing to stamp"))
         return None
     env = dict(os.environ, GIT_AUTHOR_NAME="codeteam-land", GIT_COMMITTER_NAME="codeteam-land",
                GIT_AUTHOR_EMAIL="codeteam@local", GIT_COMMITTER_EMAIL="codeteam@local")
-    git(tree, "commit", "-q", "-m", f"docs: versions, dates and changelog entries for the promotion of {h[:10]} "
-        f"({len(take)} work order{'s' if len(take) != 1 else ''})\n\n{MADE_BY}", env=env)
+    done = git(tree, "commit", "-q", "-m", f"docs: versions, dates and changelog entries for the promotion of {h[:10]} "
+               f"({len(take)} work order{'s' if len(take) != 1 else ''})\n\n{MADE_BY}", env=env, check=False)
+    if done.returncode:
+        raise StampFailed(f"the stamp commit was refused (exit {done.returncode}):\n{stamp_step_output(done)}")
     return out(tree, "rev-parse", "HEAD")
 
 
@@ -2698,6 +3138,25 @@ def write_stamp_documents(tree: Path, take: list[dict], targets: dict) -> dict:
     return logs
 
 
+def stamp_sources(team: Team, logs: dict) -> str:
+    """Where each line a stamp adds to a changelog comes from, for the note when the after step refuses one. The text
+    a refusal quotes was written by someone else: 2026-11-12, a line naming `docs/_public` came from
+    Kong's changelog entry file, which no record the orchestrator searched held, and every later stamp would fail on
+    it."""
+    ledger = guard_ledger(team)
+    parts = []
+    for file, log in sorted(logs.items()):
+        src = []
+        for row in sorted(log["wos"], key=lambda row: row["time"]):
+            path = Path(os.path.expanduser(ledger), "changelog", f"{row['wo']}.md") if ledger else None
+            src.append(f"{row['wo']} ({path if path and path.exists() else 'its first commit subject'})")
+        src += [f"the changelog section moved from {doc}" for doc, _ in log["moved"]]
+        if src:
+            parts.append(f"{file} takes {', '.join(src)}")
+    return ("Its entries: " + "; ".join(parts) + ". " if parts else "") + \
+        "Reword the one the refusal names; the next promotion stamps the owed documents again."
+
+
 def stamp_entry(ledger: str | None, row: dict) -> str:
     path = Path(os.path.expanduser(ledger), "changelog", f"{row['wo']}.md") if ledger else None
     text = path.read_text().strip() if path and path.exists() else row["entry"]
@@ -2710,7 +3169,7 @@ def write_stamp_changelogs(team: Team, tree: Path, logs: dict) -> None:
     for file, log in logs.items():
         path = tree / file
         text = path.read_text() if path.exists() else f"# {path.name[:-len('_CHANGELOG.md')]} changelog\n\n" \
-            "Append-only: newest at the end. Written by codeteam at each promotion; never edited by hand.\n"
+            "Append-only: newest at the end. Written at each promotion; never edited by hand.\n"
         for doc, section in log["moved"]:
             text = text.rstrip("\n") + f"\n\n## Earlier entries, moved from {Path(doc).name} on {today}\n\n{section}\n"
         text = text.rstrip("\n") + f"\n\n## {'.'.join(map(str, log['version']))} -- {today}\n\n" \
@@ -2790,6 +3249,11 @@ def itest_checkout(team: Team, M: str) -> Path:
             r = git(tree, "checkout", "-q", "-f", "--detach", M, check=False)
     else:
         r = git(team.repo, "worktree", "add", "--detach", str(tree), M, check=False)
+        if r.returncode and "already registered worktree" in (r.stderr or ""):
+            # The folder was deleted and git still lists it: -f reuses this path's entry alone.
+            r = git(team.repo, "worktree", "add", "-f", "--detach", str(tree), M, check=False)
+        if r.returncode == 0:
+            codeteam_tm.exclude([tree])     # the landing tool's own tree and its builds: none of it is backed up
     if r.returncode:
         raise CheckoutFailed(M, r.stderr.strip())
     return tree
@@ -2804,9 +3268,40 @@ def recheck_steps(team: Team, tree: Path, zones: Iterable[str]) -> tuple[list, l
 
 
 def integration_result(row: dict, results: list[dict], when: str) -> dict:
+    """One recheck's record; a step that did not pass keeps its last lines, its log and its failing tests."""
     return {"time": when, "M": row["M"], "wo": row["wo"], "overlapping": row["overlapping"], "zones": row["zones"],
             "tests": [{"name": result["name"], "result": result["outcome"].lower(),
-                       "seconds": round(result["seconds"], 1)} for result in results]}
+                       "seconds": round(result["seconds"], 1)}
+                      | ({key: result[key] for key in ("failing", "log", "tail") if result.get(key)}
+                         if result["outcome"] != "PASS" else {}) for result in results]}
+
+
+RECHECK_LOGS_KEPT = 60
+
+
+def keep_recheck_logs(team: Team, M: str, results: list[dict]) -> None:
+    """Save each failing step's whole output to land/recheck-logs/ and name its failing tests: zone-tool's records in
+    land/itest are per scope and the next recheck overwrites them (2026-11-12: an app's test failure
+    reached the finding with no test name and no log). Drops "text" from every result."""
+    folder = team.dir / "recheck-logs"
+    for result in results:
+        text = result.pop("text", None)
+        if result["outcome"] == "PASS" or text is None:
+            continue
+        result["failing"] = failing_test_names(text)[:20]
+        try:
+            folder.mkdir(exist_ok=True)
+            path = folder / f"{M[:10]}-{re.sub(r'[^A-Za-z0-9._-]+', '-', result['name']).strip('-')}.log"
+            path.write_text(text)
+            result["log"] = str(path)
+        except OSError as ex:  # A full disk must not lose the recheck's result.
+            result["log_error"] = f"{type(ex).__name__}: {ex}"
+    try:
+        logs = sorted(folder.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in logs[RECHECK_LOGS_KEPT:]:
+            old.unlink()
+    except OSError:
+        pass
 
 
 def recheck_findings(tests: list[dict], open_fixes: list[dict]) -> dict:
@@ -2822,6 +3317,15 @@ def recheck_findings(tests: list[dict], open_fixes: list[dict]) -> dict:
     return {key: list(dict.fromkeys(values)) for key, values in changes.items()}
 
 
+def landing_fix_note(team: Team, commit: str) -> str:
+    """The FIX-FORWARD line for a test failure at a landing commit. The fix
+    work order stays cut from integration and merges the failing landing commit when the cause lives only there.
+    Stage 4 step 3 ('the coder never merges landing', a Stage 4 conflict rule) was once read as forbidding it.
+    own_base keeps Stage 3 on the fix's own commits after such a merge."""
+    return (f" If the cause is on {team.landing} and not in integration, merge {commit[:10]} into the fix tree; "
+            f"Stage 3 reviews only the fix's own commits.")
+
+
 def open_recheck_finding(team: Team, row: dict, rec: dict, test: dict, when: str) -> None:
     """Create and route one test finding while the caller holds FindingsLock."""
     feature = feature_of(rec)
@@ -2830,6 +3334,10 @@ def open_recheck_finding(team: Team, row: dict, rec: dict, test: dict, when: str
     wos = [row["wo"], *row["overlapping"]]
     what = (f"{test['name']} {'hangs' if test['result'] == 'hung' else 'fails'} at M {row['M'][:10]} "
             f"after an overlapping landing; overlapping work orders: {', '.join(row['overlapping'])}")
+    if test.get("failing"):
+        what += f"; failing tests: {', '.join(test['failing'])}"
+    if test.get("log"):
+        what += f"; log: {test['log']}"
     items.append({"id": fid, "time": when, "by": "recheck", "also": [], "feature": feature, "wos": wos,
                   "zone": rec["zone"], "where": test["name"], "severity": 2, "kind": "test", "what": what,
                   "belongs": "", "state": "open", "fixed_by": None, "closed": None, "reason": None,
@@ -2838,7 +3346,7 @@ def open_recheck_finding(team: Team, row: dict, rec: dict, test: dict, when: str
     team.notify(team.c("orchestrator", "orc") if rec["zone"] == "orc" else f"Coord-{rec['zone']}", "REQUEST",
                 f"FIX-FORWARD {fid} | zone {rec['zone']} | test {test['name']} | M {row['M'][:10]} | "
                 f"work orders {', '.join(wos)} | {what}. Route as a work order; it lands with "
-                f"codeteam-land {team.manifest} land <wo> --fixes {fid}")
+                f"codeteam-land {team.manifest} land <wo> --fixes {fid}." + landing_fix_note(team, row["M"]))
 
 
 def apply_recheck_findings(team: Team, row: dict, rec: dict, tests: list[dict], when: str) -> None:
@@ -2876,56 +3384,60 @@ def complete_recheck(team: Team, row: dict, when: str) -> None:
         team.log({"time": now(), "wos": [row["wo"]], "recheck_bookkeeping_error": f"{type(ex).__name__}: {ex}"})
 
 
-def recheck_checkout_notice(team: Team, row: dict, result: dict) -> None:
-    if row.get("move"):
-        with Lock(team):
-            rows = read_recheck(team)
-            current = rows[rows.index(row)]
-            if "checkout_failed" in current:
-                return
-            current["checkout_failed"] = result["time"]
-            path = team.dir / "recheck.jsonl"
-            temporary = path.with_name(f".{path.name}.tmp")
-            temporary.write_text("".join(json.dumps(item) + "\n" for item in rows))
-            temporary.replace(path)
+def recheck_checkout_notice(team: Team, row: dict, result: dict) -> bool:
+    """Record a recheck's first failed checkout on its row and tell the orchestrator; False when it was told already."""
+    with Lock(team):
+        rows = read_recheck(team)
+        if row not in rows:
+            return False
+        current = rows[rows.index(row)]
+        if "checkout_failed" in current:
+            return False
+        current["checkout_failed"] = result["time"]
+        path = team.dir / "recheck.jsonl"
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text("".join(json.dumps(item) + "\n" for item in rows))
+        temporary.replace(path)
     team.notify(team.c("orchestrator", "orc"), "NOTE",
                 f"Recheck checkout failed at M {row['M'][:10]} for work orders "
                 f"{', '.join(row.get('set') or [row['wo']])}: {' '.join(result['error'].splitlines())}; "
-                + ("the move recheck stays pending until its outcome is recorded." if row.get("move") else
-                   "the recheck row is completed without test evidence."))
+                "the recheck stays pending and is tried again each poll until the checkout works (git's error above "
+                "names the cause); Stage 6 waits for it.")
+    return True
 
 
 def recheck_one(team: Team, row: dict) -> dict:
     """Recheck the set at its landing commit, running integration tests only after compilation passes.
 
-    Move rechecks stay pending on checkout or findings errors, so Stage 6 cannot bypass the move's outcome.
-    Ordinary rechecks attempt completion and feature test-writing registration even on those errors.
+    A recheck whose checkout fails stays pending and is tried again; its first failure is recorded and told once
+    (a recheck that ran nothing is not done). Move rechecks also stay pending on findings
+    errors, so Stage 6 cannot bypass the move's outcome; ordinary rechecks complete on those.
     """
     try:
         tree = itest_checkout(team, row["M"])
     except CheckoutFailed as ex:
         result = integration_result(row, [], now()) | {"checkout": "failed", "error": ex.error,
                                                        "set": row.get("set") or [row["wo"]]}
+        if recheck_checkout_notice(team, row, result):
+            with (team.dir / "integration-results.jsonl").open("a") as file:
+                file.write(json.dumps(result) + "\n")
+        return result
     else:
         compile, tests = recheck_steps(team, tree, row["zones"])
         env = team_env(team, "integration")
-        results = step_results(tree, compile, env, concurrent=False)
+        results = step_results(tree, compile, env, concurrent=False, keep_text=True)
         if all(result["outcome"] == "PASS" for result in results):
-            results.extend(step_results(tree, tests, env))
+            results.extend(step_results(tree, tests, env, keep_text=True))
+        keep_recheck_logs(team, row["M"], results)
         result = integration_result(row, results, now())
     with (team.dir / "integration-results.jsonl").open("a") as file:
         file.write(json.dumps(result) + "\n")
-    if result.get("checkout") == "failed":
-        recheck_checkout_notice(team, row, result)
+    try:
+        apply_recheck_findings(team, row, landed_rec(team, row["wo"]), result["tests"], result["time"])
+    except Exception as ex:
+        team.log({"time": now(), "wos": [row["wo"]], "recheck_findings_error": f"{type(ex).__name__}: {ex}"})
         if row.get("move"):
             return result
-    else:
-        try:
-            apply_recheck_findings(team, row, landed_rec(team, row["wo"]), result["tests"], result["time"])
-        except Exception as ex:
-            team.log({"time": now(), "wos": [row["wo"]], "recheck_findings_error": f"{type(ex).__name__}: {ex}"})
-            if row.get("move"):
-                return result
     complete_recheck(team, row, result["time"])
     return result
 
@@ -2934,9 +3446,11 @@ def run_recheck_tick(team: Team, rec: dict) -> tuple | None:
     try:
         with stage_admit("Stage 5", f"recheck of {rec['wo']} at M {rec['M'][:10]}"):
             started = time.time()
-            recheck_one(team, rec)
+            result = recheck_one(team, rec)
     except RestartPending:
         return None
+    if result.get("checkout") == "failed":
+        return None                     # pending: the runner sleeps a poll before it tries again
     if rec.get("move") and any(row.get("move") and "done" not in row for row in read_recheck(team)):
         return None
     return started, lambda: f"Stage 5 recheck of {rec['wo']} at M {rec['M'][:10]}"
@@ -3099,7 +3613,12 @@ if [ "$got" != "$want" ]; then
   exit 2
 fi
 keep=""; for k in $LAND_KEEP; do keep="$keep -e $k"; done     # untracked inputs a suite needs (model weights)
-git checkout -q -f --detach "$h" && git clean -q -fd -e cargo-target -e target -e .build -e .codegraph -e node_modules $keep || {
+build="-e cargo-target -e target -e .build -e .codegraph -e node_modules"    # warm build output, kept
+# Python's bytecode caches are ignored files, which `git clean -fd` keeps, so a test that reads the tree saw the last
+# run's: they go at each checkout, outside the kept folders, and the suite writes none.
+export PYTHONDONTWRITEBYTECODE=1
+git checkout -q -f --detach "$h" && git clean -q -fd $build $keep &&
+  git clean -q -fdx $build -e DerivedData $keep -- ':(glob)**/__pycache__/' ':(glob)**/*.pyc' || {
   printf '{"hash":"%s","result":"error","detail":"checkout failed"}\n' "$h"; exit 2; }
 t0=$(date +%s)
 mkdir -p "$HOME/land-check-logs"
@@ -3240,6 +3759,7 @@ def install_land_check(team: Team, a: dict) -> str | None:
                 r = git(team.repo, "clone", "-q", "--shared", "--no-checkout", str(team.repo), a["path"], check=False)
                 if r.returncode:
                     return r.stderr.strip()
+                codeteam_tm.exclude([Path(a["path"])])    # the validation clone and its builds
             root_links(team, a["path"])
             tmp = Path(a["path"], ".git", "land-check.new")  # rename so a running shell keeps reading its copy
             tmp.write_text(REMOTE_CHECK)
@@ -3295,7 +3815,10 @@ def run_land_check(team: Team, a: dict, h: str, group: str) -> dict:
     keep = " ".join(a.get("keep", []))
     # ssh does not inherit the local team environment: pass the hang rule and selected group explicitly.
     settings = " ".join(f"{key}={shlex.quote(value)}" for key, value in hang_settings(team.cfg).items())
-    cmd = (f"cd {clone_shell_path(a['path'])} && LAND_KEEP={shlex.quote(keep)} CODETEAM_TEST_GROUP={shlex.quote(group)} "
+    # GROUP as well as CODETEAM_TEST_GROUP, as Stage 2 sets both: a repo Makefile's test-one reads GROUP (e.g.
+    # TEST_GROUP=${GROUP:-unit}), so without it Stage 6 ran a product's unit tests.
+    cmd = (f"cd {clone_shell_path(a['path'])} && LAND_KEEP={shlex.quote(keep)} GROUP={shlex.quote(group)} "
+           f"CODETEAM_TEST_GROUP={shlex.quote(group)} "
            f"{'' if a.get('local') else settings + ' '}~/bin/land-check {h} {shlex.quote(suite)} "
            f"{shlex.quote(toolchain_cmd(a))} {toolchain_fp(a)}")
     if a.get("local"):
@@ -3317,6 +3840,10 @@ def run_land_check(team: Team, a: dict, h: str, group: str) -> dict:
 
 def check_at(team: Team, a: dict, h: str, group: str, before: Callable | None = None) -> dict:
     """Push h, ensure land-check is current, then run the tier; the caller owns recording the result."""
+    # Only install_land_check makes a local tier's clone: install first when it is missing, or the push below fails
+    # on every run and the clone is never made.
+    if a.get("local") and not Path(a["path"], ".git").exists() and (detail := ensure_land_check(team, a)) is not None:
+        return {"hash": h, "result": "toolchain", "detail": detail, "time": now()}
     dest = a["path"] if a.get("local") else f"{a['host']}:{a['path']}"
     # --no-verify: a transport to codeteam's own check clone, not a push of the product (its pre-push gates and LFS
     # upload are for GitHub).
@@ -3344,10 +3871,61 @@ def alpha_check(team: Team, a: dict, h: str) -> dict:
 SLOW_RE = re.compile(r"^(?P<path>[^:\s]+\.swift):(?P<line>\d+):(?P<col>\d+): warning: (?P<what>.+?) took (?P<ms>\d+)ms to type-check")
 
 
+def slow_site(path, line, what):
+    """A site's identity from one survey to the next: a named function by file and name (an edit above it moves its
+    line); an expression or a closure by file, line and text."""
+    return (path, what) if "'" in what else (path, line, what)
+
+
+def slow_new(rows, prev_rows, reported, changed, seen=frozenset()):
+    """The sites new to the code: over the line now, and either in a file the work landed
+    since the last survey changed and never over the line in any survey before, or over the line in two surveys
+    running and never reported. A run type-checks only what it rebuilds, so a site can be missing from one survey and
+    back in the next with the same time (one test function
+    measured 869 ms both times); that is not new code. changed: the files changed since the last survey, or None when that
+    is not known. seen: every site over the line in any survey so far."""
+    prev = {slow_site(*r[:3]) for r in prev_rows}
+    new = []
+    for r in rows:
+        site = slow_site(*r[:3])
+        if changed is not None and r[0] in changed:
+            fresh = site not in prev and site not in seen
+        else:
+            fresh = site in prev and site not in reported
+        if fresh:
+            new.append(r)
+    return new
+
+
+def slow_previous(team, h):
+    """(last survey's commit or None, its rows, the sites already reported, every site seen over the line) from
+    <team>/land/slow-compile.json. The first format was a bare list of rows: its commit is the last validation that
+    could have surveyed, and every site in it counts as reported and seen, so the first survey under the new rule names
+    only what is new to the code."""
+    p = team.dir / "slow-compile.json"
+    data = json.loads(p.read_text()) if p.exists() else {}
+    if isinstance(data, list):
+        prev = next((row["commit"] for row in reversed(validation_rows(team))
+                     if row.get("result") in ("pass", "fail") and row.get("commit") != h), None)
+        sites = {slow_site(*r[:3]) for r in data}
+        return prev, data, sites, set(sites)
+    rows = data.get("rows", [])
+    reported = {tuple(x) for x in data.get("reported", [])}
+    seen = {tuple(x) for x in data.get("seen", [])} | {slow_site(*r[:3]) for r in rows} | reported
+    return data.get("commit"), rows, reported, seen
+
+
+def slow_changed(team, prev, h):
+    if not prev:
+        return None
+    r = git(team.repo, "diff", "--name-only", prev, h, check=False)
+    return set(r.stdout.split()) if r.returncode == 0 else None
+
+
 def slow_report(team, a, h):
     """The slow-compile survey of one validation run on the remote machine: every Swift function or expression over [land.remote]
     slow_ms, from the run's log; written to <team>/land/slow-compile.md (worst first, one row per site) and, when
-    sites are new since the last report, a NOTE to the orchestrator. Code to review for compile speed, not failures."""
+    sites are new to the code (slow_new), a NOTE to the orchestrator. Code to review for compile speed, not failures."""
     r = ssh(a, f"grep -h 'ms to type-check' ~/land-check-logs/{h}.log 2>/dev/null | sort -u", timeout=300)
     sites = {}
     root = a["path"].rstrip("/").replace("~", "")
@@ -3362,22 +3940,32 @@ def slow_report(team, a, h):
                 break
         key = (path, int(m["line"]), m["what"])
         sites[key] = max(sites.get(key, 0), int(m["ms"]))
-    old_p = team.dir / "slow-compile.json"
-    old = {tuple(x[:3]) for x in json.loads(old_p.read_text())} if old_p.exists() else set()
+    prev, prev_rows, reported, seen = slow_previous(team, h)
     rows = sorted(([*k, v] for k, v in sites.items()), key=lambda x: -x[3])
-    old_p.write_text(json.dumps(rows) + "\n")
+    new = slow_new(rows, prev_rows, reported, slow_changed(team, prev, h), seen)
+    reported |= {slow_site(*r[:3]) for r in new}
+    seen |= {slow_site(*r[:3]) for r in rows}
+    (team.dir / "slow-compile.json").write_text(json.dumps({
+        "commit": h, "rows": rows, "reported": sorted(map(list, reported), key=str),
+        "seen": sorted(map(list, seen), key=str)}) + "\n")
+
+    def table(rs):
+        return ["| ms | Zone | Where | What |", "|---|---|---|---|"] + [
+            f"| {ms} | {zone_of_file(team, path) or '-'} | `{path}:{ln}` | {what} |" for path, ln, what, ms in rs]
     lines = [f"# Slow to compile: Swift code over {a.get('slow_ms')} ms to type-check",
              f"", f"Validation of landing {h[:10]} on the remote machine, {now()}. Review these for compile speed; "
-             "they are not failures.", "", "| ms | Zone | Where | What |", "|---|---|---|---|"]
-    for path, ln, what, ms in rows:
-        lines.append(f"| {ms} | {zone_of_file(team, path) or '-'} | `{path}:{ln}` | {what} |")
-    (team.dir / "slow-compile.md").write_text("\n".join(lines) + "\n")
-    new = [r_ for r_ in rows if tuple(r_[:3]) not in old]
+             "they are not failures.", ""]
+    if new:
+        lines += [f"## New to the code ({len(new)})", "", "In a file changed since the last survey"
+                  + (f" ({prev[:10]})" if prev else "") + " and not over the line in it, or over the line in two "
+                  "surveys running for the first time.", "", *table(new), "", f"## All ({len(rows)})", ""]
+    (team.dir / "slow-compile.md").write_text("\n".join(lines + table(rows)) + "\n")
     if new:
         top = "; ".join(f"{p}:{l} {w} {m}ms" for p, l, w, m in new[:5])
         team.notify(team.c("orchestrator", "orc"), "NOTE",
-                    f"Slow-compile survey (remote validation {h[:10]}): {len(new)} new Swift site(s) over "
-                    f"{a.get('slow_ms')} ms to type-check, {len(rows)} in all. Worst new: {top}. Report: "
+                    f"Slow-compile survey (remote validation {h[:10]}): {len(new)} Swift site(s) new to the code "
+                    f"over {a.get('slow_ms')} ms to type-check (in a file changed since the last survey, or over in "
+                    f"two surveys running), {len(rows)} in all. Worst new: {top}. Report: "
                     f"{team.dir / 'slow-compile.md'}. Route each to its zone as review work when it suits.")
 
 
@@ -3400,7 +3988,8 @@ def stage6_target(team: Team) -> str | None:
         if T is not None and (move is None or "done" not in move):
             return None
         try:
-            return rechecked_commit(commits, [row["M"] for row in rows if "done" not in row], T, ancestry(team))
+            return rechecked_commit(commits, [row["M"] for row in rows if "done" not in row], T, ancestry(team),
+                                    set_inner_commits(team))
         except PromotionRefused as ex:
             # Undecidable ancestry holds validation; raised, it would end the runner and launchd would loop it.
             print(f"Stage 6 holds: {ex}", file=sys.stderr, flush=True)
@@ -3408,11 +3997,12 @@ def stage6_target(team: Team) -> str | None:
 
 
 def rechecked_commit(commits: list[str], pending: list[str], T: str | None,
-                     is_ancestor: Callable[[str, str], bool]) -> str | None:
+                     is_ancestor: Callable[[str, str], bool], inner: set[str] = frozenset()) -> str | None:
+    """The newest landing commit with no pending recheck at or before it; never one inside a --with set."""
     for C in commits:
         if T is not None and not is_ancestor(T, C):
             break
-        if not any(is_ancestor(M, C) for M in pending):
+        if C not in inner and not any(is_ancestor(M, C) for M in pending):
             return C
         if C == T:
             break
@@ -3482,7 +4072,8 @@ def open_validation_finding(team: Team, C: str, test: dict, when: str) -> None:
     save_findings(team, "validation", items)
     team.notify(team.c("orchestrator", "orc") if zone == "orc" else f"Coord-{zone}", "REQUEST",
                 f"FIX-FORWARD {fid} | zone {zone} | test {test['name']} | C {C[:10]} | {what}. "
-                f"Route as a work order; it lands with codeteam-land {team.manifest} land <wo> --fixes {fid}")
+                f"Route as a work order; it lands with codeteam-land {team.manifest} land <wo> --fixes {fid}."
+                + landing_fix_note(team, C))
 
 
 def apply_validation_findings(team: Team, C: str, tests: list[dict], when: str) -> None:
@@ -3521,8 +4112,10 @@ def df_free_gib(text: str) -> float | None:
 
 
 def floor_clean_command(path: str, keep: list[str]) -> str:
-    excludes = " ".join(shlex.quote(f":!{entry}") for entry in [".codegraph", *keep])
-    return f"cd {clone_shell_path(path)} && git clean -q -f -d -X -- . {excludes}"
+    # A negated ignore rule makes a kept folder not-ignored, so -X leaves it. An exclude pathspec (":!path") does not:
+    # git clean -d removes an ignored folder whole (2026-11-11: a model's weights went).
+    keeps = " ".join(f"-e {shlex.quote('!/' + entry.strip('/'))}" for entry in [".codegraph", *keep])
+    return f"cd {clone_shell_path(path)} && git clean -q -f -d -X {keeps} -- ."
 
 
 def disk_check(team: Team, a: dict) -> dict:
@@ -3559,9 +4152,39 @@ def remote_failure_lines(a: dict, C: str) -> str:
     return r.stdout if r.returncode in (0, 1) else ""
 
 
+FAILING_TEST_LINES = (
+    re.compile(r"^test (\S+) \.\.\. FAILED$"),                              # Rust (cargo test, nextest's libtest)
+    re.compile(r"Test Case '-\[(\S+) (\S+)\]' failed \("),                  # XCTest
+    re.compile(r"Test case '([^']+)' failed"),                              # xcodebuild's per-case line
+    re.compile(r"FAILED (\S+::\S+)"),                                       # pytest's summary
+)
+SWIFT_TESTING_FAILED = re.compile(r"(?:^|\s)Test (.+?) failed after [\d.]+ seconds")
+
+
 def failing_test_names(text: str) -> list[str]:
-    return list(dict.fromkeys(m[1] for line in text.splitlines()
-                              if (m := re.fullmatch(r"test (\S+) \.\.\. FAILED", line.strip()))))
+    """The failing tests a test log names, in order, once each: Rust, XCTest, pytest, and Swift tests from xcodebuild's
+    'Failing tests:' list or, when a log has none, Swift Testing's 'Test x failed after' lines (whose glyph prefix
+    differs between swift test and xcodebuild)."""
+    names, listed, swift = [], [], []
+    in_list = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_list:
+            if stripped and line[:1].isspace():
+                listed.append(stripped)
+                continue
+            in_list = False
+        if stripped == "Failing tests:":
+            in_list = True
+            continue
+        for pattern in FAILING_TEST_LINES:
+            if m := pattern.search(stripped):
+                names.append(".".join(m.groups()))
+                break
+        else:
+            if (m := SWIFT_TESTING_FAILED.search(stripped)) and not m[1].startswith("run with "):
+                swift.append(m[1])
+    return list(dict.fromkeys(names + (listed or swift)))
 
 
 def validation_test_rows(team: Team, a: dict, C: str, res: dict) -> list[dict]:
@@ -3774,9 +4397,10 @@ def promotion_stamp(team: Team, h: str, base: str) -> None:
     try:
         stamp = stamp_docs(team, h, base)
     except (SystemExit, Exception) as ex:
-        message = f"Document stamp failed for {h}: {type(ex).__name__}: {ex}; promoted without a stamp."
+        why = str(ex) if isinstance(ex, StampFailed) else f"{type(ex).__name__}: {ex} (the reason is in validate-run.log)"
+        message = f"Document stamp failed for {h}: {why}\nPromoted without a stamp; its documents stay owed to the next one."
         print(message, file=sys.stderr)
-        team.notify(team.c("orchestrator", "orc"), "NOTE", message)
+        team.notify(team.c("orchestrator", "orc"), "NOTE", " | ".join(x.strip() for x in message.splitlines() if x.strip()))
         return
     if stamp:
         print(f"Document stamp {stamp} queued for landing; it reaches base with a later promotion.", file=sys.stderr)
@@ -3805,6 +4429,8 @@ def check_promotion(team: Team, C: str) -> None:
     T = move_tip(team)
     if T is not None and C != T and not ancestry(team)(T, C):
         raise PromotionRefused(f"{C} is before the v5.4 move-over tip {T}")
+    if C in set_inner_commits(team):
+        raise PromotionRefused(f"{C[:10]} is inside a --with set's landing; only the set's last commit holds all of it")
     if not stage6_passed(stage_rows(team, validation_rows(team), T), C):
         raise PromotionRefused(f"{C} has no passing Stage 6 validation; every test must pass")
     if blocked := unfixed_failures(C, all_findings(team), landed_hashes(team), ancestry(team)):
@@ -3872,9 +4498,9 @@ def promotion_target(team: Team) -> str | None:
     T = move_tip(team)
     rows = stage_rows(team, validation_rows(team), T)
     is_ancestor = ancestry(team)
-    findings, landed = list(all_findings(team)), landed_hashes(team)
+    findings, landed, inner = list(all_findings(team)), landed_hashes(team), set_inner_commits(team)
     return next((row["commit"] for row in reversed(rows)
-                 if (T is None or row["commit"] == T or is_ancestor(T, row["commit"]))
+                 if row["commit"] not in inner and (T is None or row["commit"] == T or is_ancestor(T, row["commit"]))
                  and stage6_passed(rows, row["commit"]) and is_ancestor(row["commit"], team.landing)
                  and not unfixed_failures(row["commit"], findings, landed, is_ancestor)), None)
 
@@ -3900,14 +4526,26 @@ def restart_lock(qdir: Path) -> Iterator[Path]:
 
 
 @contextmanager
-def stage_admit(stage: str, name: str, qdir: Path | None = None) -> Iterator[None]:
+def stage_admit(stage: str, name: str, qdir: Path | None = None,
+                holds: tuple[str, list[str]] | None = None) -> Iterator[None]:
+    """Admit a stage run unless a build queue restart is pending. holds=(team key, work orders): the run works in those
+    work orders' trees and records, so it is refused while a live run of the same team holds any of them (a second land of a work order mid Stage 2 read the set's merge in its tree and was refused for
+    another member's files)."""
     with restart_lock(qdir if qdir is not None else buildq_dir()) as rdir:
         if (rdir / "buildq.json").exists():
             raise RestartPending
         stages = rdir / "stages"
         stages.mkdir(exist_ok=True)
+        row = {"stage": stage, "name": name, "pid": os.getpid(), "started": now()}
+        if holds:
+            for other in stage_holders(rdir, *holds):
+                wo = next(w for w in holds[1] if w in other["wos"])
+                die(f"{wo}: a land of it is already running (pid {other['pid']}, {other['stage']} {other['name']}, "
+                    f"since {other['started']}). Its tree stays on that run's merge until it ends: wait for its result, "
+                    f"or stop it with `kill -TERM {other['pid']}` (never -9), which puts the tree back on its branch.")
+            row.update(team=holds[0], wos=list(holds[1]))
         path = stages / f"{os.getpid()}-{next(_stage_sequence)}.json"
-        path.write_text(json.dumps({"stage": stage, "name": name, "pid": os.getpid(), "started": now()}) + "\n")
+        path.write_text(json.dumps(row) + "\n")
     # Admission protects the whole run; the flock protects only its check-and-write.
     try:
         yield
@@ -3923,6 +4561,31 @@ def stage_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def stage_wos(row: dict) -> list[str]:
+    """The work orders a stage record holds: its wos, or, for a land recorded by an older version (no team, no wos), the names
+    in its Stage 2 name "check of a, b" (the next land puts a set merge back, so such a land must hold too)."""
+    if "wos" in row:
+        return row["wos"]
+    name = row.get("name", "")
+    return name.removeprefix("check of ").split(", ") if row.get("stage") == "Stage 2" and name.startswith("check of ") \
+        else []
+
+
+def stage_holders(rdir: Path, team_key: str, wos: list[str], alive: Callable[[int], bool] = stage_alive) -> list[dict]:
+    """The live admissions of other processes for team_key that hold any of wos; a dead one is skipped and left for
+    live_stages to remove. A record from an older version has no team and counts for every team."""
+    held = []
+    for path in sorted((rdir / "stages").glob("*.json")):
+        try:
+            row = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue                    # A stage may finish during the scan.
+        if (row.get("team", team_key) == team_key and row["pid"] != os.getpid() and set(stage_wos(row)) & set(wos)
+                and alive(row["pid"])):
+            held.append(row)
+    return held
 
 
 def live_stages(rdir: Path, alive: Callable[[int], bool] = stage_alive) -> list[str]:
@@ -4125,16 +4788,18 @@ def after_promote(team: Team, old: str, new: str) -> None:
 
 
 def runner_restart(team: Team, command: str, job: tuple[float, Callable[[], str]] | None = None) -> bool:
-    """At a whole-stage boundary, consume a request and let launchd's KeepAlive load the new program."""
+    """At a whole-stage boundary, consume a request and let launchd's KeepAlive load the new program. The line goes to
+    the runner's own log (<land>/<command>.log), not to the orchestrator: a routine restart asks nothing of it, and
+    the watchdog reports a runner that does not come back (three NOTEs to every team for each
+    move of codeteam's main, labelled with the team's base as if its own main had moved)."""
     path = team.dir / "restart" / f"{command}.json"
     if not path.exists():
         return False
     request = json.loads(path.read_text())
     waited = job[1]() if job is not None and job[0] < request["requested_ts"] else "it had no job running"
     runner = {"queue-run": "land", "recheck-run": "recheck", "validate-run": "validate"}[command]
-    team.notify(team.c("orchestrator", "orc"), "NOTE",
-                f"Restarted {LAUNCHD_PREFIX}.codeteam-{runner}.{team.manifest.stem} for {team.m.get('base', 'main')} "
-                f"{request['tip'][:10]}; waited for: {waited}")
+    print(f"{now()} restarting {LAUNCHD_PREFIX}.codeteam-{runner}.{team.manifest.stem}: codeteam's landing tool changed "
+          f"(codeteam {request['tip'][:10]}); waited for: {waited}", flush=True)
     path.unlink()
     return True
 
@@ -4651,10 +5316,38 @@ UNION_MARK = "# codeteam: append-only logs merge by union"
 UNION_END = "# codeteam: end of append-only logs"
 
 
-def install_union_logs(common):
+def union_family(pattern: str) -> str:
+    """The append-only log family a path pattern names, by its last component: CHANGELOG, DECISIONS, or ""."""
+    name = pattern.rstrip("/").rsplit("/", 1)[-1].upper()
+    return next((fam for fam in ("CHANGELOG", "DECISIONS") if fam in name), "")
+
+
+def product_union_families(team) -> set[str]:
+    """The log families the product's own tracked .gitattributes (on integration, else the base) gives a merge
+    attribute. The product decides how those merge; codeteam's info/attributes, which outranks .gitattributes, leaves
+    them alone (one product keeps its root release notes, generated plugin log and per-document
+    changelogs out of union, and codeteam's CHANGELOG.md and *_CHANGELOG.md lines overrode that in every worktree)."""
+    for ref in (team.integration, team.m.get("base", "main")):
+        r = git(team.repo, "show", f"{ref}:.gitattributes", check=False)
+        if r.returncode == 0:
+            break
+    else:
+        return set()
+    out = set()
+    for line in (r.stdout or "").splitlines():
+        words = line.split()
+        if len(words) < 2 or words[0].startswith("#"):
+            continue
+        if any(w.lstrip("-!") == "merge" or w.startswith("merge=") for w in words[1:]):
+            out.add(union_family(words[0]))
+    return out - {""}
+
+
+def install_union_logs(common, decided=frozenset()):
     """Append-only logs merge by union in every worktree (info/ is shared), so two work orders that each add an entry
     never clash (a shared decisions log once bounced six landings in a morning). The block is rewritten
-    each time, so a change to UNION_LOGS reaches teams that have the old list."""
+    each time, so a change to UNION_LOGS reaches teams that have the old list. A family in `decided` (the product's
+    own .gitattributes sets its merge, product_union_families) is left out of the block."""
     f = common / "info" / "attributes"
     f.parent.mkdir(parents=True, exist_ok=True)
     ours = {f"{p} merge=union" for p in (*UNION_LOGS, "RULINGS.md")}   # every pattern codeteam ever wrote
@@ -4672,12 +5365,13 @@ def install_union_logs(common):
         inside = inside and line in ours
         keep.append(line)
     f.write_text("".join(x + "\n" for x in keep) + UNION_MARK + ", so two work orders adding entries never clash\n"
-                 + "".join(f"{p} merge=union\n" for p in UNION_LOGS) + UNION_END + "\n")
+                 + "".join(f"{p} merge=union\n" for p in UNION_LOGS if union_family(p) not in decided)
+                 + UNION_END + "\n")
 
 
 def cmd_install_hook(team, a):
     common = Path(out(team.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    install_union_logs(common)
+    install_union_logs(common, product_union_families(team))
     h = common / "codeteam-land-guard"
     refs = guarded_refs(team)
     allowed = " ".join(team.c("allow_committers", []))
@@ -4736,6 +5430,8 @@ def main(argv):
     p = sp.add_parser("land-cancel"); p.add_argument("wo"); p.add_argument("--reason", default=None)
     p = sp.add_parser("wo-retire"); p.add_argument("wo"); p.add_argument("--force", action="store_true")
     p.add_argument("--reason", default=None)
+    p = sp.add_parser("wo-hold"); p.add_argument("wo", nargs="?"); p.add_argument("--because")
+    p.add_argument("--release", action="store_true")
     p = sp.add_parser("revert"); p.add_argument("wo")
     sp.add_parser("install-hook")
     sp.add_parser("alpha-install")
@@ -4756,7 +5452,7 @@ def main(argv):
      "queue-run": cmd_queue_run, "recheck-run": cmd_recheck_run, "land-one": cmd_land_one, "land-hold": cmd_land_hold, "land-next": cmd_land_next, "wo-tag": cmd_wo_tag, "feature-done": cmd_feature_done,
      "finding": cmd_finding, "findings": cmd_findings, "finding-drop": cmd_finding_drop, "reviewed": cmd_reviewed,
      "first-time": cmd_first_time, "layers": cmd_layers,
-     "land-cancel": cmd_land_cancel, "wo-retire": cmd_wo_retire,
+     "land-cancel": cmd_land_cancel, "wo-retire": cmd_wo_retire, "wo-hold": cmd_wo_hold,
      "revert": cmd_revert, "install-hook": cmd_install_hook, "alpha-install": cmd_alpha_install,
      "alpha-bisect": cmd_alpha_bisect,
      "validate-run": cmd_validate_run, "promote": cmd_promote, "migrate": cmd_migrate, "service": cmd_service,

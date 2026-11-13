@@ -4977,5 +4977,35 @@ class BroadcastCollectTests(unittest.TestCase):
         self.assertIsNone(lane.get("oldest_mail_s"))
 
 
+class TeamManifestsTest(unittest.TestCase):
+    """The deck shows a team whose manifest lives in its own repo, beside production's teams/."""
+
+    def setUp(self):
+        from codeteam2.deck import collect
+        self.c = collect
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.home, self.workspace = self.root / "codeteam", self.root / "work"
+        for rel in ("codeteam/teams/acme.toml", "codeteam/teams/codeteam.toml",
+                    "work/team-codeteam-next/design/codeteam-next/teams/codeteam-next.toml",
+                    "work/team-codeteam-next/design/codeteam-next/teams/acme.toml",
+                    "work/team-codeteam/design/codeteam-maint/teams/codeteam.toml",
+                    "work/team-acme/design/acme/README.md", "work/team-gauges/team/notes.txt"):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text("")
+
+    def manifests(self, teams_dir=None):
+        return [str(p.relative_to(self.root)) for p in
+                self.c.team_manifests(teams_dir, home=self.home, workspace=self.workspace)]
+
+    def test_a_team_keeping_its_own_manifest_is_shown_and_production_wins_a_name(self):
+        self.assertEqual(self.manifests(), ["codeteam/teams/acme.toml", "codeteam/teams/codeteam.toml",
+                                            "work/team-codeteam-next/design/codeteam-next/teams/codeteam-next.toml"])
+
+    def test_a_fixture_folder_is_all_a_test_sees(self):
+        self.assertEqual(self.manifests(self.home / "teams"), ["codeteam/teams/acme.toml", "codeteam/teams/codeteam.toml"])
+
+
 if __name__ == "__main__":
     unittest.main()

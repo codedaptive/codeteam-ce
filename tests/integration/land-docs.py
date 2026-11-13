@@ -139,6 +139,7 @@ notify = "echo {{kind}} {{to}} {{text}} >> {W / 'notify.log'}"
 owner_notify = "true"
 [land.docs]
 enabled = true
+after = "git ls-files docs/reference > docs/tracked.txt"
 ''')
 land("install-hook")
 notes = lambda: (W / "notify.log").read_text() if (W / "notify.log").exists() else ""
@@ -229,6 +230,10 @@ t("a document that is new since the last promotion keeps the version it came wit
 log = main("docs/reference/A_CHANGELOG.md")
 t("the zone's changelog file has one heading for the promotion with each work order's entry",
   log.count(f"## 2.0.0 -- {TODAY}") == 1 and "- ifaceonly: Interface: say what open returns" in log and "- rm: " in log, log[-600:])
+t("the after step sees the changelog file the stamp creates (make public-docs copies tracked files only)",
+  "docs/reference/A_CHANGELOG.md" in main("docs/tracked.txt"), main("docs/tracked.txt"))
+t("the changelog header names no tool: it ships with the product",
+  "Written at each promotion; never edited by hand." in log and "codeteam" not in log.split("## ", 1)[0], log[:300])
 t("Kong's line is the entry when he has written one", "add: write() joins the public API." in log and "- add: add" not in log, log[-600:])
 t("the documents keep no Changelog section; the old entries moved to the file",
   "## Changelog" not in main(SPEC) and "Earlier entries, moved from A_SPEC.md" in log and "Old entry." in log, main(SPEC)[-200:])
@@ -264,6 +269,61 @@ t("Swift member names and a TOML table name are not read as missing files",
   notes().count("naming files that do not exist") == n_notes, notes()[-300:])
 t("a missing file is reported to the zone; a file name, or a path with any line number, is enough",
   "gone.swift" in line and "b.swift" not in line and "a.swift" not in line.replace("gone.swift", ""), line)
+
+print("== a Doc-Level declaration alone lands; a failed stamp says why and leaves its documents owed")
+THIRD = "A/docs/third.md"
+if sh("git rev-parse landing").stdout != sh("git rev-parse integration").stdout:
+    promote(stamp=False)
+n0 = gates()
+trees = {name: Path(land("wo-cut", "A", name).stdout.strip()) for name in ("empty", "declare", "late2")}
+third = trees["late2"] / THIRD
+third.write_text(third.read_text().replace("Changed.", "Changed again."))
+for name, body in (("empty", "Nothing at all"), ("declare", "Guide: its level\n\nDoc-Level: A/docs/guide.md minor"),
+                   ("late2", "Third again\n\nDoc-Level: A/docs/third.md minor")):
+    (trees[name] / ".msg").write_text(body)
+    sh("git add -A . ':!.msg' && git -c user.email=t@t -c user.name=l commit --trailer 'Agent: repo-orchestrator' --trailer 'Model: claude-opus-5-5' --trailer 'Effort: xhigh' --trailer 'Worktree: main' -q --allow-empty -F .msg && rm .msg",
+       cwd=trees[name])
+r = land("land", "empty")
+t("a work order with no change and no Doc-Level line is refused", r.returncode != 0 and "nothing to land" in r.stderr,
+  r.stdout + r.stderr)
+land("wo-retire", "empty", "--force")
+r = land("land", "declare")
+t("a work order whose only commit states a document's level lands", r.returncode == 0, r.stdout + r.stderr)
+run_queue()
+t("it runs no build and no tests", gates() == n0, (n0, gates()))
+t("its level is recorded for the next stamp", level("declare", GUIDE) == "minor", pending())
+land("land", "late2")
+run_queue()
+pf.write_text("".join(l + "\n" for l in pf.read_text().splitlines() if '"wo": "late2"' not in l))   # a late row
+toml = (W / "team.toml").read_text()
+(W / "team.toml").write_text(toml.replace('after = "git ls-files docs/reference > docs/tracked.txt"',
+                                          'after = "echo names private docs path docs/RULINGS.md >&2; exit 3"'))
+with (ROOT / "land" / "validation-results.jsonl").open("a") as f:
+    f.write(json.dumps({"time": "now", "commit": sh("git rev-parse landing").stdout.strip(), "result": "pass",
+                        "seconds": 1, "tests": [{"name": "suite", "result": "pass", "seconds": 1}]}) + "\n")
+r = promote()
+t("a failed after step stops the stamp and the report gives its exit and output",
+  "Document stamp failed" in r.stderr and "exited 3" in r.stderr and "docs/RULINGS.md" in r.stderr, r.stderr[-600:])
+# 2026-11-12: the refused line came from Kong's changelog entry file, which the report did not name.
+t("the report names where each changelog entry came from",
+  "late2 (its first commit subject)" in r.stderr and "Reword the one the refusal names" in r.stderr, r.stderr[-900:])
+t("the promotion still happens", sh("git rev-parse main").stdout == sh("git rev-parse landing").stdout)
+left = [p.name for p in (ROOT / "land" / "wo").glob("docs-stamp-*.json") if not p.name.endswith((".landed.json", ".retired.json"))]
+t("the failed stamp's work order is retired, not left open", left == [], left)
+t("its late row stays owed", level("late2", THIRD) == "minor" and level("declare", GUIDE) == "minor", pending())
+(W / "team.toml").write_text(toml)
+before = (ver(THIRD), ver(GUIDE))
+wo("nudge", {"A/notes.md": "# Notes, ungoverned\nnudge\n"})
+run_queue()
+for _ in range(2):
+    with (ROOT / "land" / "validation-results.jsonl").open("a") as f:
+        f.write(json.dumps({"time": "now", "commit": sh("git rev-parse landing").stdout.strip(), "result": "pass",
+                            "seconds": 1, "tests": [{"name": "suite", "result": "pass", "seconds": 1}]}) + "\n")
+    promote()
+    run_queue()
+t("the next promotion stamps what the failed one owed", before == ("2.0.0", "4.0.1") and ver(THIRD) == "2.1.0"
+  and ver(GUIDE) == "4.1.0", (before, ver(THIRD), ver(GUIDE)))
+t("nothing is left pending after it", pending() == [], pending())
 
 print(f"\n{'all passed' if not fails else f'{fails} failed'}  ({W})")
 sys.exit(1 if fails else 0)

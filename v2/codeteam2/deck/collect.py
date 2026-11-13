@@ -1716,9 +1716,26 @@ def _line_matches(seen, pid, p, watched):
     return known
 
 
+def team_manifests(teams_dir=None, *, home=None, workspace=None):
+    """The manifests the deck shows, by team name. With teams_dir (a test's fixture), its *.toml only. Otherwise
+    production's teams/*.toml, plus the manifest of each team-<x> in the workspace that keeps its own in its repo,
+    design/*/teams/<x>.toml, and has none in teams/. That is the watchdog's rule: a team whose manifest lives
+    in its own clone was once missing from the deck."""
+    if teams_dir is not None:
+        return sorted(Path(teams_dir).glob("*.toml"))
+    found = {p.stem: p for p in sorted(Path(home or CT_HOME).joinpath("teams").glob("*.toml"))}
+    for folder in sorted(Path(workspace or WORKSPACE).glob("team-*")):
+        name = folder.name.removeprefix("team-")
+        if name not in found:
+            own = sorted(folder.glob(f"design/*/teams/{name}.toml"))
+            if own:
+                found[name] = own[0]
+    return [found[name] for name in sorted(found)]
+
+
 def collect(names=(), *, teams_dir=None, now=None, herdr=None, ps_text=None, queue_dir=None,
             queue_conf=None, metrics_dir=None, projects_dir=None, cache=None, thresholds=None, disk=None):
-    """One snapshot of the named teams (all of teams_dir/*.toml when none are named) with model.derive's flags and
+    """One snapshot of the named teams (all of team_manifests(teams_dir) when none are named) with model.derive's flags and
     alerts. Every directory defaults to the live one; tests over a fixture pass their own. disk is a
     DiskScanner.result(): its entry for a team replaces what the team's disk.json says (and gives a team with no
     v2 folder its disk). ps (when its 5 s interval is due), and the pane and agent lists of the default herdr session
@@ -1743,8 +1760,7 @@ def collect(names=(), *, teams_dir=None, now=None, herdr=None, ps_text=None, que
         ps_job = pool.submit(_read_ps, ps_text) if ps_text is not None else \
             ctx.cache.every("ps", now, 5, lambda: pool.submit(_read_ps, None))
         _start_herdr(ctx, DEFAULT_HERDR_SESSION)
-        manifests = sorted(Path(teams_dir or CT_HOME / "teams").glob("*.toml"))
-        teams = [_team_row(ctx, p) for p in manifests if not names or p.stem in names]
+        teams = [_team_row(ctx, p) for p in team_manifests(teams_dir) if not names or p.stem in names]
         ps, ps_error = ps_job.result()
         if ps_error:
             errors.append(ps_error)

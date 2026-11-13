@@ -149,4 +149,27 @@ rc=$?
 errors="$(record_check dotted-i BROKEN 'No space left on device')"
 if [ "$rc" -eq 1 ] && [ -z "$errors" ]; then ok "8 dotted-i signature"; else bad "8 dotted-i signature" "exit $rc; $errors"; fi
 
+# 9. A package graph that never resolved is BROKEN too, and runs again.
+for n in 1 2; do
+  out="$(cd "$repo" && env -i PATH=/opt/homebrew/bin:/usr/bin:/bin HOME="$tmp" \
+    "$here/bin/zone-tool" test --cached --key resolve -- sh -c 'echo x >> "$1"; echo "xcodebuild: error: Could not resolve package dependencies:"; exit 74' sh "$tmp/resolve-count")"
+  rc=$?
+done
+count="$(wc -l < "$tmp/resolve-count" | tr -d ' ')"
+result="$("$py" -I -c '
+import json, pathlib, sys
+for p in pathlib.Path(sys.argv[1]).glob(".test-record-*.json"):
+    r = json.loads(p.read_text())
+    if r.get("key") == "resolve":
+        print(r.get("result"), r.get("reason", "")[:40])' "$repo")"
+if [ "$rc" -eq 74 ] && [ "$count" = 2 ] && [[ "$result" == "BROKEN package resolution: "* ]] && [[ "$out" == *'zone-test: BROKEN (package resolution)'* ]]; then
+  ok "9 package resolution is BROKEN and reruns"
+else bad "9 package resolution" "exit $rc, runs $count (want 2), record [$result], stdout [$out]"; fi
+
+# 10. xcodebuild refusing a build database another build holds is BROKEN too.
+out="$(cd "$repo" && env -i PATH=/opt/homebrew/bin:/usr/bin:/bin HOME="$tmp" \
+  "$here/bin/zone-tool" test --cached --key builddb -- sh -c 'echo "error: unable to attach DB: database is locked Possibly there are two concurrent builds running in the same filesystem location."; exit 65')"
+rc=$?
+case "$out" in *'zone-test: BROKEN (build database in use)'*) ok "10 build database in use is BROKEN" ;; *) bad "10 build database" "exit $rc, stdout [$out]" ;; esac
+
 exit "$fail"
