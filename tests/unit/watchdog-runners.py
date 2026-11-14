@@ -108,7 +108,8 @@ class RunnerProblemsTests(unittest.TestCase):
                   patch.object(self.watchdog.subprocess, "run", return_value=SimpleNamespace(returncode=0,
                                                                                              stdout="state = running")),
                   patch.object(self.watchdog, "notify") as notify, patch.object(self.watchdog, "sweep_queue"),
-                  patch.object(self.watchdog, "sweep_disk"), contextlib.redirect_stdout(io.StringIO())):
+                  patch.object(self.watchdog, "disk_emergency"), patch.object(self.watchdog, "sweep_disk"),
+                  contextlib.redirect_stdout(io.StringIO())):
                 self.watchdog.check()
             self.assertEqual([call.args[1] for call in notify.call_args_list], problems)
             self.assertEqual(set(json.loads(state.read_text())),
@@ -138,10 +139,11 @@ class FullDiskTests(unittest.TestCase):
             with (patch.object(watchdog, "TEAMS", Path(tmp)), patch.object(watchdog, "STATE", FullState(Path(tmp))),
                   patch.object(watchdog, "WORKSPACE", Path(tmp)),
                   patch.object(watchdog, "sweep_queue", side_effect=lambda: ran.append("queue")),
+                  patch.object(watchdog, "disk_emergency", side_effect=lambda: ran.append("emergency")),
                   patch.object(watchdog, "sweep_disk", side_effect=lambda: ran.append("disk")),
                   contextlib.redirect_stdout(out)):
                 watchdog.check()
-        self.assertEqual(ran, ["queue", "disk"])
+        self.assertEqual(ran, ["queue", "emergency", "disk"])
         self.assertIn("failed: OSError: [Errno 28] No space left on device", out.getvalue())
 
     def test_a_failing_floor_does_not_stop_the_team_checks(self):
@@ -151,7 +153,7 @@ class FullDiskTests(unittest.TestCase):
             out = io.StringIO()
             with (patch.object(watchdog, "TEAMS", Path(tmp)), patch.object(watchdog, "STATE", state),
                   patch.object(watchdog, "WORKSPACE", Path(tmp)),
-                  patch.object(watchdog, "sweep_queue"),
+                  patch.object(watchdog, "sweep_queue"), patch.object(watchdog, "disk_emergency"),
                   patch.object(watchdog, "sweep_disk", side_effect=OSError(28, "No space left on device")),
                   contextlib.redirect_stdout(out)):
                 watchdog.check()
@@ -242,6 +244,89 @@ class LandCloneFloorTests(unittest.TestCase):
             self.assertFalse((root / "land" / "itest" / "target").exists())
             self.assertTrue((root / "land" / "validate" / "target").is_dir(), "Stage 6 holds the validate clone")
             self.assertTrue((root / "land" / "itest" / ".." / "itest").is_dir(), "the clone itself stays")
+
+
+class RunsFromTests(unittest.TestCase):
+    """A team whose loop and landing runners another checkout runs: the watchdog starts its dead loop
+    with that checkout's codeteam2 on that checkout's manifest, never this one's, and leaves its landing clones,
+    whose Stage 5 and 6 records that checkout keeps, alone."""
+
+    def setUp(self):
+        self.watchdog, _ = load_watchdog()
+
+    def agents(self, root, args):
+        import plistlib
+        agents = root / "agents"
+        agents.mkdir()
+        job = agents / f"{self.watchdog.LAUNCHD_PREFIX}.codeteam-land.t.plist"
+        job.write_bytes(plistlib.dumps({"ProgramArguments": args}))
+        return agents
+
+    def test_runs_from_reads_the_land_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            other = root / "jj"
+            agents = self.agents(root, ["/py", str(other / "bin" / "codeteam-land"), str(other / "teams" / "t.toml"),
+                                        "queue-run"])
+            self.assertEqual(self.watchdog.runs_from("t", agents), (other, other / "teams" / "t.toml"))
+            self.assertIsNone(self.watchdog.runs_from("none", agents))
+            (agents / f"{self.watchdog.LAUNCHD_PREFIX}.codeteam-land.bad.plist").write_text("not a plist")
+            self.assertIsNone(self.watchdog.runs_from("bad", agents))
+
+    def test_runs_from_is_none_for_this_checkouts_own_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = self.agents(Path(tmp), ["/py", str(SCRIPT.parent / "codeteam-land"), "/x/teams/t.toml", "queue-run"])
+            self.assertIsNone(self.watchdog.runs_from("t", agents))
+
+    def test_a_dead_loop_starts_with_the_checkout_its_runners_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root, other = base / "team-t", base / "jj"
+            (root / "team" / "v2").mkdir(parents=True)
+            (root / "team" / "v2" / "up").touch()
+            (base / "teams").mkdir()
+            prod = base / "teams" / "t.toml"
+            prod.write_text(f'worktree_root = "{root}"\n')
+            (other / "teams").mkdir(parents=True)
+            theirs = other / "teams" / "t.toml"
+            theirs.write_text(f'worktree_root = "{root}"\n')
+            ran = []
+            for elsewhere, want in ((None, [str(SCRIPT.parent.parent / "v2" / "bin" / "codeteam2"), "ensure-loop", str(prod)]),
+                                    ((other, theirs), [str(other / "v2" / "bin" / "codeteam2"), "ensure-loop", str(theirs)])):
+                ran.clear()
+                with (patch.object(self.watchdog, "manifests", return_value=[prod]),
+                      patch.object(self.watchdog, "runs_from", return_value=elsewhere),
+                      patch.object(self.watchdog, "STATE", base / "state.json"),
+                      patch.object(self.watchdog, "notify"),
+                      patch.object(self.watchdog.subprocess, "run", side_effect=lambda argv, **kw: ran.append(argv)),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.watchdog.check_teams()
+                self.assertEqual(ran, [want])
+
+    def test_the_floor_leaves_another_checkouts_clones_and_queued_trees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            teams, q, root, other = base / "teams", base / "queue", base / "team-t", base / "jj"
+            teams.mkdir()
+            q.mkdir()
+            (teams / "t.toml").write_text(f'worktree_root = "{root}"\n[land]\nenabled = true\n')
+            (root / "land" / "itest" / "target").mkdir(parents=True)
+            for wo in ("busy", "idle"):
+                (root / "wo" / "A" / wo / "target").mkdir(parents=True)
+                (root / "wo" / "A" / wo / ".git").write_text("gitdir: x\n")
+            (other / "run" / "queue").mkdir(parents=True)
+            (other / "run" / "queue" / "1.json").write_text(json.dumps({"state": "running",
+                                                                        "worktree": str(root / "wo" / "A" / "busy")}))
+            with (patch.object(self.watchdog, "runs_from", return_value=(other, other / "teams" / "t.toml")),
+                  patch.object(self.watchdog, "last_active", return_value=0.0),
+                  patch.object(self.watchdog.subprocess, "Popen"), patch.object(self.watchdog, "notify"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                done = self.watchdog.sweep_disk(teams, q, min_gb=150, idle_s=1800, free=lambda: 20.0,
+                                                land_min_gb=53.7, workspace=base / "none")
+            self.assertEqual(len(done), 1, done)
+            self.assertIn(str(root / "wo" / "A" / "idle" / "target"), done[0])
+            self.assertTrue((root / "wo" / "A" / "busy" / "target").is_dir(), "a build in the other checkout's queue")
+            self.assertTrue((root / "land" / "itest" / "target").is_dir(), "the other checkout's landing clone")
 
 
 if __name__ == "__main__":

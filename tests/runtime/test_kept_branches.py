@@ -111,3 +111,32 @@ def test_branch_leftovers_excludes_landing_but_reports_stray(codeteam, monkeypat
 
     result = codeteam.branch_leftovers(team, LANES)
     assert result[extra_index] == ["scratch/x"]
+
+
+@pytest.mark.parametrize("v55,jj_repo", [(True, False), (False, True), (False, False)], ids=["v55", "jj-repo", "v54"])
+def test_branch_leftovers_leaves_a_v55_teams_zone_bookmarks_here_and_reports_them_on_github(codeteam, monkeypatch,
+                                                                                          tmp_path, v55, jj_repo):
+    # A v5.5 team once pushed two zone/* bookmarks on the patrol's word, and jj made the zones'
+    # squashes immutable. On a v5.5 team (the manifest's flag, or a colocated jj repository) a local zone/* is the
+    # zone's jj bookmark: not outside the rule, not unmirrored.
+    team = FakeTeam({"land": {"enabled": True, "v55": v55}})
+    team.repo = tmp_path
+    if jj_repo:
+        (tmp_path / ".jj").mkdir()
+    v55 = v55 or jj_repo
+
+    def fake_run(args, *, capture_output, text):
+        outputs = {
+            ("worktree", "list", "--porcelain"): f"worktree {tmp_path}\n",
+            ("for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads"):
+                "aaa main\nbbb zone/gitio\nccc zone/orc\nddd scratch/x\n",
+            ("ls-remote", "--heads", "origin"): "aaa\trefs/heads/main\nbbb\trefs/heads/zone/gitio\n",
+        }
+        return SimpleNamespace(stdout=outputs[tuple(args[3:])])
+
+    monkeypatch.setattr(codeteam.subprocess, "run", fake_run)
+
+    here, github, unmirrored, *_ = codeteam.branch_leftovers(team, LANES)
+    assert here == (["scratch/x"] if v55 else ["scratch/x", "zone/gitio", "zone/orc"])
+    assert github == ["zone/gitio"]
+    assert "zone/gitio" not in unmirrored and "zone/orc" not in unmirrored

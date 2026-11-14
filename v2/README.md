@@ -53,7 +53,7 @@ $V2/bin/codeteam2 up <manifest>          # workspace, roles, staff sessions, and
 $V2/bin/codeteam2 status <manifest>      # every session's real state and its mail
 $V2/bin/codeteam2 say <manifest> general Owner REQUEST Orc-<Team> "..."   # talk to the team
 $V2/bin/codeteam2 tail <manifest>        # follow the team's messages live
-$V2/bin/codeteam2 deck [teams...] [--json|--pane] [--no-motion]   # read-only live dashboard of every team
+$V2/bin/codeteam2 deck [teams...] [--json|--pane|--web [--port N]] [--no-motion]   # read-only live dashboard of every team
 herdr session attach codeteam            # watch it all live (ctrl+b q detaches; everything keeps running);
                                          # the sidebar names each pane (Coord-alpha) with its waiting mail
 $V2/bin/codeteam2 drop <manifest> <id...>   # take queued, held, or prompted-but-no-turn-yet messages out of

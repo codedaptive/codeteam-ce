@@ -12,8 +12,9 @@ facts instead of guesses:
   runtime commands (/compact, the resume line, /exit) always go alone;
 - a lane with mail that is not running is started, up to the lane cap; at the cap, a lane that
   has been idle longer than swap_idle_min with nothing waiting is sent /exit to make room, except a
-  lane the user put on hold (team/held/<key>), or one whose pane shows a subagent's view or whose input
-  box holds unsent text (it keeps its slot; the next idle lane goes instead);
+  lane the user put on hold (team/held/<key>), one whose pane shows a subagent's view or whose input
+  box holds unsent text, or one whose /exit was cancelled for its background work in the last BG_HOLD_S
+  (it keeps its slot; the next idle lane goes instead);
 - an agent blocked longer than blocked_alert_min is reported to the orchestrator (and the owner gets a
   herdr notification), once per episode;
 - nothing is typed into a session whose input box holds unsent text (someone is typing), or whose
@@ -66,6 +67,9 @@ LEAD_TAB = "orc"             # the orchestrator and designers' tab
 STAFF_TAB = "staff"          # the other standing sessions and the loop
 READY_STABLE_S = 12          # ready and quiet this long, well after its start: a session's first turn has run
 PANE_CLOSE_DELAY_S = 5    # after a stopped session exits, before its bare-shell pane is closed
+BG_HOLD_S = 600              # a session whose /exit was cancelled for its background work is not ended again for
+                             # this long (a lane's own land runs in the background, and an
+                             # hour's hold kept its slot long after the land ended while lanes with mail waited)
 REACT_S = 1.0                # cap the pause after a deferred planned action to re-observe sooner without spinning
 REACT_MAX = 10               # a failing acting call also stamps Herdr.last_action: repeated deferral could
                              # otherwise re-tick indefinitely; after this many quick pauses, sleep poll_s once
@@ -773,11 +777,12 @@ class Runtime:
         if "Background work is running" in screen and "Exit and stop tasks" in screen:
             rec = st.setdefault(s.key, {})
             if rec.get("stop_reason") in ("idle", "swap"):
-                # Ended only for idleness: its background work (a run, a build) matters more. Cancel the
-                # exit and leave it for an hour.
+                # Ended only for idleness: its background work (a run, a build, its own land) matters more.
+                # Cancel the exit and leave it for BG_HOLD_S.
                 self.herdr.agent_send_keys(s.agent, "esc")
-                rec.update({"stopping_at": None, "bg_until": ts() + 3600})
-                self.log(f"exit {s.display} cancelled: background work is running; left alone for an hour")
+                rec.update({"stopping_at": None, "bg_until": ts() + BG_HOLD_S})
+                self.log(f"exit {s.display} cancelled: background work is running; left alone for "
+                         f"{BG_HOLD_S // 60} min")
                 return
             self.herdr.agent_send_keys(s.agent, "enter")
             self.log(f"confirm exit {s.display}: background work stopped")
@@ -1255,11 +1260,25 @@ class Runtime:
                 out.append(b)
         return out
 
+    # The backup's one background job: the push (when there are branches), then v1's branch sweep (when CT_MANIFEST is
+    # set), whatever the push answered. $0 is a label; the refspecs are the arguments; CT_REPO, CT_V1 and CT_MANIFEST
+    # come in the environment. A branch gone since the list was made (a landing deleted it) is dropped first: one
+    # missing source refspec fails the whole push (2026-11-14: one team's docs-stamp branch, and none of 98 went).
+    PUSH_THEN_SWEEP = ('n=$#; while [ "$n" -gt 0 ]; do r=$1; shift; n=$((n - 1)); '
+                       'if git -C "$CT_REPO" rev-parse -q --verify "${r%%:*}" >/dev/null; then set -- "$@" "$r"; fi; '
+                       'done; '
+                       'if [ "$#" -gt 0 ]; then git -C "$CT_REPO" push --force origin "$@"; fi; '
+                       'if [ -n "$CT_MANIFEST" ]; then exec "$CT_V1" sweep-branches "$CT_MANIFEST"; fi')
+
     def backup(self, st, now):
         """Every backup_min (60), push the team's branches to GitHub in one background push, so each
         coordinator's commits are off the machine within the hour even when no codeteam command moved them
         (2026-10-27: 12 of one team's lane branches were 2 to 167 commits ahead of GitHub). v1's rules apply:
-        nothing when backup is off or there is no origin, force (the machine is the source of truth)."""
+        nothing when backup is off or there is no origin, force (the machine is the source of truth).
+        After the push, the same job runs v1's `sweep-branches`, which deletes landed branches here and on GitHub.
+        The loop can reach GitHub and cron cannot, so for a v2 team cron's `sweep` leaves branches to this job.
+        Only for a manifest in this checkout's teams/, the teams cron's sweep covered: a team whose manifest
+        is elsewhere runs its own repo's tools, and this checkout's sweep never deletes its branches."""
         every = getattr(self.team, "backup_min", 0)
         t = getattr(self.team, "t", None)
         if not every or not t or not getattr(t, "backup", False):
@@ -1269,20 +1288,26 @@ class Runtime:
             return
         meta["at"] = now
         try:
-            from .team import v1
+            from pathlib import Path
+            from .team import v1, CT_HOME
             if v1.git(str(t.repo), "remote", "get-url", "origin", check=False).returncode:
                 return
             branches = self.backup_branches()
-            if not branches:
+            sweep = Path(self.team.manifest).parent == CT_HOME / "teams"
+            if not branches and not sweep:
                 return
             import subprocess
+            then = ", then sweep-branches" if sweep else ""
             logf = open(self.team.dir / "backup.log", "a")
-            logf.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} push {len(branches)} branch(es)\n")
+            logf.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} push {len(branches)} branch(es){then}\n")
             logf.flush()
-            subprocess.Popen(["git", "-C", str(t.repo), "push", "--force", "origin",
-                              *[f"refs/heads/{b}:refs/heads/{b}" for b in branches]],
+            env = {**os.environ, "CT_REPO": str(t.repo), "CT_V1": str(CT_HOME / "bin" / "codeteam"),
+                   "CT_MANIFEST": str(self.team.manifest) if sweep else ""}
+            subprocess.Popen(["/bin/sh", "-c", self.PUSH_THEN_SWEEP, "backup",
+                              *[f"refs/heads/{b}:refs/heads/{b}" for b in branches]], env=env,
                              stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
-            self.log(f"backup: pushing {len(branches)} branch(es) to GitHub in the background (team/v2/backup.log)")
+            self.log(f"backup: pushing {len(branches)} branch(es) to GitHub{then}, in the background "
+                     f"(team/v2/backup.log)")
         except Exception as e:      # a backup must never stop the loop
             self.log(f"backup skipped: {type(e).__name__}: {e}")
 

@@ -1,10 +1,12 @@
-"""codeteam2 deck [teams...] [--json] [--pane] [--interval S] [--threshold K=V ...]
+"""codeteam2 deck [teams...] [--json] [--pane] [--web [--port N]] [--interval S] [--threshold K=V ...]
 
---json prints one snapshot and exits; --pane puts the live deck in herdr's `deck` workspace; with neither, the
-live curses screen runs here. Motion overlays run between refreshes; --no-motion, non-empty NO_MOTION, or
+--json prints one snapshot and exits; --pane puts the live deck in herdr's `deck` workspace; --web serves the same
+deck as a page at http://127.0.0.1:PORT/ (default 8770) until Ctrl-C; with none of them, the live curses screen runs
+here. Motion overlays run between refreshes (CSS motion on the page); --no-motion, non-empty NO_MOTION, or
 TERM=dumb disables them. The deck reads only (collect, model and render do the work), apart from --pane,
-which creates or reuses herdr's `deck` workspace and pane, the disk scanner's disk.json cache, and the error log
-($CODETEAM_DECK_LOG, else ~/Library/Logs/codeteam-deck.log); this file wires them to the terminal.
+which creates or reuses herdr's `deck` workspace and pane, and the live deck (curses, or --web), which writes the
+disk scanner's disk.json cache and the error log ($CODETEAM_DECK_LOG, else ~/Library/Logs/codeteam-deck.log);
+this file wires them to the terminal.
 """
 import argparse
 import datetime as dt
@@ -40,6 +42,9 @@ def _parse(argv):
                                              "$CODETEAM_WORKSPACE/team-<x> that keeps its own in design/*/teams/<x>.toml)")
     ap.add_argument("--json", action="store_true", help="print one snapshot as JSON and exit")
     ap.add_argument("--pane", action="store_true", help="run the deck in herdr's `deck` workspace and pane")
+    ap.add_argument("--web", action="store_true", help="serve the deck as a page at http://127.0.0.1:PORT/")
+    ap.add_argument("--port", type=int, default=8770,
+                    help="--web's port; it binds 127.0.0.1 only (default 8770)")
     ap.add_argument("--no-motion", action="store_true", help="keep the live deck still")
     ap.add_argument("--interval", type=float, default=2.0, help="seconds between refreshes (default 2)")
     ap.add_argument("--threshold", action="append", default=[], metavar="K=V",
@@ -213,6 +218,11 @@ def main(argv):
     if args.pane:
         return _pane(args.teams, args.no_motion)
     thresholds = _thresholds(args.threshold)
+    if args.web:
+        from . import motion
+        from .server.serve import serve
+        return serve(args.teams, port=args.port, interval=args.interval, thresholds=thresholds,
+                     motion_on=motion.enabled(args.no_motion, os.environ))
     if args.json:
         from . import collect
         print(json.dumps(collect.collect(args.teams, thresholds=thresholds)))

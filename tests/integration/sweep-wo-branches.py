@@ -9,6 +9,7 @@ archive ref goes to GitHub first, since the backup mirrors branches only). Stays
 whose archive push fails, an open work order, one checked out in a worktree, and one with no record and its own commit.
 A copy with no record that only an archived landing holds (refs/archive/landing*, kept before a history rewrite) goes:
 landing's own history no longer reaches it.
+A GitHub that cannot be read is said, and a delete GitHub refuses keeps the branch and is not counted.
 """
 import importlib.machinery
 import importlib.util
@@ -198,6 +199,52 @@ def test_wo_branches_go_by_the_landing_record_and_the_rest_stay():
         assert ct.sweep_landed_branches(FakeTeam(repo, root), team, dry_run=False) == 0
 
 
+def sweep_output(ct, repo, root):
+    """The sweep's count and what it printed."""
+    import contextlib
+    import io
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        n = ct.sweep_landed_branches(FakeTeam(repo, root), {"lanes": {"A": {}}}, dry_run=False)
+    return n, out.getvalue()
+
+
+def test_a_github_that_cannot_be_read_is_said_not_taken_for_one_with_nothing_to_delete():
+    """From 2026-11-13 14:23 the hourly sweep deleted no team's landed branches on GitHub and
+    printed nothing, because a failed `git ls-remote` read as an empty GitHub."""
+    ct = load()
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        origin, repo, root = build(d)
+        before = refs(origin, "refs/heads")
+        git(repo, "remote", "set-url", "origin", str(d / "unreachable.git"))
+        n, said = sweep_output(ct, repo, root)
+        assert n == 0, said
+        assert "WARN: GitHub branches not read (fatal:" in said and "none deleted there" in said, said
+        assert refs(origin, "refs/heads") == before
+
+
+def test_a_refused_delete_keeps_the_branch_and_is_not_counted():
+    """The sweep printed "deleted" whatever `git push --delete` answered."""
+    ct = load()
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        origin, repo, root = build(d)
+        hook = origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nin=$(cat)\n"
+                        "if echo \"$in\" | grep -q refs/archive/wo/reject; then echo refused >&2; exit 1; fi\n"
+                        "if echo \"$in\" | grep -q 'refs/heads/wo/A/landed$'; then echo protected >&2; exit 1; fi\n"
+                        "exit 0\n")
+        n, said = sweep_output(ct, repo, root)
+        assert "wo/A/landed" in refs(origin, "refs/heads")
+        assert "kept wo/A/landed on GitHub: deleting it there failed (! [remote rejected] wo/A/landed" in said, said
+        assert "deleted landed branch wo/A/landed" not in said, said
+        assert n == len(GONE) - 1, said
+        assert not ((GONE - {"wo/A/landed"}) & refs(origin, "refs/heads"))
+
+
 if __name__ == "__main__":
     test_wo_branches_go_by_the_landing_record_and_the_rest_stay()
+    test_a_github_that_cannot_be_read_is_said_not_taken_for_one_with_nothing_to_delete()
+    test_a_refused_delete_keeps_the_branch_and_is_not_counted()
     print("all passed")

@@ -34,6 +34,7 @@ import glob
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
@@ -44,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+import tokenize
 import tomllib
 from pathlib import Path
 from collections.abc import Callable, Iterable, Iterator
@@ -131,9 +133,34 @@ if not os.environ.get("SSH_AUTH_SOCK") or "herdr" in os.environ.get("SSH_AUTH_SO
 
 
 def save_record(path: Path, record: dict) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(record, indent=1) + "\n")
-    temporary.replace(path)
+    """Write a JSON record whole: to a temporary file of this writer's own beside it (its process and
+    thread in the name, so two writers never share one), flushed to disk, then moved into place, so a reader finds
+    the old record or the new one. A write that fails removes its temporary file and raises."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(temporary, "w") as f:
+            f.write(json.dumps(record, indent=1) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def open_records(team) -> list[tuple[Path, dict]]:
+    """Each open work order's record file and record (not .landed or .retired). A record a concurrent retire or land
+    removed between the listing and the read, or one that does not parse, is skipped (a reader once
+    crashed on one)."""
+    found = []
+    for path in sorted((team.dir / "wo").glob("*.json")):
+        if path.name.endswith((".landed.json", ".retired.json")):
+            continue
+        try:
+            found.append((path, json.loads(path.read_text())))
+        except (FileNotFoundError, ValueError):
+            continue
+    return found
 
 
 def zone_tool():
@@ -189,14 +216,13 @@ class Team:
         return self.dir / "wo" / f"{wo}.json"
 
     def wo(self, wo):
-        p = self.wo_file(wo)
-        if not p.exists():
+        try:
+            return json.loads(self.wo_file(wo).read_text())
+        except FileNotFoundError:       # never there, or landed or retired since it was named
             die(f"unknown work order {wo}")
-        return json.loads(p.read_text())
 
     def save_wo(self, rec):
-        p = self.wo_file(rec["wo"])
-        p.write_text(json.dumps(rec, indent=1) + "\n")
+        save_record(self.wo_file(rec["wo"]), rec)
 
     def notify(self, to, kind, text):
         """A message to a session (Kong, a zone's coordinator, the orchestrator). [land].notify is a command
@@ -260,6 +286,287 @@ def in_zone(team, f, zone):
 
 def docs_only(files: list[str], suffixes: Iterable[str]) -> bool:
     return bool(files) and all(f.endswith(tuple(suffixes)) for f in files)
+
+
+# ---------------------------------------------------------------- comment-only
+# A work order whose every changed file differs from its base only in comments lands
+# as docs-only does: no compile, no tests, no recheck; Kong still reviews it and validation still runs. Detected from
+# the files, never from a flag. Comments a tool reads stay code: Rust and Swift doc comments holding a code block,
+# Python docstrings (strings) and the directive comments below. A file in a language with no rule here is never
+# comment-only: it counts as code.
+
+PY_DIRECTIVE = re.compile(r"type:|noqa|pragma|pylint:|mypy:|pyright:|ruff:|fmt:|isort:|yapf:|nosec|pyre-", re.I)
+PY_CODING = re.compile(r"^[ \t\f]*#.*?coding[:=]")
+C_DIRECTIVE = re.compile(r"swiftlint:|swift-format-ignore|sourcery:|periphery:|rustfmt:|clippy:")
+DOC_CODE = re.compile(r"```|~~~|@Snippet|^[ \t]*(?:///|//!|\*)[ \t]*(?: {4}|\t)\S", re.M)
+RUST_CHAR = re.compile(r"'(?:[^'\\\n]|\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.))'")
+RUST_RAW = re.compile(r'r(#*)"')
+SWIFT_OPEN = re.compile(r'(#*)("""|"|/)')
+LINE_DOC = {"rust": ("///", "//!"), "swift": ("///",)}
+
+
+def no_build_label(kind: str) -> str:
+    return f"{kind}: no build, no tests"
+
+
+def python_code(text: str) -> str:
+    """Python's tokens without comments or the line breaks that end no statement. Docstrings are strings and stay;
+    so does a comment a tool reads: a #! line, a coding line, type:, noqa, pragma and the linters' own."""
+    kept = []
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if tok.type == tokenize.NL:
+            continue
+        if tok.type == tokenize.COMMENT and not (
+                PY_DIRECTIVE.search(tok.string) or tok.start == (1, 0) and tok.string.startswith("#!")
+                or tok.start[0] <= 2 and PY_CODING.match(tok.line)):
+            continue
+        kept.append(f"{tokenize.tok_name[tok.type]} {'' if tok.type == tokenize.NEWLINE else tok.string}")
+    return "\n".join(kept)
+
+
+def _squash(pieces: list[tuple[bool, str]]) -> str:
+    """Join scanned pieces: kept ones (strings, doc comments that hold code) verbatim; in code, a run of whitespace
+    becomes one newline if it held one, else one space, so a removed comment line leaves no trace."""
+    out_, code = [], []
+    for keep, text in [*pieces, (True, "")]:
+        if not keep:
+            code.append(text)
+            continue
+        out_.append(re.sub(r"\s+", lambda m: "\n" if "\n" in m.group() else " ", "".join(code)))
+        out_.append(text)
+        code = []
+    return "".join(out_).strip()
+
+
+def _block_end(text: str, i: int) -> int:
+    """The end of the nested /* */ comment that starts at i (Rust and Swift both nest them)."""
+    depth, j = 0, i
+    while j < len(text):
+        if text.startswith("/*", j):
+            depth, j = depth + 1, j + 2
+        elif text.startswith("*/", j):
+            depth, j = depth - 1, j + 2
+            if not depth:
+                return j
+        else:
+            j += 1
+    raise ValueError("unterminated block comment")
+
+
+def _line_end(text: str, i: int) -> int:
+    end = text.find("\n", i)
+    return len(text) if end < 0 else end
+
+
+def _line_doc(text: str, i: int, lang: str) -> str | None:
+    """The doc marker of the // comment at i: Rust's /// (not ////) and //!, Swift's /// (any longer run too)."""
+    for mark in LINE_DOC[lang]:
+        if text.startswith(mark, i) and not (lang == "rust" and mark == "///" and text.startswith("////", i)):
+            return mark
+    return None
+
+
+def _block_doc(text: str, i: int) -> bool:
+    return (text.startswith("/**", i) and not text.startswith(("/***", "/**/"), i)) or text.startswith("/*!", i)
+
+
+def _rust_string(text: str, i: int) -> int | None:
+    """The end of a string or char literal that starts at i, or None when none starts there."""
+    c = text[i]
+    if c == '"':
+        j = i + 1
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+            elif text[j] == '"':
+                return j + 1
+            else:
+                j += 1
+        raise ValueError("unterminated string")
+    if c == "'":
+        m = RUST_CHAR.match(text, i)
+        return m.end() if m else None                 # no match: a lifetime's quote, which is code
+    if c == "r" and (m := RUST_RAW.match(text, i)):
+        before = text[i - 1] if i else ""
+        prefix_ok = not (before.isalnum() or before == "_") or (
+            before in "bc" and not (i > 1 and (text[i - 2].isalnum() or text[i - 2] == "_")))
+        if prefix_ok:
+            close = '"' + m.group(1)
+            end = text.find(close, m.end())
+            if end < 0:
+                raise ValueError("unterminated raw string")
+            return end + len(close)
+    return None
+
+
+def _swift_string(text: str, i: int) -> int | None:
+    """The end of the string or #/regex/# literal that starts at i, interpolations included, or None."""
+    m = SWIFT_OPEN.match(text, i)
+    if not m or (m.group(2) == "/" and not m.group(1)):
+        return None                                   # a bare /: division or a bare regex, read as code
+    hashes, quote = m.group(1), m.group(2)
+    close = (quote if quote != "/" else "/") + hashes
+    escape = "\\" + hashes
+    j = m.end()
+    while j < len(text):
+        if quote != "/" and text.startswith(escape, j):
+            k = j + len(escape)
+            j = _swift_interpolation(text, k + 1) if text[k:k + 1] == "(" else k + 1
+        elif text.startswith(close, j):
+            return j + len(close)
+        elif text[j] == "\n" and quote == '"':
+            raise ValueError("unterminated string")
+        else:
+            j += 1
+    raise ValueError("unterminated string")
+
+
+def _swift_interpolation(text: str, j: int) -> int:
+    depth = 1
+    while j < len(text):
+        if (end := _swift_string(text, j)) is not None:
+            j = end
+            continue
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if not depth:
+                return j + 1
+        j += 1
+    raise ValueError("unterminated interpolation")
+
+
+def c_family_code(text: str, lang: str) -> str:
+    """Rust or Swift source with each comment replaced by a space, except a doc comment (or a run of doc lines of one
+    kind, blank lines between) that holds a code block, and a comment a linter or formatter reads: those stay as
+    code, so a change inside a doc test is code."""
+    pieces, i, start = [], 0, 0
+    literal = _rust_string if lang == "rust" else _swift_string
+    while i < len(text):
+        if text.startswith("//", i):
+            mark, end = _line_doc(text, i, lang), _line_end(text, i)
+            while mark:                                    # a doc group: the same marker after only whitespace
+                k = end
+                while k < len(text) and text[k].isspace():
+                    k += 1
+                if k >= len(text) or _line_doc(text, k, lang) != mark:
+                    break
+                end = _line_end(text, k)
+        elif text.startswith("/*", i):
+            mark, end = _block_doc(text, i), _block_end(text, i)
+        else:
+            end = literal(text, i)
+            if end is None:
+                i += 1
+                continue
+            pieces += [(False, text[start:i]), (True, text[i:end])]
+            i = start = end
+            continue
+        keep = bool(mark) and bool(DOC_CODE.search(text[i:end])) or bool(C_DIRECTIVE.search(text[i:end]))
+        pieces += [(False, text[start:i]), (True, text[i:end]) if keep else (False, " ")]
+        i = start = end
+    pieces.append((False, text[start:]))
+    return _squash(pieces)
+
+
+def toml_code(text: str) -> str:
+    """TOML with each # comment replaced by a space; strings verbatim."""
+    pieces, i, start = [], 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == "#":
+            end = _line_end(text, i)
+            pieces += [(False, text[start:i]), (False, " ")]
+            i = start = end
+            continue
+        if c in "\"'":
+            triple = text.startswith(c * 3, i)
+            close = c * 3 if triple else c
+            j = i + len(close)
+            while True:
+                if j >= len(text) or (not triple and text[j] == "\n"):
+                    raise ValueError("unterminated string")
+                if c == '"' and text[j] == "\\":
+                    j += 2
+                elif text.startswith(close, j):
+                    j += len(close)
+                    while triple and j < len(text) and text[j] == c:
+                        j += 1                             # up to two quotes may end the string's own text
+                    break
+                else:
+                    j += 1
+            pieces += [(False, text[start:i]), (True, text[i:j])]
+            i = start = j
+            continue
+        i += 1
+    pieces.append((False, text[start:]))
+    return _squash(pieces)
+
+
+COMMENT_RULES: dict[str, Callable[[str], str]] = {
+    ".py": python_code, ".pyi": python_code, ".toml": toml_code,
+    ".rs": lambda text: c_family_code(text, "rust"), ".swift": lambda text: c_family_code(text, "swift")}
+
+
+def code_text(path: str, text: str) -> str | None:
+    """The file's text with its comments out, by its language; None when there is no rule for it or the text does not
+    read as that language (such a file is never comment-only: it counts as code)."""
+    rule = COMMENT_RULES.get(Path(path).suffix)
+    if rule is None:
+        return None
+    try:
+        return rule(text)
+    except (ValueError, SyntaxError, tokenize.TokenError, IndexError):
+        return None
+
+
+def _blob(tree, sha: str) -> str | None:
+    r = subprocess.run(["git", "-C", str(tree), "cat-file", "blob", sha], capture_output=True)
+    if r.returncode:
+        return None
+    try:
+        return r.stdout.decode()
+    except UnicodeDecodeError:
+        return None
+
+
+def comment_only(tree, base: str, doc_suffixes: Iterable[str]) -> bool:
+    """Every file changed from base to HEAD (merges included) is a document, or a file in a language with a rule whose
+    text without comments is the same on both sides, with its mode unchanged. An added, deleted or renamed code file,
+    or one the rule cannot read, is code."""
+    raw = git(tree, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, "HEAD", check=False)
+    if raw.returncode:
+        return False
+    fields = (getattr(raw, "stdout", "") or "").split("\0")
+    changed = 0
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        if not meta.startswith(":"):
+            continue
+        changed += 1
+        if path.endswith(tuple(doc_suffixes)):
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = meta[1:].split()
+        if status != "M" or old_mode != new_mode:
+            return False
+        old, new = _blob(tree, old_sha), _blob(tree, new_sha)
+        if old is None or new is None:
+            return False
+        a, b = code_text(path, old), code_text(path, new)
+        if a is None or a != b:
+            return False
+    return changed > 0
+
+
+def no_build_kind(team: Team, rec: dict, files: list[str]) -> str | None:
+    """'docs-only' (documents only, or no file: a Doc-Level declaration), 'comment-only', or None: a normal landing."""
+    docs = tuple(team.c("docs_only_suffixes", [".md"]))
+    if not files or docs_only(files, docs):
+        return "docs-only"
+    try:
+        return "comment-only" if comment_only(rec["tree"], own_base(team, rec["tree"]), docs) else None
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None                                   # unreadable: a normal landing
 
 
 def hang_settings(cfg: dict) -> dict[str, str]:
@@ -334,15 +641,39 @@ def zone_of_file(team, f):
     return None
 
 
+def declared_deps(team) -> dict:
+    """{zone: [the zones it names]} for each lane that declares `deps`, a list of zone names (the key v5.5's
+    lane_deps reads; an empty list counts). A list naming a zone that does not exist, or not a list of names, maps to
+    None, as if nothing were declared."""
+    out = {}
+    for lane in team.m.get("lanes", []):
+        if "glob" in lane or "deps" not in lane:
+            continue
+        name = lane.get("name") or os.path.basename(lane.get("path", ".").strip("/") or ".")
+        deps = lane["deps"]
+        ok = isinstance(deps, list) and all(isinstance(d, str) and d in team.zones for d in deps)
+        out[name] = list(deps) if ok else None
+    return out
+
+
+def in_scope(f: str, c: str) -> bool:
+    """f is c, under the folder c, or matches the glob c, as the zone guard matches an owned path (lane_walls)."""
+    return c in (".", "") or f == c or f.startswith(c + "/") or fnmatch.fnmatchcase(f, c)
+
+
 def reach(team, tree, files):
     """The zones whose tests the change reaches: the zones that hold a changed file, and every zone whose package
     depends on one of them directly by path (change X and B calls X: test X and B, not A, which
-    calls B; zone-tool's scope at depth 1). A zone with no package manifest (scope: the whole tree) is reached by
-    every change. A file in no zone's scope (a new top-level file, a script, config) reaches every zone.
-    [land] reach = "chain" follows every package through the dependency chain."""
+    calls B; zone-tool's scope at depth 1). A zone folder with no package manifest has the whole tree as its scope,
+    so the zone is reached by every change, unless its lane declares `deps`: then such
+    a folder or owned file is its own scope, an owned glob matches what it matches, and the folders of the zones it
+    names join its scope (theirs too, through them, under reach = "chain"). A file in no zone's scope (a new
+    top-level file, a script, config) reaches every zone. [land] reach = "chain" follows every package through the
+    dependency chain."""
     zt = zone_tool()
     root = Path(tree)
     depth = None if team.c("reach", "direct") == "chain" else 1
+    declared = declared_deps(team)
 
     def scope(d):
         """A zone folder's scope. Not in this tree: nothing to test. No manifest at the folder but packages one
@@ -360,7 +691,28 @@ def reach(team, tree, files):
         if not kids:
             return ["."]
         return [d] + [x for k in kids for x in (zt.scope_dirs(root, f"{d}/{k}", depth=depth) or [])]
-    closures = {z: [s.split("!")[0] for d in dirs for s in scope(d)] for z, dirs in team.zones.items()}
+    def deps_of(z):
+        """The zones z names; under reach = "chain" also the zones they name, and so on."""
+        seen, todo = [], list(declared.get(z) or [])
+        while todo:
+            d = todo.pop(0)
+            if d != z and d not in seen:
+                seen.append(d)
+                todo += (declared.get(d) or []) if depth is None else []
+        return seen
+
+    def closure(z, dirs):
+        if declared.get(z) is None:          # no deps declared: the package rule alone
+            return [s.split("!")[0] for d in dirs for s in scope(d)]
+        own = []
+        for d in dirs:
+            if any(ch in d for ch in "*?["):
+                own.append(d)
+                continue
+            sc = scope(d)
+            own += [d] if sc == ["."] else [s.split("!")[0] for s in sc]
+        return own + [x for dep in deps_of(z) for x in team.zones[dep]]
+    closures = {z: closure(z, dirs) for z, dirs in team.zones.items()}
     hit = set()
     # Contract files (spec v5 §4): a schema, file format, config key or wire protocol listed in [land.contracts] with
     # its consumers; a diff touching one runs every consumer's tests, whatever the path reach finds.
@@ -370,7 +722,7 @@ def reach(team, tree, files):
     for f in files:
         found = False
         for z, cl in closures.items():
-            if any(c in (".", "") or f == c or f.startswith(c + "/") for c in cl):
+            if any(in_scope(f, c) for c in cl):
                 hit.add(z)
                 found = True
         if not found:
@@ -816,11 +1168,11 @@ def lane_test_key(zone: str, group: str) -> str:
     return f"lane {zone}" + (f" test-group={group}" if group != "unit" else "")
 
 
-def unit_step_keys(team: Team, tree: Path, zone: str) -> list[str] | None:
+def unit_step_keys(team: Team, tree: Path, zone: str, files: Iterable[str] = ()) -> list[str] | None:
     if lane_rec(team, zone).get("test"):
         return [lane_test_key(zone, "unit")]
     keys = []
-    for folder in test_folders(team, tree, zone, "unit"):
+    for folder in test_folders(team, tree, zone, "unit", files):
         # Ask make for its expanded key, including repo overrides. A stdin makefile works with macOS make 3.81.
         result = subprocess.run(
             ["make", "--no-print-directory", "-s",
@@ -842,26 +1194,33 @@ def commit_record(tree: str | Path, commit: str, key: str) -> int:
                           cwd=tree, capture_output=True, text=True).returncode
 
 
-def current_units(team: Team, tree: Path, zone: str) -> bool:
-    keys = unit_step_keys(team, tree, zone)
+def current_units(team: Team, tree: Path, zone: str, files: Iterable[str] = ()) -> bool:
+    keys = unit_step_keys(team, tree, zone, files)
     if keys is None:
         return False
     commit = out(tree, "rev-parse", "HEAD")
     return units_pass(commit_record(tree, commit, key) for key in keys)
 
 
-def test_units(team: Team, rec: dict, zone: str | None = None) -> None:
+def test_units(team: Team, rec: dict, zone: str | None = None, files: Iterable[str] = ()) -> None:
     """The units of zone (default the record's own) in rec's tree; the results are saved in rec, whose zone stays
     its own. A set tests each member's zone in the first member's tree (a copy of the first
-    record carrying another member's zone was saved over the first one's record)."""
-    if not stage2_steps(team, rec, zone_tests(team, rec["tree"], zone or rec["zone"], "land"), "unit"):
+    record carrying another member's zone was saved over the first one's record). files: what the landing changed,
+    for the test roots below a plain owned folder; each caller passes them."""
+    if not stage2_steps(team, rec, zone_tests(team, rec["tree"], zone or rec["zone"], "land", files=files), "unit"):
         sys.exit(GATE)
 
 
 def stage2_record(results: list[dict]) -> list[dict]:
-    """A step the machine stopped is recorded by what stopped it, "disk" or "cache", not "fail"."""
+    """A step the machine stopped is recorded by what stopped it, "disk" or "cache", not "fail". A step that waited
+    for the build queue carries that wait as "queued", which its "seconds" include."""
     return [{"step": result["name"], "result": result.get("stopped_by") or result["outcome"].lower(),
-             "seconds": round(result["seconds"], 1)} for result in results]
+             "seconds": round(result["seconds"], 1)} | queued_field(result) for result in results]
+
+
+def queued_field(result: dict) -> dict:
+    """{"queued": seconds} for a step result that waited for the build queue, else {}."""
+    return {"queued": result["queued"]} if result.get("queued") is not None else {}
 
 
 # What Stage 2 prints for each infrastructure stop, after the steps it names (stage2_steps).
@@ -893,8 +1252,96 @@ def stage2_steps(team: Team, rec: dict, steps: list[tuple[str, str]], group: str
         stopped = [result["name"] for result in results if result.get("stopped_by") == kind]
         if stopped:
             print(notice.format(steps=", ".join(stopped)), flush=True)
-    restore_build_changes(rec, before)
+    stale = made_stale(team, rec, restore_build_changes(rec, before))
+    if stale:
+        rec["stage2"].append({"step": "committed lock files current", "result": "fail", "seconds": 0.0})
+        team.save_wo(rec)
+        print(f"FAIL {rec['wo']}: its build rewrote {', '.join(stale)}, which this work order made stale: it changes "
+              f"the manifest that feeds it ({', '.join(sorted({LOCK_MANIFESTS[os.path.basename(f)] for f in stale}))}). "
+              "Commit the regenerated file with this work order, or, when another zone owns it, land with that zone's "
+              "work order as a set; then run land again.", flush=True)
+        return False
     return ok
+
+
+# A lock file and the manifest it is generated from (made_stale).
+LOCK_MANIFESTS = {"Cargo.lock": "Cargo.toml", "Package.resolved": "Package.swift", "package-lock.json": "package.json",
+                  "yarn.lock": "package.json", "pnpm-lock.yaml": "package.json", "uv.lock": "pyproject.toml",
+                  "poetry.lock": "pyproject.toml", "go.sum": "go.mod"}
+
+
+# What a lock records from its manifest (lock_inputs). Package.swift is code and go.mod is nearly all inputs:
+# with no list here, the whole text counts.
+LOCK_INPUTS = {
+    "Cargo.toml": ("package.name", "package.version", "dependencies", "dev-dependencies", "build-dependencies",
+                   "target", "patch", "replace", "workspace.members", "workspace.exclude", "workspace.dependencies",
+                   "workspace.package.version"),
+    "pyproject.toml": ("project.name", "project.version", "project.requires-python", "project.dependencies",
+                       "project.optional-dependencies", "dependency-groups", "tool.uv", "tool.poetry.name",
+                       "tool.poetry.version", "tool.poetry.dependencies", "tool.poetry.dev-dependencies",
+                       "tool.poetry.group", "tool.poetry.extras", "tool.poetry.source"),
+    "package.json": ("name", "version", "license", "bin", "engines", "os", "cpu", "workspaces", "dependencies",
+                     "devDependencies", "optionalDependencies", "peerDependencies", "peerDependenciesMeta",
+                     "bundleDependencies", "bundledDependencies", "overrides", "resolutions", "pnpm"),
+}
+
+
+def lock_inputs(name: str, text: str | None):
+    """The parts of a manifest named `name` that its lock records (LOCK_INPUTS), to compare two versions: a
+    description, say, is not one. None for no manifest; the whole text for a manifest with no list or one that does
+    not parse."""
+    if text is None:
+        return None
+    keys = LOCK_INPUTS.get(name)
+    if keys is None:
+        return text
+    try:
+        data = json.loads(text) if name.endswith(".json") else tomllib.loads(text)
+    except ValueError:
+        return text
+
+    def at(path):
+        node = data
+        for part in path.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        return node
+    return {key: at(key) for key in keys}
+
+
+def made_stale(team: Team, rec: dict, rewritten: list[str]) -> list[str]:
+    """The lock files among those a Stage 2 build rewrote that the work order made stale: its own changes include a
+    manifest that feeds the lock, in the lock's folder or below it, and change what the lock records from it
+    (lock_inputs) (2026-11-13: a crate joined the workspace with no lock entry, the build regenerated
+    Cargo.lock, Stage 2 passed, and every lane's build has rewritten the promoted lock since). A lock that was already
+    stale on integration stays a notice (restore_build_changes), so one stale lock never fails every gate, and
+    so does a manifest change the lock does not record, such as a description. Unreadable
+    history fails nothing."""
+    locks = [f for f in rewritten if os.path.basename(f) in LOCK_MANIFESTS]
+    if not locks:
+        return []
+    tree = rec["tree"]
+    try:
+        base = own_base(team, tree)
+        own = changed_files(tree, base)
+    except (subprocess.CalledProcessError, OSError):
+        return []
+
+    def text_at(rev, f):
+        shown = git(tree, "show", f"{rev}:{f}", check=False)
+        return shown.stdout if shown.returncode == 0 else None
+
+    def changes_inputs(f):
+        name = os.path.basename(f)
+        return lock_inputs(name, text_at(base, f)) != lock_inputs(name, text_at("HEAD", f))
+
+    def feeds(lock):
+        folder = os.path.dirname(lock)
+        return any(os.path.basename(f) == LOCK_MANIFESTS[os.path.basename(lock)]
+                   and (not folder or f.startswith(folder + "/")) and changes_inputs(f) for f in own)
+    try:
+        return [lock for lock in locks if feeds(lock)]
+    except OSError:
+        return []
 
 
 def changed_tracked(tree: str | Path) -> set[str]:
@@ -1007,13 +1454,14 @@ def check_integration(team: Team, rec: dict, only_docs: bool, files: list[str] |
         die(f"FAIL numbered entry used twice: {', '.join(dup)}", GATE)
     if only_docs:
         return []
-    zones = reach(team, rec["tree"], rec["files"] if files is None else files)
+    files = rec["files"] if files is None else files
+    zones = reach(team, rec["tree"], files)
     if not stage2_steps(team, rec, compile_steps(team, rec["tree"], zones), "integration", concurrent=False):
         sys.exit(GATE)
     steps = repo_test_steps(rec["tree"], team.c("unit_tests", "tests/unit"), "unit", "land", str(HERE / "zone-tool"))
     if steps and not stage2_steps(team, rec, steps, "unit"):
         sys.exit(GATE)
-    tests = [step for z in zones for step in zone_tests(team, rec["tree"], z, "land", group="integration")]
+    tests = [step for z in zones for step in zone_tests(team, rec["tree"], z, "land", group="integration", files=files)]
     tests.extend(repo_integration_steps(rec["tree"], team.c("integration_tests", "tests/integration"),
                                        "land", str(HERE / "zone-tool")))
     if not stage2_steps(team, rec, tests, "integration"):
@@ -1071,7 +1519,8 @@ def put_back_set_merge(rec: dict) -> None:
           f"put back on {branch} ({tip[:10]})", flush=True)
 
 
-def checked_members(team: Team, names: list[str]) -> list[tuple[dict, bool]]:
+def checked_members(team: Team, names: list[str]) -> list[tuple[dict, str | None]]:
+    """Each member with what it lands as: 'docs-only' or 'comment-only' (no build, no tests), or None."""
     if len(set(names)) != len(names):
         die("a work order occurs more than once in the landing set")
     for wo in names:
@@ -1088,17 +1537,17 @@ def checked_members(team: Team, names: list[str]) -> list[tuple[dict, bool]]:
     try:
         for rec in records:
             files = check_work_order(team, rec)     # no files: a Doc-Level declaration only, which tests nothing
-            only_docs = not files or docs_only(files, team.c("docs_only_suffixes", [".md"]))
-            if alone and not only_docs and not current_units(team, Path(rec["tree"]), rec["zone"]):
-                test_units(team, rec)
-            members.append((rec, only_docs))
+            no_build = no_build_kind(team, rec, files)
+            if alone and not no_build and not current_units(team, Path(rec["tree"]), rec["zone"], files):
+                test_units(team, rec, files=files)
+            members.append((rec, no_build))
     finally:
         for rec in records:
             team.save_wo(rec)
     return members
 
 
-def merge_checked_base(team: Team, rec: dict, base: str, only_docs: bool, test: bool = True) -> None:
+def merge_checked_base(team: Team, rec: dict, base: str, only_docs: str | bool | None, test: bool = True) -> None:
     before = out(rec["tree"], "rev-parse", "HEAD")
     merged = git(rec["tree"], "merge", "--no-edit", base, check=False)
     if merged.returncode:
@@ -1107,10 +1556,10 @@ def merge_checked_base(team: Team, rec: dict, base: str, only_docs: bool, test: 
         sys.exit(CONFLICT)
     if test and not only_docs and touches_zone(team.zones,
             out(rec["tree"], "diff", "--name-only", before, "HEAD").splitlines(), rec["zone"]):
-        test_units(team, rec)
+        test_units(team, rec, files=work_order_files(team, rec))
 
 
-def merge_set_tips(tree: str | Path, members: list[tuple[dict, bool]]) -> None:
+def merge_set_tips(tree: str | Path, members: list[tuple[dict, str | None]]) -> None:
     git(tree, "checkout", "-q", "--detach", members[0][0]["tip"])
     for rec, _ in members[1:]:
         merged = git(tree, "merge", "--no-edit", rec["tip"], check=False)
@@ -1121,19 +1570,20 @@ def merge_set_tips(tree: str | Path, members: list[tuple[dict, bool]]) -> None:
             sys.exit(CONFLICT)
 
 
-def check_combined_members(team: Team, members: list[tuple[dict, bool]], base: str) -> tuple[list[str], list[str]]:
+def check_combined_members(team: Team, members: list[tuple[dict, str | None]], base: str) -> tuple[list[str], list[str]]:
     first = members[0][0]
     tree = first["tree"]
     is_set = len(members) > 1
     try:
         if is_set:
             merge_set_tips(tree, members)
+        files = changed_files(tree, own_base(team, tree))
+        if is_set:
             # Every member's zone is unit-tested here, once, on the merged tips: halves that build only
             # together (one zone's code, another's Cargo.lock) land as a set.
             for zone in dict.fromkeys(rec["zone"] for rec, docs in members if not docs):
-                if not current_units(team, Path(tree), zone):
-                    test_units(team, first, zone)
-        files = changed_files(tree, own_base(team, tree))
+                if not current_units(team, Path(tree), zone, files):
+                    test_units(team, first, zone, files)
         zones = check_integration(team, first, all(docs for _, docs in members), files=files)
         return zones, reach(team, tree, files)
     finally:
@@ -1194,8 +1644,15 @@ def check_and_queue(team: Team, a, names: list[str]) -> None:
             rec.update(base=base, tip=out(rec["tree"], "rev-parse", "HEAD"), files=changed_files(rec["tree"], own_base(team, rec["tree"])))
         zones, reached = check_combined_members(team, members, base)
         queued = now()
-        for rec, _ in members:
+        # The label only when the whole set skipped its build: a member built with the others says nothing.
+        label = all(kind for _, kind in members) and no_build_label(
+            "comment-only" if any(kind == "comment-only" for _, kind in members) else "docs-only")
+        for rec, kind in members:
             rec.update(zones=zones, reach=reached, set=names)
+            if label:
+                rec["no_build"] = no_build_label(kind if kind == "comment-only" else "docs-only")
+            else:
+                rec.pop("no_build", None)
             queue_notices(team, rec, a)
     finally:
         for rec, _ in members:
@@ -1206,7 +1663,8 @@ def check_and_queue(team: Team, a, names: list[str]) -> None:
         requests = queue_stage3(team, [rec for rec, _ in members], entry, queued)
     for reviewer, items in requests.items():
         team.notify(reviewer, "REQUEST", stage3_request(team, items))
-    print(f"queued {', '.join(names)}; reach: {', '.join(reached)}; Stage 2 passed; review: {entry['review']}")
+    print(f"queued {', '.join(names)}; reach: {', '.join(reached)}; Stage 2 passed"
+          f"{f' ({label})' if label else ''}; review: {entry['review']}")
 
 
 def cmd_queue(team, a):
@@ -1285,7 +1743,7 @@ def cmd_wo_retire(team, a):
     rec["retired"] = now()
     if a.reason:
         rec["retired_reason"] = a.reason
-    team.wo_file(a.wo).with_suffix(".retired.json").write_text(json.dumps(rec, indent=1) + "\n")
+    save_record(team.wo_file(a.wo).with_suffix(".retired.json"), rec)
     team.wo_file(a.wo).unlink()
     print(f"retired {a.wo}" + (f" (branch kept as refs/archive/wo/{a.wo})" if tip else ""))
 
@@ -1405,14 +1863,34 @@ def records_pass(text):
 # poisoned for ...").
 STOPS = (("disk", re.compile(r"No space left on device|\[Errno 28\]|\(os error 28\)|\bENOSPC\b")),
          ("cache", re.compile(r"error: (?:[^\n]*\[#CompilationCaching\]|failed to update cache: cache poisoned|CAS error:)")))
+# A test run that finished prints its summary: Swift Testing's "Test run with N tests ... passed/failed", XCTest's
+# "Executed N tests" (N at least 1: xcodebuild prints 0 for a bundle of Swift Testing tests), cargo's "test result:",
+# pytest's "N failed ... in Ns". Its failures are the tests', whatever the compile cache said while it built
+# (2026-11-14: two "cache poisoned" lines, then 1409 tests ran and two failed). xcodebuild's "** TEST FAILED **" is
+# no such line: it prints it when the build fails too.
+TESTS_RAN = re.compile(r"Test run with \d+ tests?\b[^\n]* (?:passed|failed)|Executed [1-9]\d* tests?, with \d+ failures?"
+                       r"|^test result: |\b\d+ (?:passed|failed)\b[^\n]* in [\d.]+s", re.M)
+
+
+# zone-tool's line before a queue job's summary (print_done): how long the job waited for the build queue.
+QUEUED = re.compile(r"^zone-tool: queued (\d+) s, ran \d+ s \(job [^)\n]+\)\nzone-test: ", re.M)
+
+
+def queued_seconds(text: str) -> int | None:
+    """How long a step's zone-tool jobs waited in the build queue, summed, from the line each prints just before its
+    summary; None when the step ran no queue job. A step's recorded seconds are this wait plus the run."""
+    waits = QUEUED.findall(text)
+    return sum(int(wait) for wait in waits) if waits else None
 
 
 def stopped_by(outcome: str, text: str) -> str | None:
-    """What stopped a step that did not pass, when its output says it was the machine: "disk" or "cache". Only
-    Stage 2 reads this (stage2_steps); the outcome itself stays PASS, FAIL or HUNG, which Stages 5 and 6 judge by."""
+    """What stopped a step that did not pass, when its output says it was the machine: "disk" or "cache". A cache
+    error beside a test run that finished (TESTS_RAN) is not the stop: the tests failed. Only Stage 2 reads
+    this (stage2_steps); the outcome itself stays PASS, FAIL or HUNG, which Stages 5 and 6 judge by."""
     if outcome == "PASS":
         return None
-    return next((kind for kind, said in STOPS if said.search(text)), None)
+    return next((kind for kind, said in STOPS
+                 if said.search(text) and not (kind == "cache" and TESTS_RAN.search(text))), None)
 
 
 def step_outcome(rc: int, text: str) -> str:
@@ -1446,6 +1924,8 @@ def step_results(tree: str | Path, steps: list[tuple[str, str]], env: dict[str, 
         seconds = time.time() - started
         outcome = step_outcome(pr.returncode, text)
         result = {"name": name, "outcome": outcome, "seconds": seconds, "tail": text.splitlines()[-30:]}
+        if (waited := queued_seconds(text)) is not None:
+            result["queued"] = waited
         if kind := stopped_by(outcome, text):
             result["stopped_by"] = kind
         return result | {"text": text} if keep_text else result
@@ -1521,10 +2001,11 @@ def test_folder(tree: str | Path, folder: str, path_lane: bool) -> bool:
         or any(f"/{t}/" in f"/{folder}/" for t in ("tests", "Tests", "__tests__"))
 
 
-def zone_tests(team, tree, zone, cls, group="unit"):
+def zone_tests(team, tree, zone, cls, group="unit", files=()):
     """A zone's test steps: its lane's own `test` command when the manifest gives one, run through the build
     queue; otherwise one zone-test-one per folder of the zone that is a test root (a package, a crate, a tests folder,
-    or the zone's own path). Owned files and plain folders (Makefile, scripts/, Hooks/) are walls, not tests: the type
+    or the zone's own path), and the test roots below a plain owned folder that hold a file in files, what the landing
+    changed (test_folders). Owned files and plain folders (Makefile, scripts/, Hooks/) are walls, not tests: the type
     check covers them. (A tooling lane that owned ten such paths once had each run as a test.)"""
     lane = lane_rec(team, zone)
     if lane.get("test"):
@@ -1533,23 +2014,55 @@ def zone_tests(team, tree, zone, cls, group="unit"):
         return [(f"tests {zone} (its lane's test)", cmd)]
     tmpl = team.c("test", "make --no-print-directory zone-test-one DIR={dir} CLASS={cls}")
     steps = []
-    for d in test_folders(team, tree, zone, group):
+    for d in test_folders(team, tree, zone, group, files):
         cmd = tmpl.replace("{dir}", shlex.quote(d)).replace("{zone}", shlex.quote(zone)).replace("{cls}", cls)
         steps.append((f"tests {zone} ({d})", cmd))          # plain replace: templates hold shell braces
     return steps
 
 
-def test_folders(team: Team, tree: str | Path, zone: str, group: str) -> list[str]:
+def changed_roots(tree: str | Path, folder: str, files: Iterable[str]) -> list[str]:
+    """The test roots below an owned folder that hold a file the landing changed: for each changed file under it, the
+    outermost folder between the two that is a test root (a package, a crate or a tests folder). A file directly in
+    the folder, or in no test root, adds nothing: the type check covers it."""
+    d = folder.strip("/")
+    if d in ("", ".") or any(c in d for c in "*?["):
+        return []
+    roots = []
+    for f in files:
+        if not f.startswith(d + "/"):
+            continue
+        parts = f[len(d) + 1:].split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            candidate = d + "/" + "/".join(parts[:i])
+            if test_folder(tree, candidate, False):
+                roots.append(candidate)
+                break
+    return list(dict.fromkeys(roots))
+
+
+def test_folders(team: Team, tree: str | Path, zone: str, group: str, files: Iterable[str] = ()) -> list[str]:
+    """The zone's test roots: each owned folder that is one, and below an owned folder that is not (a whole-repo lane's
+    tools/, scripts/, distribution/), the test roots that hold a file the landing changed (files). 2026-11-14:
+    one tooling lane's 11 packages ran at no landing stage, and the rule is to
+    test the changed kit at landing; a landing that touches no such root runs none of them."""
     lane = lane_rec(team, zone)
     own = lane.get("path", ".").strip("/") or "."
     skip = team.c("skip_tests", []) if group == "unit" else []   # integration folders participate in Stage 2
+    files = list(files)
 
     def own_path(d):
         # Only the lane's own path is a test root by being its path; an owned folder (e.g. docs/specs/acme-mgr)
         # needs a package or a tests folder like any other.
         return "glob" in lane or (own != "." and d.strip("/") == own)
-    return [d for d in team.zones.get(zone, []) if test_folder(tree, d, own_path(d))
-            and not any(fnmatch.fnmatch(d.strip("/"), g.strip("/")) for g in skip)]
+
+    def skipped(d):
+        return any(fnmatch.fnmatch(d.strip("/"), g.strip("/")) for g in skip)
+    owned = team.zones.get(zone, [])
+    roots = [d for d in owned if test_folder(tree, d, own_path(d)) and not skipped(d)]
+    for d in owned:
+        if d not in roots and files:
+            roots += [r for r in changed_roots(tree, d, files) if r not in roots and not skipped(r)]
+    return roots
 
 
 def team_env(team, group="unit"):
@@ -1662,16 +2175,7 @@ def save_feature(team, fr):
 
 
 def open_tagged(team, f):
-    out_ = []
-    for p in (team.dir / "wo").glob("*.json"):
-        if p.name.endswith((".landed.json", ".retired.json")):
-            continue
-        try:
-            if json.loads(p.read_text()).get("feature") == f:
-                out_.append(p.stem)
-        except ValueError:
-            pass
-    return out_
+    return [p.stem for p, rec in open_records(team) if rec.get("feature") == f]
 
 
 def unreviewed(fr):
@@ -2469,12 +2973,16 @@ def conflicting_landings(team: Team, base: str, old: str, files: list[str]) -> l
     return [wo for wo, changed in intervening_landings(team, base, old) if set(changed).intersection(files)]
 
 
-def intervening_landings(team: Team, base: str, old: str) -> list[tuple[str, list[str]]]:
-    """Landings ancestral to landing but absent from the proven Stage 2 base can invalidate its checked zones."""
+def intervening_landings(team: Team, base: str, old: str, builds: bool = False) -> list[tuple[str, list[str]]]:
+    """Landings ancestral to landing but absent from the proven Stage 2 base can invalidate its checked zones.
+    builds: leave out a comment-only landing, whose whole diff (merges included) changed no code a build sees.
+    A docs-only one stays, and overlapping() drops its documents, so code a merge brought still counts."""
     p = team.dir / "landed.log"
     found = []
     for line in p.read_text().splitlines() if p.exists() else []:
         row = json.loads(line)
+        if builds and str(row.get("no_build", "")).startswith("comment-only"):
+            continue
         h = row.get("hash")
         if not h or git(team.repo, "merge-base", "--is-ancestor", h, base, check=False).returncode == 0:
             continue
@@ -2536,11 +3044,12 @@ def merge_landing_member(team: Team, base: str, old: str, rec: dict, tip: str) -
 
 
 def landing_recheck(team: Team, entry: dict, old: str, tip: str) -> bool:
-    overlaps = overlapping(team.zones, intervening_landings(team, entry["base"], old), entry["zones"],
+    overlaps = overlapping(team.zones, intervening_landings(team, entry["base"], old, builds=True), entry["zones"],
                            team.c("docs_only_suffixes", [".md"]))
     if not overlaps:
         return False
     row = recheck_row(tip, entry["wo"], overlaps, entry["zones"], now())
+    row["files"] = out(team.repo, "diff", "--name-only", old, tip).splitlines()    # the test roots it changed
     if len(entry_members(entry)) > 1:
         row["set"] = [wo for wo, _ in entry_members(entry)]
     with open(team.dir / "recheck.jsonl", "a") as f:
@@ -2563,6 +3072,8 @@ def record_landing_members(team: Team, entry: dict, old: str, recs: dict[str, di
                "feature": feature_of(rec), "fixes": rec.get("fixes") or []}
         if len(whole) > 1:
             row["set"] = whole              # only the set's last commit holds all of it
+        if rec.get("no_build"):
+            row["no_build"] = rec["no_build"]   # 'comment-only: no build, no tests'
         rec["landed_base"] = entry["base"]
         rec["landed_at"] = row["time"]
         team.save_wo(rec)
@@ -2570,7 +3081,7 @@ def record_landing_members(team: Team, entry: dict, old: str, recs: dict[str, di
         team.log(row)
         rows.append(row)
         old = commit
-        print(f"landed {wo} at {commit[:10]}")
+        print(f"landed {wo} at {commit[:10]}" + (f" ({row['no_build']})" if row.get("no_build") else ""))
     return rows
 
 
@@ -2623,7 +3134,10 @@ def clean_idle(team):
     for f in (team.dir / "wo").glob("*.json"):
         if f.name.endswith(".landed.json"):
             continue
-        rec = json.loads(f.read_text())
+        try:
+            rec = json.loads(f.read_text())
+        except (FileNotFoundError, ValueError):      # landed or retired since the listing, or being written
+            continue
         tree = Path(rec["tree"])
         if rec.get("cleaned") or not tree.is_dir():
             continue
@@ -2703,16 +3217,20 @@ FRONT_VERSION = re.compile(r"^version:\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", re.M)
 EXTERNAL_MARK = "<!-- external -->"     # on a Markdown line: its file names are not this repository's
 
 
-def missing_file_refs(lines, tracked, names):
-    """File names on these added Markdown lines that name no tracked file. A line with EXTERNAL_MARK is skipped: it
-    cites another repository's files or a package's own file list (2026-11-12: a package SPEC
-    named another repository's files and a finder package's contents, and each NOTE cost a lane turn)."""
+def missing_file_refs(lines, tracked, names, removed=()):
+    """File names on these added Markdown lines that name no tracked file. A name also on one of the removed lines was
+    there before the landing, so it is not one the landing added (2026-11-13: rewording a commit id on an old
+    changelog line re-raised a file that moved after the entry was written). A line with EXTERNAL_MARK is skipped: it
+    cites another repository's files or a package's own file list (2026-11-12: a package SPEC named another
+    repository's files and a finder package's contents, and each NOTE cost a lane turn)."""
+    had = {ref for line in removed for ref in FILE_REF.findall(line)}
     broken = []
     for line in lines:
         if EXTERNAL_MARK in line.lower():
             continue
         for ref in FILE_REF.findall(line):
-            if ref in tracked or (("/" not in ref) and ref in names) or any(t_.endswith("/" + ref) for t_ in tracked):
+            if ref in had or ref in tracked or (("/" not in ref) and ref in names) \
+                    or any(t_.endswith("/" + ref) for t_ in tracked):
                 continue
             broken.append(ref)
     return broken
@@ -2855,13 +3373,7 @@ def tell_dependents(team, rec, landed, docs):
     No message; nothing is woken. Its coordinator reads the file at start-up and empties it."""
     if not docs:
         return
-    open_zones = set()
-    for f in (team.dir / "wo").glob("*.json"):
-        if not f.name.endswith((".landed.json", ".retired.json")):
-            try:
-                open_zones.add(json.loads(f.read_text()).get("zone"))
-            except ValueError:
-                pass
+    open_zones = {rec.get("zone") for _, rec in open_records(team)}
     summary = (out(team.repo, "log", "--no-merges", "--format=%s", f"{landed}^..{rec['tip']}").splitlines() or [""])[-1] \
         if rec.get("tip") else ""
     for z in rec.get("reach", []):
@@ -2894,14 +3406,15 @@ def docs_pass(team, row, rec):
     cfg = team.cfg.get("docs") or {}
     if not cfg.get("enabled"):
         return None
-    # broken file references on the Markdown lines it added (file only, no line numbers)
+    # broken file references it added to Markdown, not those already on a line it edited (file only, no line numbers)
     tracked = out(team.repo, "ls-tree", "-r", "--name-only", landed).splitlines()
     names = {}
     for t_ in tracked:
         names.setdefault(os.path.basename(t_), []).append(t_)
-    added = [line[1:] for line in out(team.repo, "diff", "-U0", prev, landed, "--", "*.md").splitlines()
-             if line.startswith("+") and not line.startswith("+++")]
-    broken = missing_file_refs(added, tracked, names)
+    md_diff = out(team.repo, "diff", "-U0", prev, landed, "--", "*.md").splitlines()
+    added = [line[1:] for line in md_diff if line.startswith("+") and not line.startswith("+++")]
+    removed = [line[1:] for line in md_diff if line.startswith("-") and not line.startswith("---")]
+    broken = missing_file_refs(added, tracked, names, removed)
     if broken:
         team.notify(f"Coord-{rec['zone']}", "NOTE", f"{rec['wo']} landed with Markdown naming files that do not exist: "
                     f"{', '.join(sorted(set(broken))[:12])}. A file name or path is enough; fix them in your next work order. A name "
@@ -2958,6 +3471,11 @@ def stamp_docs(team: Team, h: str, base: str) -> str | None:
             tip = team.wo(wo)["branch"] if team.wo_file(wo).exists() else f"refs/landed/{wo}"
             settle_stamp(team, pend, owed, out(team.repo, "rev-parse", tip))
         return wo
+    earlier = unpromoted_stamp(team, h, wo)
+    if earlier:
+        print(f"Document stamp waits: {earlier} is not on base yet; what this promotion owes is stamped by the first "
+              f"promotion that holds it.", file=sys.stderr)
+        return None
     base_hash = out(team.repo, "rev-parse", base)
     take = collect_stamps(team, h, base_hash, pend)
     if not take:
@@ -2969,6 +3487,52 @@ def stamp_docs(team: Team, h: str, base: str) -> str | None:
         return None
     spawn(shlex.join([sys.executable, str(Path(__file__).resolve()), str(team.manifest), "land", wo]))
     return wo
+
+
+def landed_stamps(team: Team) -> list[tuple[str, str]]:
+    """(work order, tip) of every landed stamp, the newest landing first."""
+    rows = []
+    for f in (team.dir / "wo").glob("docs-stamp-*.landed.json"):
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("tip"):
+            rows.append((rec.get("landed_at") or "", f.name[:-len(".landed.json")], rec["tip"]))
+    return [(wo, tip) for _, wo, tip in sorted(rows, reverse=True)]
+
+
+def unpromoted_stamp(team: Team, h: str, wo: str) -> str | None:
+    """An earlier stamp not on base yet: open (cut, in Stage 2 or 4, or sent back), or landed with its tip outside h.
+    While there is one, a promotion cuts no stamp, and what it owes stays in docs-pending.jsonl for the first
+    promotion that holds that stamp, which then builds on it (2026-11-14: each stamp was cut from
+    integration while the one before sat only on landing, so two stamps changed the same version line, and four in one
+    morning were sent back at Stage 4, each waiting for a promote, a wo-pull and a hand merge). Landing is one line,
+    so the newest landed stamp inside h means every older one is too."""
+    d = team.dir / "wo"
+    for f in sorted(d.glob("docs-stamp-*.json")):
+        other = f.name[:-len(".json")]
+        if other != wo and "." not in other and not (d / f"{other}.landed.json").exists() \
+                and not (d / f"{other}.retired.json").exists():
+            return other
+    is_anc = ancestry(team)
+    for other, tip in landed_stamps(team):
+        if other == wo:
+            continue
+        return None if is_anc(tip, h) else other
+    return None
+
+
+def published_stamps(team: Team, base: str, h: str) -> list[str]:
+    """Tips of the landed stamps that this promotion carries to base (in h, not in base), the newest first."""
+    is_anc = ancestry(team)
+    tips = []
+    for _, tip in landed_stamps(team):
+        if is_anc(tip, base):
+            break
+        if is_anc(tip, h):
+            tips.append(tip)
+    return tips
 
 
 class StampFailed(Exception):
@@ -3010,7 +3574,7 @@ def write_stamp_commit(team: Team, wo: str, h: str, take: list[dict], base_hash:
     team.save_wo(rec)
     tree = Path(rec["tree"])
     levels, groups = stamp_levels(take)
-    targets = document_targets(team, tree, levels, base_hash)
+    targets = document_targets(team, tree, levels, base_hash, published_stamps(team, base_hash, h))
     align_doc_targets(tree, targets, groups)
     logs = write_stamp_documents(tree, take, targets)
     write_stamp_changelogs(team, tree, logs)
@@ -3098,14 +3662,21 @@ def stamp_levels(take: list[dict]) -> tuple[dict, set[tuple]]:
     return levels, groups
 
 
-def document_targets(team: Team, tree: Path, levels: dict, base: str) -> dict:
+def document_targets(team: Team, tree: Path, levels: dict, base: str, stamps: list[str] = ()) -> dict:
+    """Each document's version: its owed level applied once to the newest version already published, at the last
+    promotion (base) or by a stamp this promotion carries to base (stamps); a version at or past that is kept (set by
+    hand). A stamp's own bump is no hand-set version: the rows owed now were not in what it published
+    (2026-11-14: a package's patch, owed after the stamp that published 11.2.0, read 11.1.0 as its base, left the
+    document at 11.2.0 and wrote a second 11.2.0 heading)."""
     targets = {}
     for file, level in levels.items():
         path = tree / file
         current = _version(path.read_text()) if path.exists() else None
         if not current:
             continue
-        before = _version(git(team.repo, "show", f"{base}:{file}", check=False).stdout)
+        published = [v for v in (_version(git(team.repo, "show", f"{ref}:{file}", check=False).stdout)
+                                  for ref in (base, *stamps)) if v]
+        before = max(published) if published else None
         targets[file] = max(current, _bump(before, level)) if before and level else current
     return targets
 
@@ -3259,11 +3830,12 @@ def itest_checkout(team: Team, M: str) -> Path:
     return tree
 
 
-def recheck_steps(team: Team, tree: Path, zones: Iterable[str]) -> tuple[list, list]:
-    # Repo gates compare to the moving integration branch, not this recheck's fixed M.
-    zones = list(zones)
+def recheck_steps(team: Team, tree: Path, zones: Iterable[str], files: Iterable[str] = ()) -> tuple[list, list]:
+    # Repo gates compare to the moving integration branch, not this recheck's fixed M. files: what the landing changed
+    # (the row's, written at Stage 4), for the test roots below a plain owned folder.
+    zones, files = list(zones), list(files)
     return ([step for step in compile_steps(team, tree, zones) if step[0] != "repo gates"],
-            [step for zone in zones for step in zone_tests(team, tree, zone, "land", group="integration")]
+            [step for zone in zones for step in zone_tests(team, tree, zone, "land", group="integration", files=files)]
             + repo_integration_steps(tree, team.c("integration_tests", "tests/integration"), "land", str(HERE / "zone-tool")))
 
 
@@ -3271,7 +3843,7 @@ def integration_result(row: dict, results: list[dict], when: str) -> dict:
     """One recheck's record; a step that did not pass keeps its last lines, its log and its failing tests."""
     return {"time": when, "M": row["M"], "wo": row["wo"], "overlapping": row["overlapping"], "zones": row["zones"],
             "tests": [{"name": result["name"], "result": result["outcome"].lower(),
-                       "seconds": round(result["seconds"], 1)}
+                       "seconds": round(result["seconds"], 1)} | queued_field(result)
                       | ({key: result[key] for key in ("failing", "log", "tail") if result.get(key)}
                          if result["outcome"] != "PASS" else {}) for result in results]}
 
@@ -3423,7 +3995,7 @@ def recheck_one(team: Team, row: dict) -> dict:
                 file.write(json.dumps(result) + "\n")
         return result
     else:
-        compile, tests = recheck_steps(team, tree, row["zones"])
+        compile, tests = recheck_steps(team, tree, row["zones"], row.get("files", []))
         env = team_env(team, "integration")
         results = step_results(tree, compile, env, concurrent=False, keep_text=True)
         if all(result["outcome"] == "PASS" for result in results):
@@ -4823,8 +5395,7 @@ def promotion_coordinators(team: Team, files: list[str]) -> dict[str, list[str]]
     reached = set(reach(team, team.repo, files)) if files else set()
     if files:
         reached.add("orc")
-    open_zones = {json.loads(path.read_text())["zone"] for path in (team.dir / "wo").glob("*.json")
-                  if not path.name.endswith((".landed.json", ".retired.json"))}
+    open_zones = {rec["zone"] for _, rec in open_records(team)}
     coordinators = {}
     for zone in sorted(open_zones & reached):
         to = team.c("orchestrator", "orc") if zone == "orc" else f"Coord-{zone}"

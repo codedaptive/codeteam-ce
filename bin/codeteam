@@ -1204,6 +1204,12 @@ def common_values(t):
         "target": t.target, "branch_rows": branch_rows(t),
         # Keep landing-only text out of non-landing teams' rendered roles.
         "landing_note": (
+            "\n\nA lab lands with codeteam-land on its one branch (branch flow v5.4, "
+            "`docs/SPEC-branch-flow-v5.4.md` in the codeteam checkout, for a lab): every work order tree is cut from "
+            f"`{t.base}`, Kong reviews each work order before it lands (Stage 3) and sends findings back to its "
+            f"zone's coordinator, and Stage 4 merges it onto `{t.base}`. There is no `integration` or `landing` "
+            f"branch. Only the landing tool moves `{t.base}`; nobody commits on it directly."
+            if landing(t) and t.lab else
             "\n\nOn a team that lands with codeteam-land (branch flow v5.4, `docs/SPEC-branch-flow-v5.4.md` in the codeteam checkout): "
             f"`{t.base}` holds proven code and moves only at Stage 7, by fast-forward; "
             f"`{t.integration}` is a copy of `{t.base}`, fast-forwarded right after it moves, and every work order "
@@ -1284,6 +1290,12 @@ def base_recipients(t):
 
 
 def branch_rows(t, lane_branch="Lane branches"):
+    if landing(t) and t.lab:
+        # A lab lands on its base itself: codeteam-land's integration and landing are the base (2026-11-14:
+        # a lab's seat text named three branches it does not have).
+        return (f"| `{t.base}` | The lab's one branch: work lands on it directly, one work order at a time (Stage 4); "
+                "a lab has no `integration` or `landing` branch. |\n"
+                f"| Work order tree | One work order, cut from `{t.base}`, moved by its agent. |")
     if landing(t):
         return (f"| `{t.base}` | Proven code; moved only by Stage 7, by fast-forward. |\n"
                 f"| `{t.integration}` | A copy of `{t.base}`, fast-forwarded to it right after it moves; "
@@ -1346,8 +1358,9 @@ def landing_promotion(t):
             f"and new `{t.integration}`, and restarts what the promote changed. `{L} promote [HASH]` runs Stage 7 "
             "now under the same conditions; it refuses with its reason and has no override.\n"
             f"6. Your own edits and the designer's (docs, rulings, specs) land like any change: `{L} wo-cut orc <name>`, "
-            f"edit and commit in that tree, `{L} land <name>`. Nobody commits on `{t.base}`, `{t.integration}` or "
-            f"`{landing_branch(t)}` directly; the guard refuses it.\n"
+            f"edit and commit in that tree, `{L} land <name>`. Nobody commits on "
+            + (f"`{t.base}`" if t.lab else f"`{t.base}`, `{t.integration}` or `{landing_branch(t)}`")
+            + " directly; the guard refuses it.\n"
             f"7. Move-over, once per team (not lab teams): `{L} migrate-v54` renames the old `{t.integration}` "
             f"branch to `{landing_branch(t)}` by pointer, installs the hook, sets `{t.integration}` to `{t.base}`, "
             f"queues one recheck of every zone at `{landing_branch(t)}`'s tip and asks Kong for one backlog review per "
@@ -1512,8 +1525,9 @@ def render_roles(t, team):
         if landing(t) and a.get("role") == "designer":
             L = f"codeteam-land {t.manifest}"
             extra = (f"\n\n## Committing (spec v5)\n\nYour documents land like any change: `{L} wo-cut orc <name>`, "
-                     f"edit and commit in that tree, `{L} land <name>`. Nobody commits on `{t.base}` or "
-                     f"`{t.integration}` directly; the guard refuses it.\n")
+                     f"edit and commit in that tree, `{L} land <name>`. Nobody commits on "
+                     + (f"`{t.base}`" if t.lab else f"`{t.base}` or `{t.integration}`")
+                     + " directly; the guard refuses it.\n")
         (outd / f"{n}.md").write_text(render(tpl.read_text(), {
             **common, "name": n, "job": a.get("job", ""),
             "cwd": t.assistant_cwd(n), "channel": t.assistant_channel(n),
@@ -4322,7 +4336,13 @@ def branch_leftovers(t, team):
         sha, ref = l.split()
         remote[ref.replace("refs/heads/", "")] = sha
     ok = lambda b: b in keep or b in checked_out or any(fnmatch.fnmatch(b, g) for g in allow)
-    extra_local = sorted(b for b in local if not ok(b))
+    # A v5.5 team's zones are jj bookmarks (zone/<zone>), moved by its landing script and never pushed: a pushed one
+    # comes back as an untracked remote bookmark, which jj makes immutable, and the zone's next squash fails.
+    # Here one is neither outside the rule nor unmirrored; on GitHub one is outside the rule.
+    # v5.5 is read from the manifest or from the repo itself (a colocated jj repository has .jj), since a team's loop
+    # may read a manifest of record that lacks the flag (2026-11-13).
+    v55 = (t.m.get("land") or {}).get("v55") is True or (Path(repo) / ".jj").is_dir()
+    extra_local = sorted(b for b in local if not ok(b) and not (v55 and b.startswith("zone/")))
     extra_remote = sorted(b for b in remote if not ok(b))
     unmirrored = sorted(b for b in local if ok(b) and b not in checked_out - keep and remote.get(b) != local[b])
     return extra_local, extra_remote, unmirrored, len(local), len(remote), sum(1 for b in local if ok(b))
@@ -4363,7 +4383,12 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
                                          capture_output=True).returncode == 0
     remote = {}
     if github:
-        for l in git_lines("ls-remote", "--heads", "origin"):
+        listed = subprocess.run(["git", "-C", repo, "ls-remote", "--heads", "origin"], capture_output=True, text=True)
+        if listed.returncode:
+            # A GitHub that cannot be read looked like one with nothing to delete: from 2026-11-13 14:23 the hourly
+            # sweep left every team's landed branches there and said nothing.
+            warn(f"GitHub branches not read ({git_error_line(listed)}); none deleted there")
+        for l in listed.stdout.splitlines() if listed.returncode == 0 else []:
             sha, ref = l.split()
             remote[ref.replace("refs/heads/", "")] = sha
     ours = lambda b: any(fnmatch.fnmatch(b, g) for g in SWEEP_BRANCH_KINDS) and b not in checked_out and b not in keep
@@ -4482,9 +4507,60 @@ def sweep_landed_branches(t: Team, team, dry_run: bool) -> int:
         if go_local:
             subprocess.run(["git", "-C", repo, "branch", "-D", b], capture_output=True)
         if go_remote:
-            subprocess.run(["git", "-C", repo, "push", "-q", "origin", "--delete", b], capture_output=True)
+            gone = subprocess.run(["git", "-C", repo, "push", "-q", "origin", "--delete", b], capture_output=True,
+                                  text=True)
+            if gone.returncode:
+                say_line(f"kept {b} on GitHub: deleting it there failed ({git_error_line(gone)})")
+                if not go_local:
+                    continue
+                where = "here"
         say_line(f"deleted landed branch {b} ({where})"); n += 1
     return n
+
+
+def git_error_line(result: subprocess.CompletedProcess) -> str:
+    """The line of a failed git command's output that says why: its first fatal: line or rejected ref, else its first
+    line, else its exit code (git ends with advice such as "and the repository exists.", which says nothing)."""
+    lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    why = [line for line in lines if line.startswith("fatal:") or "rejected]" in line]
+    return (why or lines or [f"exit {result.returncode}"])[0]
+
+
+def branches_swept_by_loop(t: Team) -> bool:
+    """A team on codeteam v2 has its branch sweep in its loop's hourly backup (`sweep-branches`, after the push),
+    not in cron's `sweep`: git reaches GitHub from the loop, and from cron it has not since 2026-11-13 14:10 ("could
+    not read Username for 'https://github.com': Device not configured", every team)."""
+    return (t.home / "v2" / "up").exists()
+
+
+CRON_JOBS = ("wake", "tick", "patrol", "sweep", "sweep-accepted", "sweep-branches", "rotate")
+LAUNCHD_PREFIX = os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam"
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+
+
+def run_elsewhere(t: Team, agents=None, teams=None) -> str | None:
+    """The team's manifest of record, when this checkout's teams/<x>.toml is only a copy of a team another checkout's
+    tools run: the team's launchd land job names that checkout's bin/codeteam-land and a manifest there (the watchdog's
+    runs_from rule). None for a manifest outside this checkout's teams/, a team with no land job, or a job that
+    runs this checkout's tool on this manifest. Cron's jobs stand aside for such a team:
+    when a v5.5 checkout runs a team's loop and runners, this checkout's teams/<x>.toml is a stale copy with no
+    v55, and its hourly sweep once removed worktrees and branches in the team's colocated jj repo by v1 rules, where a
+    deleted branch is a deleted bookmark; its minute wake would start this checkout's loop on that copy if the real
+    one died."""
+    import plistlib
+    manifest = Path(t.manifest).resolve()
+    if manifest.parent != Path(teams or TOOL_DIR / "teams").resolve():
+        return None
+    try:
+        with open(Path(agents or LAUNCH_AGENTS) / f"{LAUNCHD_PREFIX}.codeteam-land.{manifest.stem}.plist", "rb") as f:
+            args = [str(a) for a in plistlib.load(f).get("ProgramArguments", [])]
+    except Exception:                   # no job, or one that does not read as a plist: this checkout's, as before
+        return None
+    land = next((Path(a) for a in args if Path(a).name == "codeteam-land"), None)
+    other = next((Path(a) for a in args if a.endswith(".toml")), None)
+    if land is None or other is None or land.resolve().parent.parent == TOOL_DIR or other.resolve() == manifest:
+        return None
+    return str(other)
 
 
 def cmd_sweep_branches(t: Team, args):
@@ -5160,7 +5236,8 @@ def cmd_sweep(t: Team, args):
     sweep_orphan_worktrees(t, team, args.dry_run)
     sweep_landed_worktrees(t, team, args.dry_run)
     sweep_builds_and_units(t, team, args.dry_run)
-    sweep_landed_branches(t, team, args.dry_run)
+    if not branches_swept_by_loop(t):
+        sweep_landed_branches(t, team, args.dry_run)
     if not args.dry_run:
         tm_exclude_team(t)
     if args.dry_run:
@@ -5383,9 +5460,18 @@ def main():
 
     a = ap.parse_args()
     t = Team(a.manifest)
+    # A team another checkout's tools run, seen through a copy of its manifest here: no cron job of this checkout acts
+    # on it, not even a dry run, which would answer by this checkout's rules. Wake runs every minute: silent.
+    if a.cmd in CRON_JOBS:
+        other = run_elsewhere(t)
+        if other:
+            if a.cmd != "wake":
+                print(f"{t.product} is run from {other} by that checkout's tools: this checkout's {a.cmd} stands "
+                      f"aside")
+            return
     # A HALTED file beside the registry stops every cron job for the team, not only wake
     # (2026-10-23): sweep removes worktrees and branches, patrol and tick post and type.
-    if a.cmd in ("wake", "tick", "patrol", "sweep", "sweep-accepted", "sweep-branches", "rotate") and \
+    if a.cmd in CRON_JOBS and \
             not getattr(a, "dry_run", False) and (registry_file(t).parent / "HALTED").exists():
         if a.cmd == "sweep":
             # A halted team's idle build output still goes (2026-11-05: halting one team would have kept 220 GB);

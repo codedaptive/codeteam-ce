@@ -320,10 +320,11 @@ decision is seen at the next (one tick later).
   the test itself, after marking its job `running` with `fallback: true`, `started` and `record_mtime` (only while still
   `queued`; a job the runner already started carries on as a wait). `--wait auto` waits `BASH_DEFAULT_TIMEOUT_MS` / 1000
   less 60 seconds when that variable is set (1740 in a codeteam session), at least 30, else 100.
-- `job wait <ticket> [--max SECONDS]` (default 540): exit 0 DONE (prints the job's log, then
-  `zone-test: <result> (exit N); record <path>`, or `zone-test: <result> (exit N); answered from record <path>` for an
-  `answered` job; a FAIL is still 0), 4 WAITING (`WAITING: queued, number N in class C,
-  estimated start HH:MM` or `unknown`, with `, held: <hold>` added when `hold` is set, or `WAITING: running for M min`;
+- `job wait <ticket> [--max SECONDS]` (default 540): exit 0 DONE (prints the job's log, then, for a job that ran,
+  `zone-tool: queued N s, ran M s (job <ticket>)`, then `zone-test: <result> (exit N); record <path>`, or
+  `zone-test: <result> (exit N); answered from record <path>` for an `answered` job; a FAIL is still 0), 4 WAITING
+  (`WAITING: queued, number N in class C, estimated start HH:MM` or `unknown`, with `, held: <hold>` added when
+  `hold` is set, or `WAITING: running for M min`;
   then `WAITING: zone-tool job wait <ticket>`), 3 BROKEN (`BROKEN: <reason>`), 2 no such ticket. A wait that finds the
   runner dead starts it again; on a stale beat it prints `WAITING: the runner is not responding (last beat N s ago)` and
   exits 4. It never runs the test.

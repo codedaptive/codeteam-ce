@@ -2107,8 +2107,32 @@ class BackgroundWorkTests(unittest.TestCase):
     def test_background_work_is_not_ended_for_idleness(self):
         st = {"a": {"state_since": NOW - 7 * 3600, "bg_until": NOW + 600}}
         self.assertFalse([x for x in P(status={"a": "idle"}, st=st, idle_exit_min=360) if x[0] == "stop"])
-        st["a"]["bg_until"] = NOW - 1                       # an hour later: idle exit may try again
+        st["a"]["bg_until"] = NOW - 1                       # once the hold ends: idle exit may try again
         self.assertIn(("stop", "a", "idle"), P(status={"a": "idle"}, st=st, idle_exit_min=360))
+
+    def test_a_cancelled_exit_holds_the_lane_for_bg_hold_s(self):
+        # A swapped lane whose own land runs in the background is asked again after
+        # BG_HOLD_S (10 min), not an hour, so it yields its slot soon after the land ends.
+        from unittest.mock import patch
+        from codeteam2 import scheduler
+        keys, logs = [], []
+        herdr = SimpleNamespace(agent_read=lambda agent, lines: "Background work is running\n> 1. Exit and stop tasks",
+                                agent_send_keys=lambda agent, key: keys.append(key))
+        rt = SimpleNamespace(herdr=herdr, log=logs.append)
+        s = SimpleNamespace(key="a", agent="ag", display="Coord-a")
+        st = {"a": {"stop_reason": "swap", "stopping_at": NOW - 3}}
+        with patch.object(scheduler, "ts", return_value=NOW):
+            Runtime.confirm_exit(rt, s, st)
+        self.assertEqual(st["a"]["bg_until"], NOW + 600)
+        self.assertEqual(keys, ["esc"])                    # the exit is cancelled, the work goes on
+        self.assertIsNone(st["a"]["stopping_at"])
+        self.assertEqual(logs, ["exit Coord-a cancelled: background work is running; left alone for 10 min"])
+        held = P(status={"a": "idle", "b": "absent"}, st={"a": {**st["a"], "state_since": NOW - 3600}},
+                 pending={"b": [(1, NOW - 60)]}, cap=1)
+        self.assertNotIn(("stop", "a", "swap"), held)      # within the hold: not swapped again
+        later = P(status={"a": "idle", "b": "absent"}, st={"a": {**st["a"], "state_since": NOW - 3600}},
+                  pending={"b": [(1, NOW - 60)]}, cap=1, now=NOW + 601)
+        self.assertIn(("stop", "a", "swap"), later)        # after it: swapped for the lane with mail
 
 
 class PatrolTests(unittest.TestCase):

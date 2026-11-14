@@ -1,0 +1,55 @@
+// BUILDS · queue (render._build_box): the job strip (running green, queued grey), the counts, the runner's budget
+// and swap, class chips, the jobs, the 24 h waits and the warms. Empty when the queue has nothing to show.
+import { buildJobs } from "./buildJobs.js";
+import { fmt } from "./fmt.js";
+import { h } from "./h.js";
+
+// Worktree tails in the warm rows are capped as render.PATH_CAP.
+const PATH_CAP = 14;
+
+function runnerLine(runner) {
+  if (runner.state !== "live") {
+    const beat = runner.state === "stale" ? ` (last beat ${fmt.dur(runner.beat_age_s)} ago)` : "";
+    return h.span(`no live runner${beat}`, "amber");
+  }
+  const used = fmt.num(runner.used);
+  const budget = fmt.num(runner.budget);
+  const swap = fmt.num(runner.swap);
+  const line = h.span("budget", "dim") + " " + h.bar(used, budget, "green") + " "
+    + h.span(`${fmt.g(used === null ? null : Math.floor(used + 0.5))}/${fmt.g(budget)}`, "bold") + h.span("   swap", "dim") + " ";
+  if (swap === null) return line + h.span("?", "amber");
+  return line + h.bar(swap, 1, runner.swap_hold === true ? "salmon" : "green") + " " + h.span(`${(swap * 100).toFixed(0)}%`, "dim");
+}
+
+function chip(c) {
+  const ceiling = c.ceiling === 0 ? "∞" : fmt.g(c.ceiling);
+  return `<span class="chipline">${h.span(c.class || "?", "teal bold")} ${h.span(`${fmt.dicts(c.running).length}/${ceiling}`, "dim")}</span>`;
+}
+
+function waits(c) {
+  const w = fmt.mapping(c.waits);
+  return (fmt.num(w.n) || 0) > 0 ? h.row(h.span(`waits ${fmt.g(w.window_h)}h · ${c.class || "?"} · ${fmt.g(w.n)} · `
+    + `med ${fmt.dur(w.median_s)} · max ${fmt.dur(w.max_s)}`, "dim")) : "";
+}
+
+export function builds(snapBuilds, motion) {
+  const b = fmt.mapping(snapBuilds);
+  const queue = fmt.mapping(b.queue);
+  const runner = fmt.mapping(queue.runner);
+  const classes = fmt.dicts(queue.classes);
+  const running = classes.flatMap((c) => fmt.dicts(c.running));
+  const queued = classes.flatMap((c) => fmt.dicts(c.queued));
+  const warms = fmt.dicts(b.warms);
+  const active = classes.some((c) => (fmt.num(fmt.mapping(c.waits).n) || 0) > 0);
+  if (!(running.length || queued.length || active || runner.state === "live" || warms.length)) return "";
+  const sweep = motion && running.length ? " sweep" : "";
+  const strip = running.map(() => `<i class="bg-green${sweep}"></i>`).join("") + queued.map(() => '<i class="bg-faint"></i>').join("");
+  const body = h.row(`<span class="strip">${strip}</span>`)
+    + h.row(h.span("■", "green") + " " + h.span(`${running.length} running`, "green") + "   "
+      + h.span("■", "dim") + " " + h.span(`${queued.length} queued`, "dim"))
+    + h.row(runnerLine(runner)) + h.row(classes.map(chip).join(""), "chips")
+    + buildJobs(running, queued) + classes.map(waits).join("")
+    + warms.map((w) => h.row(h.span(`warm ${w.state || "?"} ${fmt.dur(w.elapsed_s)} ${fmt.tail(w.worktree, PATH_CAP)}`, "dim"))).join("");
+  const right = h.span(`${running.length + queued.length} jobs`, "dim") + (queue.state === "?" ? h.span(" · queue ?", "amber") : "");
+  return h.box(h.span("BUILDS · queue", "green bold"), right, body, "green", "builds");
+}

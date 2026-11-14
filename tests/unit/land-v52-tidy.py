@@ -225,6 +225,25 @@ def test_stopped_by_reads_the_swift_compile_cache_error_on_a_step_that_did_not_p
     assert cl.stopped_by("FAIL", "XCTAssertEqual failed: the cache poisoned flag was not set") is None
 
 
+def test_a_finished_test_run_is_a_test_failure_even_beside_a_cache_error():
+    # 2026-11-14: xcodebuild logged "failed to update cache: cache poisoned" twice while building a package,
+    # then ran 1409 tests and two failed; the step read as CACHE, "nothing to fix", twice.
+    poisoned = ("error: failed to update cache: cache poisoned for '4a19' (new='llvmcas://747a' vs. "
+                "existing 'llvmcas://553a')\n")
+    for ran in ("\U00100884 Test run with 1409 tests in 179 suites failed after 24.575 seconds with 2 issues.",
+                "\t Executed 12 tests, with 1 failure (0 unexpected) in 0.512 (0.600) seconds",
+                "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+                "==== 1 failed, 30 passed in 1.23s ===="):
+        assert cl.stopped_by("FAIL", poisoned + ran + "\n** TEST FAILED **") is None, ran
+    # A build stopped before any test ran: no summary, XCTest's zero count, or only xcodebuild's verdict.
+    for not_ran in ("", "\t Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.021) seconds",
+                    "** TEST FAILED **"):
+        assert cl.stopped_by("FAIL", poisoned + not_ran) == "cache", not_ran
+    # A full disk stays the machine's, whatever ran.
+    assert cl.stopped_by("FAIL", "No space left on device\nTest run with 3 tests in 1 suite failed after 1 seconds") \
+        == "disk"
+
+
 def test_stage2_steps_records_a_full_disk_step_as_disk_and_says_it_is_no_test_failure():
     # Two Stage 2 runs once died of ENOSPC and read as test failures. The exit stays 3 (SPEC v5.4
     # Stage 2 step 7); the record and the words say what stopped it.

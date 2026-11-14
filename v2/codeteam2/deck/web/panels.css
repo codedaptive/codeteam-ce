@@ -1,0 +1,78 @@
+/* Boxes, rows, gauges and each panel's columns. Rows are one --row high; numbers are monospace with tabular
+   figures so columns line up; cut cells end in an ellipsis and carry their full text in title. */
+.box {
+  background: var(--panel); border: 1px solid var(--edge); border-radius: 6px;
+  padding: 2px 8px 3px; min-width: 0;
+}
+.box > header { display: flex; align-items: baseline; gap: 10px; height: 19px; overflow: hidden; }
+.box > header .title { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.box > header .right { flex: none; white-space: nowrap; }
+.k-blue { border-color: var(--blue); } .k-coral { border-color: var(--coral); }
+.k-green { border-color: var(--green); } .k-amber { border-color: var(--amber); }
+.k-coral > header .title, .k-green > header .title, .k-amber > header .title { font-weight: 650; }
+
+.row { height: var(--row); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex;
+  align-items: center; gap: 0 4px; min-width: 0; }
+.row > * { flex: none; }
+.row.wrap { height: auto; min-height: var(--row); flex-wrap: wrap; white-space: normal; }
+.row.wrap > * { white-space: nowrap; }
+.num, .bar + span, .row .c-dim, .srow, .job, .mrow, .alert, .counts { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.srow .name, .alert .tname, .halted .tname, .disk .tname { font-family: var(--sans); }
+.cut { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.cut.lead { direction: rtl; text-align: left; }
+.push { margin-left: auto; }
+.c-chipped { border: 1px solid currentColor; border-radius: 3px; padding: 0 3px; line-height: 13px; }
+
+/* Bars: a track and a fill whose width is the value; pips add segment gaps; steps are effort's five cells. */
+.bar, .pips { position: relative; display: inline-block; height: 7px; border-radius: 4px; background: var(--track);
+  overflow: hidden; vertical-align: middle; flex: none; width: 64px; }
+.bar.ctx { width: 36px; } .bar.wide { width: 96px; } .bar.disk { width: 110px; }
+.bar > i, .pips > i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; }
+.pips { width: calc(var(--cells) * 7px); border-radius: 1px;
+  -webkit-mask: repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 7px);
+  mask: repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 7px); }
+.pips > i { border-radius: 0; }
+.steps { display: inline-flex; gap: 2px; } .steps > i { width: 6px; height: 9px; border-radius: 1px; }
+.spark { vertical-align: middle; flex: none; }
+
+/* FLEET: cells across the full width. */
+.fleet .cells { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0 10px; }
+.fleet .cell { min-width: 0; }
+
+/* A team box: stats over the session rows; each row a grid of cursor, glyph, name, age, bar, %, cost, badge. */
+.srow { display: grid; grid-template-columns: 8px 12px minmax(56px, 1fr) 38px 36px 32px 50px minmax(0, max-content);
+  align-items: center; column-gap: 4px; height: var(--row); cursor: pointer; border-radius: 3px; }
+.srow > .num { text-align: right; }
+.srow:hover { background: var(--track); }
+.srow.current { background: color-mix(in srgb, var(--blue) 14%, transparent); }
+.srow .badge { margin-left: 2px; max-width: 96px; }
+.halted .tname { width: 84px; }
+
+/* Focus and agents. */
+.focus .detail, .agents .detail { padding-left: 14px; }
+.agents { padding: 0 2px; }
+.agents .ahead { margin-bottom: 1px; }
+.arow .label { width: 150px; flex: none; }
+.arow .owner { max-width: 70px; }
+.lane { position: relative; display: inline-block; width: 92px; height: 7px; flex: none;
+  background: repeating-linear-gradient(90deg, var(--faint) 0 1px, transparent 1px 5px); }
+.lane > i { position: absolute; top: 2px; height: 3px; border-radius: 2px; }
+
+/* BUILDS. */
+.strip { display: flex; gap: 2px; flex-wrap: nowrap; overflow: hidden; }
+.strip > i { width: 9px; height: 10px; border-radius: 2px; flex: none; }
+.chips { gap: 12px; }
+.job .wt { max-width: 90px; }
+
+/* log: time, sender, arrow, recipient, kind, text. */
+.mrow { display: grid; grid-template-columns: 62px 70px 10px 70px 54px minmax(0, 1fr); column-gap: 4px;
+  height: var(--row); align-items: center; }
+.mrow .who { font-family: var(--sans); }
+.tops { font-family: var(--sans); }
+
+/* DISK and ALERTS. */
+.disk .tname { width: 80px; }
+.disk .row > .num { width: 52px; text-align: right; }
+.wtrow { padding-left: 14px; }
+.alert .tname { width: 84px; flex: none; }
+.alert .text { flex: 1 1 auto; }

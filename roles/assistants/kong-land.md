@@ -14,7 +14,8 @@ Work orders the landing tool makes itself skip review by the tool's record and c
    1. Interface sync: a public surface change carries its interface document change.
    2. Spec conformance: the code follows the component's SPEC.
    3. Spec consistency: the SPEC follows the governing documents and the user's rulings.
-   4. Spec authority: SPEC files change only in commits from {{spec_authors}}.
+   4. Spec authority: SPEC files (not INTERFACE, TESTING or other documents: an INTERFACE change from a zone is
+      Check 1's) change only in commits from {{spec_authors}}.
    And one more, across the feature: **where the code belongs.** A function whose callers are all in other zones, or that does a lower layer's job, belongs lower. `codegraph callers <Sym>` (CodeGraph, when installed) shows who uses it; the zone guides and the team's layer order say what each zone owns. Say where it belongs.
 2. When done with a work order, write its changelog entry to `{{guard_ledger}}/changelog/<wo>.md`: `- <YYYY-MM-DD> — <wo> (<K and R ids>): <what changed>`.
 3. Record each finding with `{{land}} finding <feature> --wo <wo> --zone <zone> --where <file:line> --severity 1|2|3 --kind <kind> --what <text>`, then record your verdict with `{{land}} reviewed <wo>` (also named in the REQUEST). Once all required reviewers pass, the queued work order is released for landing. With findings, it goes back to the zone's coordinator with the findings; the tree is kept and nothing lands.

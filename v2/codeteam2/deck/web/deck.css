@@ -1,0 +1,67 @@
+/* The deck's palette and page layout. Colours are render.PALETTE's xterm-256 pastels in true colour (dark, the
+   default), with a darker set for a light system theme. Layout: header, FLEET, then the middle (team boxes in
+   columns, two dock columns), then ALERTS and the keys, all inside one 100vh screen. */
+:root {
+  --bg: #1e1f29; --panel: #23242f; --text: #d4d4d8;
+  --coral: #d7875f; --purple: #d7afff; --teal: #5fd7d7; --blue: #87afff; --green: #87d787; --sky: #87d7ff;
+  --amber: #ffd75f; --salmon: #ff8787; --dim: #767676; --edge: #626262; --faint: #444444; --orange: #ffaf5f;
+  --pulse2: #5faf87; --pulse3: #5f875f; --track: #2e2f3b;
+  --row: 17px; --gap: 6px;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f6f8; --panel: #ffffff; --text: #26272e;
+    --coral: #b65a2c; --purple: #8350c0; --teal: #11807f; --blue: #3a66c4; --green: #3c8a3c; --sky: #22789f;
+    --amber: #946c00; --salmon: #c63c3c; --dim: #6c6c76; --edge: #d3d3db; --faint: #c4c4cc; --orange: #b4630f;
+    --pulse2: #5faf87; --pulse3: #2f6f4f; --track: #e9e9ef;
+    color-scheme: light;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+body { font: 12px/var(--row) var(--sans); }
+.waiting { margin: 2em; color: var(--dim); }
+
+.deck {
+  display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto; gap: var(--gap);
+  height: 100vh; padding: 6px 10px 4px; overflow: hidden;
+}
+.top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 18px; }
+.counts { font-size: 13px; letter-spacing: 0.02em; }
+.legend { display: flex; flex-wrap: wrap; gap: 0 12px; }
+.legend .key { white-space: nowrap; }
+.chip { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
+.middle {
+  display: grid; grid-template-columns: minmax(0, 1fr) 344px 324px; gap: var(--gap);
+  min-height: 0; overflow: hidden;
+}
+.teams { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gap); min-height: 0; overflow: hidden; }
+.tcol { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; min-height: 0; overflow: hidden; }
+.tcol > * { flex: none; }
+.dock { display: flex; flex-direction: column; gap: var(--gap); min-height: 0; overflow: hidden; }
+.dock > * { flex: none; }
+.keys { display: flex; justify-content: center; gap: 18px; color: var(--dim); }
+
+/* Narrow windows: one column that scrolls, as the terminal stacks under 120 columns. */
+@media (max-width: 1100px) {
+  .deck { height: auto; overflow: visible; }
+  .middle { grid-template-columns: minmax(0, 1fr); overflow: visible; }
+  .teams { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Colour words (render.py's) as text, fill and SVG classes. */
+.c-coral { color: var(--coral); } .c-purple { color: var(--purple); } .c-teal { color: var(--teal); }
+.c-blue { color: var(--blue); } .c-green { color: var(--green); } .c-sky { color: var(--sky); }
+.c-amber { color: var(--amber); } .c-salmon { color: var(--salmon); } .c-dim { color: var(--dim); }
+.c-edge { color: var(--edge); } .c-faint { color: var(--faint); } .c-orange { color: var(--orange); }
+.b { font-weight: 650; }
+.bg-coral { background: var(--coral); } .bg-purple { background: var(--purple); } .bg-teal { background: var(--teal); }
+.bg-blue { background: var(--blue); } .bg-green { background: var(--green); } .bg-sky { background: var(--sky); }
+.bg-amber { background: var(--amber); } .bg-salmon { background: var(--salmon); } .bg-dim { background: var(--dim); }
+.bg-faint { background: var(--faint); } .bg-orange { background: var(--orange); }
+.f-blue { fill: var(--blue); } .f-faint { fill: var(--faint); } .f-sky { fill: var(--sky); }

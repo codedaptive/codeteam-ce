@@ -152,7 +152,7 @@ def scope_dirs(root, d, depth=None):
             if not named:
                 out.append(child.name)
         return out
-    seen, todo = set(), [(p, 0)]
+    seen, reads, todo = set(), set(), [(p, 0)]
     while todo:
         q, level = todo.pop()
         try:
@@ -167,6 +167,8 @@ def scope_dirs(root, d, depth=None):
         ports = rust_ports(q)
         if ports:
             excl[rel] = ports
+        if (q / "Cargo.toml").is_file():
+            reads |= rust_reads(q, rroot)
         mans = [q / "Package.swift", q / "Cargo.toml"] + sorted(q.glob("*/Package.swift")) + sorted(
             m for m in q.glob("*/Cargo.toml") if m.parent.name not in ports)
         for man in mans:
@@ -178,7 +180,38 @@ def scope_dirs(root, d, depth=None):
                     continue
                 todo.append((t, level + 1))
     extra = [e.strip().strip("/") for e in os.environ.get("ZONE_SCOPE_ALWAYS", "scripts").split(":") if e.strip()]
-    return [f"{d}!{'!'.join(excl[d])}" if d in excl else d for d in sorted(seen | set(extra))]
+    return [f"{d}!{'!'.join(excl[d])}" if d in excl else d for d in sorted(seen | reads | set(extra))]
+
+
+# A string literal in a Rust source that climbs out of its folder: a fixture beside the Swift port read at run time
+# ("../Tests/Conformance/x.json", from the crate folder, which is the tests' working folder and CARGO_MANIFEST_DIR) or
+# a file include_str!/include_bytes! takes in (from the source file's own folder).
+RUST_READ = _re.compile(r'"([^"\n]*\.\./[^"\n]*)"')
+
+
+def rust_reads(crate, rroot):
+    """The folders outside the crate that its Rust sources name by a relative path: each literal is tried from the
+    crate folder and from its file's folder, and the nearest existing folder at or above the path goes in the scope,
+    unless that is the crate itself, a folder holding the crate, or outside the worktree
+    (2026-11-14: one crate's Rust tests read ../Tests/Conformance/rendered_span_text_fixtures.json, the scope held only
+    the crate, and a fixture-only fix answered "nothing these tests touch has changed" with the old FAIL)."""
+    crate = crate.resolve()
+    out = set()
+    for folder, dirs, files in os.walk(crate):
+        dirs[:] = [d for d in dirs if d != "target" and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".rs"):
+                continue
+            f = Path(folder) / name
+            for lit in RUST_READ.findall(f.read_text(errors="replace")):
+                for start in (crate, f.parent):
+                    q = (start / lit.lstrip("/")).resolve()
+                    while not q.is_dir() and rroot in q.parents:
+                        q = q.parent
+                    if rroot not in q.parents or q == crate or crate in q.parents or q in crate.parents:
+                        continue
+                    out.add(str(q.relative_to(rroot)))
+    return out
 
 
 def code_hash(root, scope=None, snap=None):
@@ -1273,11 +1306,17 @@ def claim_fallback(q, ticket, why, record):
 
 
 def print_done(q, job):
-    """A done job's log, then its summary line; for a job whose test was answered from an existing record (it
-    ran nothing), the line says so."""
+    """A done job's log, then how long it waited in the queue and ran (a job that ran), then its summary line; for a
+    job whose test was answered from an existing record (it ran nothing), the summary says so. codeteam-land records
+    the wait apart from the step's seconds; the summary stays last, which records_pass needs."""
     with contextlib.suppress(FileNotFoundError):
         log = (q / f"{job['ticket']}.log").read_text(errors="replace")
         sys.stdout.write(log if log.endswith("\n") or not log else log + "\n")
+    times = [job.get(key) for key in ("submitted", "started", "finished")]
+    if not job.get("answered") and all(isinstance(t, (int, float)) for t in times):
+        submitted, started, finished = times
+        print(f"zone-tool: queued {max(0, started - submitted):.0f} s, ran {max(0, finished - started):.0f} s "
+              f"(job {job['ticket']})")
     code = job.get("exit")
     source = "answered from record" if job.get("answered") else "record"
     print(f"zone-test: {job.get('result') or ('PASS' if code == 0 else 'FAIL')} (exit {code}); {source} {job['record']}")

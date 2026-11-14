@@ -177,10 +177,12 @@ def test_recheck_steps_only_type_check_and_integration():
     with patch.object(cl, "compile_steps", return_value=[("compile A (a)", "check"), ("repo gates", "gates")]) as compile_, \
             patch.object(cl, "zone_tests", side_effect=[[('tests A', 'a')], [('tests B', 'b')]]) as tests, \
             patch.object(cl, "repo_integration_steps", return_value=[('integration tests (tests/integration)', 'repo')], create=True):
-        assert cl.recheck_steps(team, tree, ["A", "B"]) == ([('compile A (a)', 'check')],
+        assert cl.recheck_steps(team, tree, ["A", "B"], ["tools/p/a.swift"]) == ([('compile A (a)', 'check')],
             [('tests A', 'a'), ('tests B', 'b'), ('integration tests (tests/integration)', 'repo')])
     compile_.assert_called_once_with(team, tree, ["A", "B"])
-    assert tests.call_args_list == [call(team, tree, "A", "land", group="integration"), call(team, tree, "B", "land", group="integration")]
+    # the landing's files reach each zone's tests, for the test roots below a plain owned folder
+    assert tests.call_args_list == [call(team, tree, "A", "land", group="integration", files=["tools/p/a.swift"]),
+                                    call(team, tree, "B", "land", group="integration", files=["tools/p/a.swift"])]
 
 
 def test_step_results_outcome_tail_and_per_step_time():

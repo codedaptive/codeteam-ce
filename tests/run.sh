@@ -265,6 +265,12 @@ T8=$( { printf '100644 blob %s\tf8\n' $F8; git -C $B ls-tree 'lane/AKit^{tree}';
 git -C $B branch unit/AKit/f8 $(G -C $B commit-tree $T8 -p $L0 -m 'unit f8 work, never squashed')
 git -C $B update-ref refs/heads/lane/AKit $(G -C $B commit-tree $T9 -p $L0 -m "$(printf 'squash of t3 and f9\n\nWorktree: agent-t3')")
 git -C $B push -q origin worktree-agent-t1 worktree-agent-t2 hand/made 2>/dev/null
+# a team on v2 has its branch sweep in its loop's hourly backup, where git reaches GitHub; cron's does not
+H=$(python3 -c "import importlib.machinery as m, importlib.util as u; l=m.SourceFileLoader('ct','$CT'); s=u.spec_from_loader('ct',l); ct=u.module_from_spec(s); l.exec_module(ct); print(ct.Team('acme.toml').home)")
+mkdir -p "$H/v2" && touch "$H/v2/up"
+check "a v2 team's cron sweep leaves its branches to the loop's backup" "out=\$($CT sweep acme.toml --dry-run 2>&1) && ! echo \"\$out\" | grep -q 'would delete landed branch'"
+rm -f "$H/v2/up"; rmdir "$H/v2" 2>/dev/null
+check "a v1 team's cron sweep still sweeps its branches" "$CT sweep acme.toml --dry-run 2>&1 | grep -q 'would delete landed branch worktree-agent-t1'"
 check "sweep-branches --dry-run deletes nothing" "$CT sweep-branches acme.toml --dry-run | grep -q '3 landed branches would be deleted' && git -C $B rev-parse -q --verify worktree-agent-t1 >/dev/null"
 $CT sweep-branches acme.toml >/dev/null 2>&1
 git -C $B update-ref refs/heads/lane/AKit $L0

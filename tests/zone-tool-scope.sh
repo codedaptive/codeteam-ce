@@ -42,6 +42,16 @@ echo d2 > pk/D/d.rs;              t "a dependency of the package's rust/ crate c
 echo r > pk/A/rust/lib.rs;        t "a file in the package's own rust/ port: Swift not run again" cached pk/A
 t "the rust/ port's own record: first run" ran pk/A/rust
 echo d3 > pk/D/d.rs;              t "the rust/ port's dependency changed: Rust runs" ran pk/A/rust
+# What the crate reads beside the Swift port: a fixture its tests open by a path from the crate
+# folder, and a file include_str! takes in from its own source file's folder.
+mkdir -p pk/A/Tests/Conformance pk/A/Tests/Vectors pk/A/rust/tests pk/A/rust/src
+echo '{}' > pk/A/Tests/Conformance/fx.json; echo v > pk/A/Tests/Vectors/v.txt; echo s > pk/A/Tests/ATests.swift
+echo 'const FX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../Tests/Conformance/fx.json");' > pk/A/rust/tests/fx.rs
+echo 'const V: &str = include_str!("../../Tests/Vectors/v.txt");' > pk/A/rust/src/inc.rs
+t "the crate's new sources: Rust runs" ran pk/A/rust
+echo '{"a":1}' > pk/A/Tests/Conformance/fx.json; t "a fixture the Rust tests read beside the Swift port changed: Rust runs" ran pk/A/rust
+echo v2 > pk/A/Tests/Vectors/v.txt; t "a file include_str! takes in beside the Swift port changed: Rust runs" ran pk/A/rust
+echo s2 > pk/A/Tests/ATests.swift;  t "a Swift test the crate does not read changed: Rust not run again" cached pk/A/rust
 echo a2 > pk/A/a.swift;           t "the package itself changed: runs" ran pk/A
 echo n > pk/A/new.swift;          t "an untracked file in the package: runs" ran pk/A
 echo run2 > scripts/run;          t "the test runner (scripts) changed: runs" ran pk/A

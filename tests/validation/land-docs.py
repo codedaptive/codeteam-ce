@@ -89,10 +89,10 @@ def run_queue(times=3):
         land("queue-run", "--once")
 
 
-def promote(stamp=True):
+def promote(stamp=True, at=None):
     team = cl.Team(W / "team.toml")
     team.cfg["docs"]["enabled"] = stamp
-    tip = sh("git rev-parse landing").stdout.strip()
+    tip = at or sh("git rev-parse landing").stdout.strip()
     with (ROOT / "land" / "validation-results.jsonl").open("a") as file:
         file.write(json.dumps({"commit": tip, "result": "pass", "tests": []}) + "\n")
     output, errors = io.StringIO(), io.StringIO()
@@ -324,6 +324,57 @@ for _ in range(2):
 t("the next promotion stamps what the failed one owed", before == ("2.0.0", "4.0.1") and ver(THIRD) == "2.1.0"
   and ver(GUIDE) == "4.1.0", (before, ver(THIRD), ver(GUIDE)))
 t("nothing is left pending after it", pending() == [], pending())
+
+print("== stamps in a row: one in flight, and an owed level goes on top of what a stamp published")
+
+
+def passed(commit):
+    with (ROOT / "land" / "validation-results.jsonl").open("a") as f:
+        f.write(json.dumps({"time": "now", "commit": commit, "result": "pass", "seconds": 1,
+                            "tests": [{"name": "suite", "result": "pass", "seconds": 1}]}) + "\n")
+
+
+if sh("git rev-parse landing").stdout != sh("git rev-parse integration").stdout:
+    promote(stamp=False)
+g0 = tuple(int(x) for x in ver(GUIDE).split("."))
+minor, patch_ = f"{g0[0]}.{g0[1] + 1}.0", f"{g0[0]}.{g0[1] + 1}.1"
+wo("x4267", {GUIDE: main(GUIDE).replace("A later change.", "A later change. X.")}, msg="X: guide\n\nDoc-Level: minor")
+run_queue()
+L1 = sh("git rev-parse landing").stdout.strip()
+ytree = Path(land("wo-cut", "A", "y4267").stdout.strip())
+(ytree / GUIDE).write_text((ytree / GUIDE).read_text().replace("\n# Doc\n", "\n# Doc, the guide\n", 1))   # cut from
+# integration, which does not hold X yet: Y changes another line
+sh("git add -A && git -c user.email=t@t -c user.name=l commit --trailer 'Agent: repo-orchestrator' --trailer 'Model: claude-opus-5-5' --trailer 'Effort: xhigh' --trailer 'Worktree: d455' -qm 'Y: guide again'", cwd=ytree)
+land("land", "y4267")                       # queued before the stamp that X's promotion cuts
+passed(L1)
+promote(at=L1)                              # X's stamp, cut from L1, queued after Y
+run_queue(1)
+L2 = sh("git rev-parse landing").stdout.strip()
+run_queue(1)
+s1 = ROOT / "land" / "wo" / f"docs-stamp-{L1[:10]}.landed.json"
+t("X's stamp lands after Y (the order one team saw)", s1.exists()
+  and sh(f"git merge-base --is-ancestor {L2} landing", check=False).returncode == 0
+  and sh(f"git merge-base --is-ancestor {json.loads(s1.read_text())['tip'] if s1.exists() else L1} {L2}",
+         check=False).returncode == 1, sh("git log --oneline -4 landing").stdout)
+passed(L2)
+r = promote(at=L2)
+t("a promotion that does not hold the earlier stamp cuts no stamp, and says why",
+  not list((ROOT / "land" / "wo").glob(f"docs-stamp-{L2[:10]}*")) and "Document stamp waits" in r.stderr,
+  r.stderr[-400:])
+t("what that promotion owes stays owed", level("y4267", GUIDE) == "patch", pending())
+run_queue()
+for _ in range(2):
+    passed(sh("git rev-parse landing").stdout.strip())
+    promote()
+    run_queue()
+t(f"the next promotion applies the owed patch on top of the version the stamp published "
+  f"({'.'.join(map(str, g0))} -> {minor} -> {patch_})", ver(GUIDE) == patch_, ver(GUIDE))
+glog = main("A/docs/guide_CHANGELOG.md")
+t("one changelog heading for each version", glog.count(f"## {minor} -- ") == 1 and glog.count(f"## {patch_} -- ") == 1,
+  glog[-600:])
+t("no stamp was sent back by a landing conflict", not list((ROOT / "land" / "wo").glob("docs-stamp-*.bounce.txt")),
+  [p.name for p in (ROOT / "land" / "wo").glob("docs-stamp-*.bounce.txt")])
+t("nothing is left pending", pending() == [], pending())
 
 print(f"\n{'all passed' if not fails else f'{fails} failed'}  ({W})")
 sys.exit(1 if fails else 0)

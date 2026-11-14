@@ -1,0 +1,25 @@
+/* SPEC-deck-motion §A in CSS: working glyphs breathe in three greens, running build cells sweep, arriving mail
+   flashes bold amber for 2 s, running swimlanes flow, gauges ease to new values. Nothing moves when the server
+   runs with --no-motion (html[data-motion=off]) or the system asks for reduced motion. */
+html[data-motion="on"] .bar > i, html[data-motion="on"] .pips > i { transition: width 0.6s ease-out; }
+html[data-motion="on"] .pulse { animation: breathe 1s ease-in-out infinite; }
+html[data-motion="on"] .sweep {
+  background: linear-gradient(90deg, var(--green) 0%, var(--pulse2) 40%, #ffffff 50%, var(--pulse2) 60%, var(--green) 100%);
+  background-size: 300% 100%; animation: sweep 1.2s linear infinite;
+}
+html[data-motion="on"] .flash { animation: flash 2s ease-out 1; }
+html[data-motion="on"] .flash * { animation: flash-text 2s ease-out 1; }
+html[data-motion="on"] .flow {
+  background: linear-gradient(90deg, var(--blue) 0%, var(--blue) 40%, #ffffff 50%, var(--blue) 60%, var(--blue) 100%);
+  background-size: 300% 100%; animation: sweep 1.5s linear infinite;
+}
+
+@keyframes breathe { 0%, 100% { color: var(--green); } 33% { color: var(--pulse2); } 66% { color: var(--pulse3); } }
+@keyframes sweep { from { background-position: 100% 0; } to { background-position: 0 0; } }
+@keyframes flash { 0%, 70% { background: color-mix(in srgb, var(--amber) 22%, transparent); } 100% { background: transparent; } }
+@keyframes flash-text { 0%, 70% { color: var(--amber); font-weight: 700; } }
+
+@media (prefers-reduced-motion: reduce) {
+  html .pulse, html .sweep, html .flash, html .flash *, html .flow { animation: none !important; }
+  html .bar > i, html .pips > i { transition: none !important; }
+}

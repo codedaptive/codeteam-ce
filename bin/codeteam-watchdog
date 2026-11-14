@@ -7,6 +7,8 @@ older than 10 minutes, or a landing queue, recheck or validation runner that lau
 to the owner once per episode (a herdr notice), and a missing loop is started again (codeteam2 ensure-loop)."""
 import json
 import os
+import plistlib
+import re
 import shlex
 import signal
 import subprocess
@@ -31,13 +33,26 @@ DISK_MIN_GB = 150
 DISK_IDLE_S = 1800
 BUILD_DIRS = ("target", "cargo-target", ".build", "DerivedData")
 LAUNCHD_PREFIX = os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam"
+OWNER = os.environ.get("CODETEAM_OWNER") or "Owner"
 # Below this, the landing tool's own long-lived clones lose their idle build output too (2026-11-13: one team's
 # land/validate/target held 50 GiB and land/itest/target 23 GiB while the disk filled for the third time that day).
 # Stages 5 and 6 reuse that warm output, and new work order trees copy it from land/itest, so the clones are
 # cleared only below the deck's 50 GiB red line, not at DISK_MIN_GB.
 LAND_DISK_MIN_GB = 50 * 2 ** 30 / 1e9
 LAND_STAGES = {"Stage 5": "itest", "Stage 6": "validate"}
+# Disk emergency: a standing permission. Below EMERGENCY_GB free, without asking: Time Machine's local snapshots are
+# deleted (each holds every file deleted since it was taken; the disk once filled under three of them in a morning),
+# the shared compile cache's generations other than the newest go, and sccache's oldest entries beyond its cap go.
+# All of it is rebuildable and nobody's work; nothing else is touched. Each time something goes, one line to the owner.
+EMERGENCY_GB = 20
+COMPILE_CACHE = Path(os.environ.get("CODETEAM_SWIFT_CAS") or Path.home() / "Library" / "Developer"
+                     / "codeteam-compilation-cache") / "builtin"
+SCCACHE_DIR = Path.home() / "Library" / "Caches" / "Mozilla.sccache"
+SCCACHE_CONFIG = Path.home() / "Library" / "Application Support" / "Mozilla.sccache" / "config"
+SNAPSHOT_DATE = re.compile(r"\d{4}-\d{2}-\d{2}-\d{6}")
+GENERATION = re.compile(r"v(\d+)\.(\d+)")
 LABEL = f"{LAUNCHD_PREFIX}.codeteam-watchdog"
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 
 
 def notify(title, body):
@@ -72,9 +87,9 @@ def sweep_queue(q=None):
     q = Path(q or os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
     jobs = []
     for f in q.glob("*.json"):
-        if time.time() - f.stat().st_mtime > 86400:
-            continue
-        try:
+        try:  # the build queue prunes finished jobs' files, so a listed file can be gone by now
+            if time.time() - f.stat().st_mtime > 86400:
+                continue
             j = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
@@ -175,6 +190,37 @@ def manifests(teams=None, workspace=None):
     return found
 
 
+def runs_from(stem, agents=None):
+    """(checkout, manifest) when the team's landing runner runs another checkout's tool: its launchd land job names
+    that checkout's bin/codeteam-land and the team's manifest there. None when it runs this checkout's tool, or has no
+    such job. A team whose loop and runners another checkout runs (a v5.5 checkout, say) must never have them
+    reinstalled from this one, so this watchdog starts its dead loop with that checkout's codeteam2 on that manifest,
+    and leaves its landing clones alone: their Stage 5 and 6 records are that checkout's."""
+    try:
+        with open(Path(agents or LAUNCH_AGENTS) / f"{LAUNCHD_PREFIX}.codeteam-land.{stem}.plist", "rb") as f:
+            args = [str(a) for a in plistlib.load(f).get("ProgramArguments", [])]
+    except Exception:                   # no job, or one that does not read as a plist: this checkout's, as before
+        return None
+    land = next((Path(a) for a in args if Path(a).name == "codeteam-land"), None)
+    manifest = next((Path(a) for a in args if a.endswith(".toml")), None)
+    if land is None or manifest is None or land.resolve().parent.parent == HERE.parent:
+        return None
+    return land.parent.parent, manifest
+
+
+def queued_trees(q):
+    """The work order trees with a queued or running build in the build queue at q."""
+    busy = set()
+    for f in Path(q).glob("*.json"):
+        try:
+            j = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if j.get("state") in ("queued", "running") and j.get("worktree"):
+            busy.add(os.path.realpath(j["worktree"]))
+    return busy
+
+
 def land_clones(cfg, root):
     """{"itest": path, "validate": path}: the landing tool's long-lived clones of a team with [land]. Stage 5 rechecks
     in land/itest. Stage 6 has a clone here unless it validates on another machine ([land.remote], or a
@@ -218,11 +264,12 @@ def busy_land_clones(stages, command=None):
     return busy
 
 
-def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None, land_min_gb=None, workspace=None):
+def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None, land_min_gb=None, workspace=None, agents=None):
     """When free disk is below min_gb: the build output of every work order tree with no queued or running build and
     nothing touched for idle_s is moved to its team's .trash and removed in the background, oldest tree first. Below
     land_min_gb, the landing tool's own clones (land_clones) are swept the same way, except one a live Stage 5 or 6
-    run holds (busy_land_clones). Returns the lines it logged."""
+    run holds (busy_land_clones). A team whose runners run another checkout's tool (runs_from) has its builds read from
+    that checkout's queue too, and its landing clones are left alone. Returns the lines it logged."""
     min_gb = float(os.environ.get("CODETEAM_DISK_MIN_GB", DISK_MIN_GB)) if min_gb is None else min_gb
     land_min_gb = LAND_DISK_MIN_GB if land_min_gb is None else land_min_gb
     idle_s = DISK_IDLE_S if idle_s is None else idle_s
@@ -231,23 +278,19 @@ def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None, land_min
         return []
     q = Path(q or os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
     land_busy = busy_land_clones(q.parent / "restart" / "stages") if have < land_min_gb else set()
-    busy = set()
-    for f in q.glob("*.json"):
-        try:
-            j = json.loads(f.read_text())
-        except (OSError, ValueError):
-            continue
-        if j.get("state") in ("queued", "running") and j.get("worktree"):
-            busy.add(os.path.realpath(j["worktree"]))
+    busy = queued_trees(q)
     found = []
     for m in manifests(teams, workspace):
+        elsewhere = runs_from(m.stem, agents)
         try:
             cfg = tomllib.loads(m.read_text())
         except (OSError, ValueError):
             continue
         root = Path(os.path.expanduser(cfg.get("worktree_root") or str(WORKSPACE / f"team-{m.stem}")))
+        if elsewhere:
+            busy |= queued_trees(elsewhere[0] / "run" / "queue")
         trees = set()
-        if have < land_min_gb:
+        if have < land_min_gb and not elsewhere:
             trees |= {clone for kind, clone in land_clones(cfg, root).items()
                       if not {(os.path.realpath(m), kind), ("*", kind)} & land_busy}
         for f in (root / "land" / "wo").glob("*.json"):
@@ -289,6 +332,137 @@ def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None, land_min
     return done
 
 
+def snapshot_dates(run=subprocess.run):
+    """The dates of Time Machine's local snapshots (tmutil listlocalsnapshotdates), oldest first."""
+    r = run(["tmutil", "listlocalsnapshotdates", "/"], capture_output=True, text=True)
+    return sorted(x.strip() for x in (r.stdout or "").splitlines() if SNAPSHOT_DATE.fullmatch(x.strip()))
+
+
+def old_generations(cache=None):
+    """The compile cache's generation folders (v<major>.<minor>) other than the newest by version. Files (its lock,
+    v1.validation) and folders by any other name are never returned."""
+    root = Path(cache or COMPILE_CACHE)
+    found = []
+    for p in root.iterdir() if root.is_dir() else ():
+        m = GENERATION.fullmatch(p.name)
+        if m and p.is_dir() and not p.is_symlink():
+            found.append(((int(m[1]), int(m[2])), p))
+    return [p for _, p in sorted(found)[:-1]]
+
+
+def size_bytes(text):
+    """An sccache size ("80G", "512M", "1T" or plain bytes) in bytes; sccache's K, M, G and T are binary."""
+    m = re.fullmatch(r"\s*(\d+)\s*([KMGT]?)\s*", str(text or ""))
+    return int(m[1]) * 1024 ** " KMGT".index(m[2] or " ") if m else None
+
+
+def sccache_cap(teams=None, workspace=None, config=None):
+    """sccache's cap in bytes: the smallest SCCACHE_CACHE_SIZE a team's [env] sets (e.g. 80G for the one
+    machine-wide cache; the server takes it from the environment of the build that starts it), else the config
+    file's [cache.disk] size; None when neither says."""
+    sizes = []
+    for m in manifests(teams, workspace):
+        try:
+            env = tomllib.loads(m.read_text()).get("env") or {}
+        except (OSError, ValueError):
+            continue
+        n = size_bytes(env.get("SCCACHE_CACHE_SIZE"))
+        if n:
+            sizes.append(n)
+    if sizes:
+        return min(sizes)
+    try:
+        return int(tomllib.loads(Path(config or SCCACHE_CONFIG).read_text())["cache"]["disk"]["size"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def trim_sccache(cap, cache=None):
+    """Removes sccache's files, oldest modification first, until its folder holds no more than cap bytes. Returns
+    (files removed, bytes freed)."""
+    files, total = [], 0
+    for folder, _, names in os.walk(cache or SCCACHE_DIR):
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, path))
+            total += st.st_size
+    removed = freed = 0
+    for _, size, path in sorted(files):
+        if total - freed <= cap:
+            break
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        removed += 1
+        freed += size
+    return removed, freed
+
+
+def tell_owner(text):
+    """One line to the owner on codeteam's General when this checkout runs a codeteam team (teams/codeteam.toml):
+    kept in its log and shown as a herdr notice, costing no session a turn (codeteam2 say to the user). Without one,
+    a herdr notice."""
+    manifest = TEAMS / "codeteam.toml"
+    if not manifest.exists():
+        notify("codeteam watchdog: disk emergency", text[:300])
+        return
+    subprocess.run([str(HERE.parent / "v2" / "bin" / "codeteam2"), "say", str(manifest), "general",
+                    "Orc-Codeteam", "NOTE", OWNER, text], capture_output=True, text=True, timeout=60)
+
+
+def disk_emergency(free=None, run=subprocess.run, cache=None, sccache=None, cap=None, trash=None,
+                   spawn=subprocess.Popen, say=None, teams=None, workspace=None):
+    """Below EMERGENCY_GB free (a standing permission): deletes Time Machine's local snapshots,
+    moves the compile cache's old generations to a trash folder beside the cache and removes them in the background,
+    and trims sccache to its cap. Tells the owner in one line when anything went. Returns the lines it logged."""
+    have = (free or free_gb)()
+    if have >= EMERGENCY_GB:
+        return []
+    done, failed = [], []
+    for date in snapshot_dates(run):
+        r = run(["tmutil", "deletelocalsnapshots", date], capture_output=True, text=True)
+        if r.returncode:
+            failed.append(f"Time Machine snapshot {date} not deleted: {(r.stderr or r.stdout or '').strip()[:200]}")
+        else:
+            done.append(f"deleted Time Machine local snapshot {date}")
+    old = old_generations(cache)
+    if old:
+        trash_dir = Path(trash or Path(cache or COMPILE_CACHE).parent.parent / ".codeteam-trash")
+        trash_dir.mkdir(exist_ok=True)
+        moved = []
+        for p in old:
+            try:
+                p.rename(trash_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{p.name}")
+            except OSError as e:
+                failed.append(f"compile cache {p.name} not removed: {e}")
+                continue
+            moved.append(p.name)
+        if moved:
+            spawn(["sh", "-c", f"rm -rf {shlex.quote(str(trash_dir))}/*"], stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL, start_new_session=True)
+            done.append(f"removing compile cache generation {', '.join(moved)} (the newest stays)")
+    cap = sccache_cap(teams, workspace) if cap is None else cap
+    if cap:
+        n, freed = trim_sccache(cap, sccache)
+        if n:
+            done.append(f"removed sccache's {n} oldest files ({freed / 1e9:.1f} GB) beyond its {cap / 2 ** 30:.0f} GiB "
+                        "cap")
+    stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    for line in done + failed:
+        print(f"{stamp} disk emergency ({have:.0f} GB free): {line}", flush=True)
+    if done:
+        (say or tell_owner)(f"watchdog, {have:.0f} GB free (below {EMERGENCY_GB}; the standing disk emergency rule): "
+                            f"{'; '.join(done + failed)}.")
+    elif failed:
+        notify("codeteam watchdog: disk emergency", "; ".join(failed)[:300])
+    return done + failed
+
+
 def runner_problems(stem: str, run=subprocess.run, uid: int | None = None) -> list[str]:
     uid = os.getuid() if uid is None else uid
     problems = []
@@ -303,10 +477,11 @@ def runner_problems(stem: str, run=subprocess.run, uid: int | None = None) -> li
 
 
 def check():
-    """One pass: the build queue sweep, the disk floor, then each team's loop and landing runners. Each part runs even
-    when one before it fails, and the failure is logged when the log can be written: on a full disk the state file
-    cannot be written, and the pass used to stop there, before the floor."""
-    for name, part in (("sweep_queue", sweep_queue), ("sweep_disk", sweep_disk), ("check_teams", check_teams)):
+    """One pass: the build queue sweep, the disk emergency, the disk floor, then each team's loop and landing
+    runners. Each part runs even when one before it fails, and the failure is logged when the log can be written: on
+    a full disk the state file cannot be written, and the pass used to stop there, before the floor."""
+    for name, part in (("sweep_queue", sweep_queue), ("disk_emergency", disk_emergency), ("sweep_disk", sweep_disk),
+                       ("check_teams", check_teams)):
         try:
             part()
         except Exception as e:
@@ -324,8 +499,9 @@ def check_teams():
         state = {}
     now, seen = time.time(), {}
     for m in manifests():
+        checkout, manifest = runs_from(m.stem) or (HERE.parent, m)
         try:
-            cfg = tomllib.loads(m.read_text())
+            cfg = tomllib.loads(manifest.read_text())
         except (OSError, ValueError):
             continue
         root = Path(os.path.expanduser(cfg.get("worktree_root") or str(WORKSPACE / f"team-{m.stem}")))
@@ -337,7 +513,7 @@ def check_teams():
         age = now - hb.stat().st_mtime if hb.exists() else None
         if age is None or age > STALE_S:
             problems.append(f"loop heartbeat {'missing' if age is None else f'{age / 60:.0f} min old'}")
-            subprocess.run([str(HERE.parent / "v2" / "bin" / "codeteam2"), "ensure-loop", str(m)],
+            subprocess.run([str(checkout / "v2" / "bin" / "codeteam2"), "ensure-loop", str(manifest)],
                            capture_output=True, timeout=120, env=dict(os.environ, HERDR_SESSION="codeteam"))
         if (cfg.get("land") or {}).get("enabled"):
             problems.extend(runner_problems(m.stem))

@@ -202,7 +202,7 @@ def test_unit_key_query_uses_make_expansion_for_each_unit_folder() -> None:
                 SimpleNamespace(returncode=0, stdout="CODETEAM-UNIT-KEY=one A owns=src\n"),
                 SimpleNamespace(returncode=1, stdout="")]) as make:
         assert cl.unit_step_keys(team, Path("tree"), "zone") is None
-    folders.assert_called_once_with(team, Path("tree"), "zone", "unit")
+    folders.assert_called_once_with(team, Path("tree"), "zone", "unit", ())
     assert [call.args[0][-2] for call in make.call_args_list] == ["DIR=A", "DIR=B"]
     for call in make.call_args_list:
         assert call.args[0][3:5] == ["-f", "-"]
@@ -234,6 +234,66 @@ def test_an_owned_folder_with_no_package_is_a_wall_not_a_test_root() -> None:
                                zones={"acme-mgr": ["apps/acme-mgr", "docs/specs/acme-mgr", "libs/SQLCipher"]},
                                c=lambda key, default: default)
         assert cl.test_folders(team, tree, "acme-mgr", "unit") == ["apps/acme-mgr", "libs/SQLCipher"]
+
+
+def tooling_tree(tmp: str) -> tuple[Path, SimpleNamespace]:
+    """A tooling lane: path ".", owning plain folders that hold independent packages, and a top-level file."""
+    tree = Path(tmp)
+    for folder in ("tools/packager/Sources", "tools/guardian/tests", "scripts/repo_sync/tests", "scripts/bin"):
+        (tree / folder).mkdir(parents=True)
+    (tree / "tools" / "packager" / "Package.swift").write_text("")
+    team = SimpleNamespace(m={"lanes": [{"name": "tooling", "path": ".", "owns": ["tools", "scripts", "Makefile"]}]},
+                           zones={"tooling": ["tools", "scripts", "Makefile"]},
+                           c=lambda key, default: ["tools/guardian"] if key == "skip_tests" else default)
+    return tree, team
+
+
+def test_a_plain_owned_folder_runs_the_test_roots_holding_a_changed_file() -> None:
+    # A tooling lane's packages once ran at no landing stage.
+    with tempfile.TemporaryDirectory(prefix="land-roots-") as tmp:
+        tree, team = tooling_tree(tmp)
+        files = ["tools/packager/Sources/a.swift", "tools/packager/Package.swift", "scripts/repo_sync/tests/test_x.py",
+                 "scripts/bin/run.sh", "scripts/top.sh", "Makefile", "docs/x.md"]
+        assert cl.test_folders(team, tree, "tooling", "integration", files) == ["tools/packager", "scripts/repo_sync"]
+        assert cl.zone_tests(team, tree, "tooling", "land", group="integration", files=files) == [
+            ("tests tooling (tools/packager)", "make --no-print-directory zone-test-one DIR=tools/packager CLASS=land"),
+            ("tests tooling (scripts/repo_sync)",
+             "make --no-print-directory zone-test-one DIR=scripts/repo_sync CLASS=land")]
+
+
+def test_a_landing_that_changes_no_test_root_runs_none_and_skips_stand() -> None:
+    with tempfile.TemporaryDirectory(prefix="land-roots-") as tmp:
+        tree, team = tooling_tree(tmp)
+        assert cl.test_folders(team, tree, "tooling", "integration") == []
+        assert cl.test_folders(team, tree, "tooling", "integration", ["scripts/top.sh", "Makefile"]) == []
+        changed = ["tools/guardian/tests/test_g.py"]
+        assert cl.test_folders(team, tree, "tooling", "integration", changed) == ["tools/guardian"]
+        assert cl.test_folders(team, tree, "tooling", "unit", changed) == []       # skip_tests, as for any root
+
+
+def test_a_whole_repo_path_or_a_folder_already_a_root_adds_nothing() -> None:
+    with tempfile.TemporaryDirectory(prefix="land-roots-") as tmp:
+        tree, team = tooling_tree(tmp)
+        assert cl.changed_roots(tree, ".", ["tools/packager/Package.swift"]) == []
+        assert cl.changed_roots(tree, "tools/*", ["tools/packager/Package.swift"]) == []
+        (tree / "tools" / "packager" / "Plugins" / "gen").mkdir(parents=True)
+        (tree / "tools" / "packager" / "Plugins" / "gen" / "Package.swift").write_text("")
+        team.zones["tooling"] = ["tools/packager"]       # a root already: it runs whole, a root inside it is not added
+        assert cl.test_folders(team, tree, "tooling", "integration", ["tools/packager/Plugins/gen/x.swift"]) == [
+            "tools/packager"]
+
+
+def test_unit_steps_and_their_evidence_keys_take_the_changed_roots() -> None:
+    with tempfile.TemporaryDirectory(prefix="land-roots-") as tmp:
+        tree, team = tooling_tree(tmp)
+        rec = {"tree": tree, "zone": "tooling"}
+        with patch.object(cl, "stage2_steps", return_value=True) as steps:
+            cl.test_units(team, rec, files=["tools/packager/Sources/a.swift"])
+        assert [name for name, _ in steps.call_args.args[2]] == ["tests tooling (tools/packager)"]
+        with patch.object(cl, "team_env", return_value={}), patch.object(cl.subprocess, "run", return_value=
+                SimpleNamespace(returncode=0, stdout="CODETEAM-UNIT-KEY=k tools/packager\n")) as make:
+            assert cl.unit_step_keys(team, tree, "tooling", ["tools/packager/Sources/a.swift"]) == ["k tools/packager"]
+        assert make.call_args.args[0][-2] == "DIR=tools/packager"
 
 
 def test_landing_consumes_entry_before_failed_cleanup_and_finishes() -> None:
@@ -487,6 +547,10 @@ for test in (test_alpha_suite_has_no_runtime_limit, test_runner_waits_for_every_
              test_land_one_prunes_unchecked_entry_before_lookup,
              test_queue_runner_prunes_unchecked_entry_before_checked_entry,
              test_an_owned_folder_with_no_package_is_a_wall_not_a_test_root,
+             test_a_plain_owned_folder_runs_the_test_roots_holding_a_changed_file,
+             test_a_landing_that_changes_no_test_root_runs_none_and_skips_stand,
+             test_a_whole_repo_path_or_a_folder_already_a_root_adds_nothing,
+             test_unit_steps_and_their_evidence_keys_take_the_changed_roots,
              test_prune_unchecked_entries_ignores_notification_failure, test_queue_runner_polls_after_refused_entry):
     if len(sys.argv) > 1 and test.__name__ not in sys.argv[1:]:
         continue
