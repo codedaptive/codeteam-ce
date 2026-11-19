@@ -1,5 +1,7 @@
-// The terminal deck's keys (app._handle) over the page's ui state. Returns a new ui and the action the page must
-// take ("disk-now" or null); the ui given is never changed. q has no meaning in a tab, so it does nothing here.
+// The terminal deck's keys (app._handle) over the page's ui state, with two of its own (2026-11-16):
+// t shows the cursor team's agents in the agents panel, which the terminal deck lacks, and f cycles the team filter,
+// the terminal's t. a and t each turn the other off. Returns a new ui and the action the page must take ("disk-now"
+// or null); the ui given is never changed. q has no meaning in a tab, so it does nothing here.
 import { visible } from "./visible.js";
 
 // The team filter after current: null (all teams), then each team in turn, then null again (app._next_filter).
@@ -25,8 +27,10 @@ export function handleKey(key, ui, snap) {
       return { ui: { ...ui, expanded }, action: null };
     }
     case "a":
-      return { ui: { ...ui, allAgents: !ui.allAgents }, action: null };
+      return { ui: { ...ui, allAgents: !ui.allAgents, teamAgents: false }, action: null };
     case "t":
+      return { ui: { ...ui, teamAgents: !ui.teamAgents, allAgents: false }, action: null };
+    case "f":
       return { ui: { ...ui, teamFilter: nextFilter(snap, ui.teamFilter), cursor: 0 }, action: null };
     case "d":
       return { ui: { ...ui }, action: "disk-now" };

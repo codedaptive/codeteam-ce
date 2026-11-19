@@ -12,7 +12,7 @@
 #     tool runs with CODETEAM_SLOT_HELD=1 and exits 0.
 #  5. The same build inside a job (a run job whose command calls codeteam-slot) passes straight through: no slot job
 #     file is written, and the tool runs under the job's ticket.
-#  6. sample a gate-held run job's env while running, release it, then compare its env once done.
+#  6. A gate-held run job keeps env while running; once done its env is emptied.
 # Cases 1-6 run only in the integration group; unit runs print six skips after setup.
 # Run with CODETEAM_TEST_GROUP=integration make zone-test-one DIR=zone/tests/buildq-e2e.sh.
 # Time Machine is never touched: a stub tmutil (first on PATH) records its argv and exits 0.
@@ -77,11 +77,16 @@ for f in glob.glob(sys.argv[1] + "/*.json"):
         continue
     print(d.get("kind"), d.get("class"), d.get("ticket"))' "$tmp/run/queue"
 }
-# jf TICKET: prints the job file's state, then its env as JSON with sorted keys ("-" when the file has no env key).
+# jf TICKET: prints only the job file's state, never its env.
 jf() {
   "$py" -I -c 'import json, sys
+print(json.load(open(sys.argv[1])).get("state"))' "$tmp/run/queue/$1.json" 2>/dev/null
+}
+# Test env contents without printing or copying them.
+job_env_is() {
+  "$py" -I -c 'import json, sys
 d = json.load(open(sys.argv[1]))
-print(d.get("state"), json.dumps(d["env"], sort_keys=True) if "env" in d else "-")' "$tmp/run/queue/$1.json" 2>/dev/null
+sys.exit(0 if (d.get("env", {}).get("CODETEAM_SESSION") == "s-e2e" if sys.argv[2] == "running" else d.get("env") == {}) else 1)' "$tmp/run/queue/$1.json" "$2"
 }
 # in_state TICKET STATE: the job file is in STATE.
 in_state() { [ "$(jf "$1" | cut -d' ' -f1)" = "$2" ]; }
@@ -245,33 +250,31 @@ else
   echo "skip 5 a build inside a job passes straight through, under the job's ticket: integration group only; run with CODETEAM_TEST_GROUP=integration make zone-test-one DIR=zone/tests/buildq-e2e.sh"
 fi
 
-# 6. A gate holds the job running for the env sample; release it before waiting for done and comparing the env,
-#    including the session zone-tool was given (ENVLIST sets CODETEAM_SESSION=s-e2e).
-#    Allow up to 120 s each for the running state and completion, to accommodate heavy load.
-#    This case is in the integration group because it cannot pass on a busy machine.
+# 6. A gate holds the job running to check its submitted session; release it and check env is empty when done.
+#    Allow up to 120 s each for the running state and completion. The runner idle-exits after 1 s here; since then
+#    it lists Q again after releasing its lock, so this job, submitted while a runner was about to exit, is started.
+#    This case is in the integration group because it runs the real runner, zone-tool and a scratch queue together
+#    (a integration test).
 #    Run with CODETEAM_TEST_GROUP=integration make zone-test-one DIR=zone/tests/buildq-e2e.sh.
 if [ "${CODETEAM_TEST_GROUP:-unit}" = integration ]; then
 t6="$(ztool job submit --class dev --key e2e-six -- sh -c "while [ ! -e '$tmp/gate6' ]; do sleep 0.05; done; echo six")"
 if ! within 120 in_state "$t6" running; then
-  bad "6 a run job the real runner starts keeps its env while running and once done, the same env both times" "the job never reached running within 120 s (state [$(jf "$t6")])"
+  bad "6 a run job keeps env while running and empties it once done" "the job never reached running within 120 s (state [$(jf "$t6")])"
   touch "$tmp/gate6"
 else
-  running_jf="$(jf "$t6")"
+  running_env_ok=no
+  job_env_is "$t6" running && running_env_ok=yes
   touch "$tmp/gate6"
   out6="$(ztool job wait "$t6" --max 120)"
   rc6=$?
-  done_jf="$(jf "$t6")"
-  renv="${running_jf#running }"
-  denv="${done_jf#done }"
-  if [ "${running_jf%% *}" = running ] && [ "${done_jf%% *}" = done ] && [ "$renv" != - ] && [ "$renv" = "$denv" ] \
-    && has "$renv" '"CODETEAM_SESSION": "s-e2e"' && [ "$rc6" = 0 ]; then
-    ok "6 a run job the real runner starts keeps its env while running and once done, the same env both times"
+  if [ "$running_env_ok" = yes ] && [ "$(jf "$t6")" = done ] && job_env_is "$t6" done && [ "$rc6" = 0 ]; then
+    ok "6 a run job keeps env while running and empties it once done"
   else
-    bad "6 a run job the real runner starts keeps its env while running and once done, the same env both times" "running [$running_jf], wait exit $rc6, done [$done_jf], output [$out6]"
+    bad "6 a run job keeps env while running and empties it once done" "running env check $running_env_ok, wait exit $rc6, final state [$(jf "$t6")]"
   fi
 fi
 else
-  echo "skip 6 a run job the real runner starts keeps its env while running and once done, the same env both times: integration group only; run with CODETEAM_TEST_GROUP=integration"
+  echo "skip 6 a run job keeps env while running and empties it once done: integration group only; run with CODETEAM_TEST_GROUP=integration"
 fi
 
 exit $fail

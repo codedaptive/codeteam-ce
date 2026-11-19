@@ -1,20 +1,25 @@
 #!/usr/bin/env -S python3 -u
-"""Unit contracts for v5.2 removals."""
+"""Unit contracts for v5.2 removals. A unit test script (rule 11): each check is an argparse refusal with Team
+faked, or team_env or Team on a manifest in a temp folder that sets TMPDIR, and codeteam-land's import-time launchctl
+call is faked."""
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 HOME = Path(__file__).resolve().parents[2]
 loader = importlib.machinery.SourceFileLoader("cl", str(HOME / "bin" / "codeteam-land"))
 spec = importlib.util.spec_from_loader("cl", loader)
 cl = importlib.util.module_from_spec(spec)
-loader.exec_module(cl)
+with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=0)):
+    loader.exec_module(cl)
 
 W = Path(tempfile.mkdtemp(prefix="land-v52-removed-"))
 (W / "repo").mkdir()

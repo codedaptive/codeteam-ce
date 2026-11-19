@@ -446,6 +446,9 @@ class DiskTeam(Team, FakeTeam):
         return set()
 
 
+# Its setUp opens a real SQLite Store in a real temp folder and runs the real Runtime over a DiskTeam: integration tests
+# (rule 11).
+@integration_only
 class ObservationFreshnessTests(unittest.TestCase):
     def setUp(self):
         from unittest.mock import patch
@@ -615,6 +618,19 @@ class ObservationFreshnessTests(unittest.TestCase):
             self.rt.tick()
         self.assertEqual([p[0] for p in self.herdr.prompts], ["a", "b"])
 
+    def test_tick_records_when_a_session_last_worked(self):
+        """Patrol's TEAM IDLE WITH WORK reads worked_at, set on each tick a session works and when it completes a
+        turn shorter than one poll; a session seen only idle gets none."""
+        self.herdr.status["a"] = "working"
+        self.herdr.completions = {"b": 1}
+        self.rt.tick()
+        st = self.team.load_state()
+        self.assertIsNotNone(st["a"].get("worked_at"))
+        self.assertIsNone(st["b"].get("worked_at"))
+        self.herdr.completions = {"b": 2}           # b ran a whole turn between two polls, still idle on both
+        self.rt.tick()
+        self.assertIsNotNone(self.team.load_state()["b"].get("worked_at"))
+
     def test_tick_close_waits_behind_earlier_close(self):
         self.track_actions()
         self.herdr.status.update(a="absent", b="absent")
@@ -639,6 +655,20 @@ class ObservationFreshnessTests(unittest.TestCase):
                                                             ("deliver", "b", (2,))]):
             self.rt.tick()
         self.assertEqual(calls, [("deliver", "a"), ("alert", "a")])
+
+    def test_tick_starve_note_runs_after_action(self):
+        # Like the blocked alert, the starve note types nothing into a pane, so it needs no fresh observation.
+        from unittest.mock import patch
+        self.track_actions()
+        calls = []
+        def deliver(s, ids, st):
+            calls.append(("deliver", s.key))
+            self.herdr.agent_prompt(s.agent, "message")
+        self.rt.deliver = deliver
+        self.rt.starve = lambda s, minutes, holders, st: calls.append(("starve", s.key, minutes, holders))
+        with patch("codeteam2.scheduler.plan", return_value=[("deliver", "a", (1,)), ("starve", "b", 61, ("a",))]):
+            self.rt.tick()
+        self.assertEqual(calls, [("deliver", "a"), ("starve", "b", 61, ("a",))])
 
     def test_tick_without_last_action_runs_all_deliveries(self):
         from unittest.mock import patch
@@ -1901,6 +1931,50 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(self.store.get(mail)["state"], "delivered")
         self.assertFalse(self.team.state["a"]["compacting"])
 
+    def test_a_slash_command_typed_into_an_idle_session_ran_when_its_transcript_says_so(self):
+        """A runtime slash command such as /mcp reconnect starts no turn: herdr keeps the session idle and its
+        state_change_seq still, and Claude Code writes the command and its output to the transcript at once. A
+        typed record after the delivery is the command running: the message stays delivered, is not typed again,
+        opens no no-turn episode and the session's next mail is prompted (once
+        the /mcp reconnect broadcast of 2026-11-14 held the mail of 58 sessions in five teams at 21:4x)."""
+        from codeteam2 import scheduler
+        path = self.episode_transcript()
+        clock = self.patch_clock()
+        cmd = "/mcp reconnect plugin:acmex:memory"
+        c = self.store.add("runtime", "codeteam", RUNTIME, "Coord-a", "a", cmd)
+        self.rt.tick()
+        self.assertEqual([t for _, t in self.herdr.prompts], [cmd])
+        ran = dt.datetime.fromtimestamp(clock[0] + 1, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        _jsonl(path, [_record("user", ran, "<local-command-caveat>The command below was run directly in Claude "
+                              "Code</local-command-caveat>", isMeta=True),
+                      _record("user", ran, "<command-name>/mcp</command-name>\n<command-message>mcp</command-message>"
+                              "\n<command-args>reconnect plugin:acmex:memory</command-args>"),
+                      _record("user", ran, "<local-command-stdout>Successfully reconnected to plugin:acmex:memory"
+                              "</local-command-stdout>")], mode="a")
+        for _ in range(3):
+            clock[0] += scheduler.TURN_GRACE_S
+            self.rt.tick()
+        self.assertEqual(len(self.herdr.prompts), 1)
+        self.assertEqual(self.store.get(c)["state"], "delivered")
+        self.assertFalse(self.team.state["a"].get("awaiting_turn"))
+        self.assertFalse(self.team.state["a"].get("no_turn"))
+        self.assertEqual(self.episode_notes(), [])
+        mail = self.store.add("general", "Orc", "REQUEST", "Coord-a", "a", "x")
+        self.rt.tick()
+        self.assertEqual(self.store.get(mail)["state"], "delivered")
+
+    def test_a_slash_command_with_nothing_in_the_idle_transcript_is_put_back(self):
+        """The same command with no typed record after its delivery (only the earlier prompt's) did not run: it
+        is put back after the grace, as any prompt that started no turn."""
+        from codeteam2 import scheduler
+        self.episode_transcript()
+        clock = self.patch_clock()
+        c = self.store.add("runtime", "codeteam", RUNTIME, "Coord-a", "a", "/mcp reconnect plugin:acmex:memory")
+        self.rt.tick()
+        clock[0] += scheduler.TURN_GRACE_S
+        self.rt.tick()
+        self.assertEqual(self.store.get(c)["state"], "queued")
+
     def episode_transcript(self):
         """A transcript for session a whose last [codeteam] prompt ran before the episode; its path."""
         tmp = tempfile.TemporaryDirectory()
@@ -2134,6 +2208,39 @@ class BackgroundWorkTests(unittest.TestCase):
                   pending={"b": [(1, NOW - 60)]}, cap=1, now=NOW + 601)
         self.assertIn(("stop", "a", "swap"), later)        # after it: swapped for the lane with mail
 
+    def test_a_lane_starved_behind_a_cancelled_exit_is_named_once(self):
+        # Coord-sync waited 17 h at the cap while Coord-tools' /exit was cancelled, round
+        # after round, for a stuck background command.
+        sessions = S + [("c", "lane")]
+        st = {"a": {"state_since": NOW - 3600, "bg_until": NOW + 300}, "b": {"state_since": NOW - 60}}
+        args = dict(sessions=sessions, status={"a": "idle", "b": "working", "c": "absent"},
+                    pending={"c": [(3, NOW - 61 * 60)]}, cap=2)
+        acts = P(st=st, **args)
+        self.assertIn(("starve", "c", 61, ("a",)), acts)
+        self.assertNotIn(("start", "c"), acts)
+        self.assertFalse([x for x in P(st={**st, "c": {"starve_alerted": True}}, **args) if x[0] == "starve"])
+        # a swap is made this tick (b idle long enough): the slot is coming, so nothing is said
+        st["b"] = {"state_since": NOW - 25 * 60}
+        acts = P(st=st, **{**args, "status": {"a": "idle", "b": "idle", "c": "absent"}})
+        self.assertIn(("stop", "b", "swap"), acts)
+        self.assertFalse([x for x in acts if x[0] == "starve"])
+
+    def test_the_starve_note_goes_to_the_orchestrator_and_marks_the_wait(self):
+        notes, logs = [], []
+        names = {"a": "Coord-a", "b": "Coord-b"}
+        team = SimpleNamespace(cap=4, session=lambda k: SimpleNamespace(display=names[k]),
+                               t=SimpleNamespace(orc_name=lambda: "Orc-Test"))
+        rt = SimpleNamespace(team=team, log=logs.append,
+                             store=SimpleNamespace(add=lambda *a: notes.append(a)))
+        st = {}
+        Runtime.starve(rt, SimpleNamespace(key="c", display="Coord-c"), 61, ("a", "b"), st)
+        self.assertTrue(st["c"]["starve_alerted"])
+        self.assertEqual(len(notes), 1)
+        channel, sender, kind, to, key, text = notes[0]
+        self.assertEqual((channel, sender, kind, to, key), ("general", "codeteam", "NOTE", "Orc-Test", "orc"))
+        self.assertIn("Coord-c has waited 61 min for one of the 4 lane slots", text)
+        self.assertIn("each /exit of Coord-a, Coord-b was cancelled for background work", text)
+
 
 class PatrolTests(unittest.TestCase):
     def test_only_new_findings(self):
@@ -2143,6 +2250,27 @@ class PatrolTests(unittest.TestCase):
             self.assertEqual(patrol.record(p, ["x: DEAD LEAD on r1"], 1), ["x: DEAD LEAD on r1"])
             self.assertEqual(patrol.record(p, ["x: DEAD LEAD on r1", "y: SERIAL"], 2), ["y: SERIAL"])
             self.assertEqual(patrol.latest(p), (2, ["x: DEAD LEAD on r1", "y: SERIAL"]))
+
+    def test_a_parked_flag_names_the_wait_form_the_team_reads(self):
+        """lane_work skips a waiting row by its stage words only on a landing team, and elsewhere by an awaited feature
+        the stage names, so the parked flag gives the form that works on this team."""
+        from unittest import mock
+        from codeteam2 import patrol
+        from codeteam2.team import v1
+        with tempfile.TemporaryDirectory() as d:
+            def parked(land):
+                t = SimpleNamespace(root=Path(d), m={"land": {"enabled": True}} if land else {})
+                team = SimpleNamespace(t=t, team_json=lambda: {"lanes": {"alpha": {}}}, manifest="/m.toml",
+                                       held=lambda k: False)
+                store = SimpleNamespace(pending=lambda held: [])
+                with mock.patch.object(v1, "lane_work", return_value=([["r", "x", "-"]], [], [], 2, [])), \
+                        mock.patch.object(v1, "branch_leftovers", return_value=([], [], [], 0, 0, 0)):
+                    return [f for f in patrol.findings(team, {}, {}, store, now=1000.0) if "past queued" in f]
+            lands, does_not = parked(True), parked(False)
+        self.assertEqual((len(lands), len(does_not)), (1, 1))
+        self.assertIn('stage it "waits for <what>"', lands[0])
+        self.assertIn('await its feature and stage it "waiting <feature>"', does_not[0])
+        self.assertIn("a running lead's row names its tree", does_not[0])
 
 
 class PluginTests(unittest.TestCase):
@@ -2387,13 +2515,16 @@ class LaunchParityTests(unittest.TestCase):
         self.assertEqual(v2_settings["promptCacheTtl"], v1_settings["promptCacheTtl"])
         self.assertEqual(v2_settings["autoMode"], v1_settings["autoMode"])
 
-    def launch_exports(self, d, key, kind):
-        """The `export NAME=value` lines of the launch script v2 writes for one session."""
+    def launch_exports(self, d, key, kind, land=False, env=None):
+        """The `export NAME=value` lines of the launch script v2 writes for one session (land: the team lands with
+        codeteam-land, so a lane has a zone folder and no standing worktree)."""
         import shlex
         from unittest.mock import patch
         from codeteam2.team import Session, v1
         t = self.stub(d)
+        t.env = {} if env is None else env
         t.lab, t.isolate, t.repo_name, t.target = False, False, "repo", "main"
+        t.m = {"land": {"enabled": True}} if land else {}
         team = object.__new__(Team)
         team.t, team.cfg, team.product, team.retry_watchdog = t, {"mcp": False}, "smoke", False
         team.dir = Path(d) / "v2"
@@ -2411,6 +2542,11 @@ class LaunchParityTests(unittest.TestCase):
                 out[name] = shlex.split(value)[0] if value else ""
         return out
 
+    def test_landing_lane_keeps_session_incremental_setting(self):
+        with tempfile.TemporaryDirectory() as d:
+            exports = self.launch_exports(d, "alpha", "lane", land=True, env={"CARGO_INCREMENTAL": "1"})
+        self.assertEqual(exports.get("CARGO_INCREMENTAL"), "1")
+
     def test_every_session_gets_zone_mk_and_only_a_lane_gets_its_walls(self):
         """An orchestrator's or a staff session's work order tree builds and tests through zone.mk too
         (2026-11-12: an orc lead's tree had no zone targets until MAKEFILES was passed by hand). Only a lane
@@ -2426,6 +2562,18 @@ class LaunchParityTests(unittest.TestCase):
         self.assertEqual(lane.get("MAKEFILES"), zone_mk)
         self.assertIn("CODETEAM_SWT", lane)
         self.assertEqual(lane.get("CODETEAM_ZONE"), "pkg/alpha")
+
+    def test_a_lane_names_the_ledger_folder_the_patrol_reads(self):
+        """zone-tool ledger writes in CODETEAM_LEDGER_ROOT whatever its cwd, so the launch script names the folder
+        lane_ledger_dir gives the patrol: the lane folder on a team that lands, else the lane worktree (rows
+        written from a lane's ledger/ folder never reached the patrol). An orchestrator gets none."""
+        with tempfile.TemporaryDirectory() as d:
+            orc = self.launch_exports(d, "orc", "staff")
+            standing = self.launch_exports(d, "alpha", "lane")
+            lands = self.launch_exports(d, "alpha", "lane", land=True)
+        self.assertNotIn("CODETEAM_LEDGER_ROOT", orc)
+        self.assertEqual(standing.get("CODETEAM_LEDGER_ROOT"), standing.get("CODETEAM_SWT"))
+        self.assertEqual(lands.get("CODETEAM_LEDGER_ROOT"), str(Path(d)))
 
 
 class RoleRewriteTests(unittest.TestCase):

@@ -1,9 +1,9 @@
 #!/usr/bin/env -S python3 -u
-"""Unit contracts for checkout failures, land-check freshness and nested verdicts."""
+"""Unit contracts for checkout failures, land-check freshness and nested verdicts (rule 11). The recheck
+runner and its tick, which take the real stage-admission lock, are tested in tests/integration/land-v52-fixes.py."""
 import hashlib
 import importlib.machinery
 import importlib.util
-import json
 import os
 import subprocess
 import sys
@@ -133,39 +133,6 @@ def test_missing_checkout_failure_reports_git_error():
         git.assert_called_once_with(team.repo, "worktree", "add", "--detach", str(team.dir / "itest"), "merge3", check=False)
 
 
-def test_runner_keeps_a_failed_checkout_pending_and_retries_it():
-    # A recheck that ran nothing is not done. Its row stays pending, the failure is recorded
-    # and told once, and the next poll tries the same row again; the rows after it wait their turn.
-    with tempfile.TemporaryDirectory() as tmp:
-        team = make_team(Path(tmp))
-        rows = [{"M": "first123456789", "wo": "one", "zones": ["A"], "overlapping": []},
-                {"M": "second12345678", "wo": "two", "zones": ["A"], "overlapping": []}]
-        for wo in ("one", "two"):
-            (team.dir / "wo" / f"{wo}.landed.json").write_text(json.dumps({"wo": wo, "zone": "A"}))
-        (team.dir / "recheck.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-        failed, worked = SimpleNamespace(returncode=1, stderr="failed"), SimpleNamespace(returncode=0, stderr="")
-        results = team.dir / "integration-results.jsonl"
-        with patch.object(cl, "git", side_effect=[failed, failed, worked, worked]) as git, \
-                patch.object(cl, "halted", return_value=False), patch.object(cl.codeteam_tm, "exclude"), \
-                patch.object(cl, "recheck_steps", return_value=([], [])), patch.object(cl, "step_results", return_value=[]), \
-                patch.object(cl, "apply_recheck_findings"), patch.object(cl, "after_landing"), \
-                patch.object(cl, "now", return_value="now"):
-            cl.cmd_recheck_run(team, SimpleNamespace(once=True))
-            assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now"}, rows[1]]
-            assert [json.loads(line).get("checkout") for line in results.read_text().splitlines()] == ["failed"]
-            assert team.notify.call_count == 1
-            assert "stays pending" in team.notify.call_args.args[2]
-            cl.cmd_recheck_run(team, SimpleNamespace(once=True))          # still failing: no new row, no new notice
-            assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now"}, rows[1]]
-            assert len(results.read_text().splitlines()) == 1 and team.notify.call_count == 1
-            assert git.call_args_list[1].args[-1] == "first123456789"      # the same row was tried again
-            cl.cmd_recheck_run(team, SimpleNamespace(once=True))          # the checkout works: the row completes
-            assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now", "done": "now"}, rows[1]]
-            cl.cmd_recheck_run(team, SimpleNamespace(once=True))
-        assert cl.read_recheck(team) == [{**rows[0], "checkout_failed": "now", "done": "now"}, {**rows[1], "done": "now"}]
-        assert [json.loads(line).get("checkout") for line in results.read_text().splitlines()] == ["failed", None, None]
-
-
 def test_a_missing_but_registered_itest_tree_is_added_again_with_force():
     # land/itest was once deleted while git still listed it, so every `worktree add` failed.
     with tempfile.TemporaryDirectory() as tmp:
@@ -179,17 +146,6 @@ def test_a_missing_but_registered_itest_tree_is_added_again_with_force():
         assert git.call_args_list == [call(team.repo, "worktree", "add", "--detach", str(tree), "merge4", check=False),
                                       call(team.repo, "worktree", "add", "-f", "--detach", str(tree), "merge4", check=False)]
         exclude.assert_called_once_with([tree])
-
-
-def test_run_recheck_tick_returns_none_after_a_failed_checkout():
-    # The runner sleeps a poll only when the tick returns None; a pending row that returned a job would spin.
-    with tempfile.TemporaryDirectory() as tmp:
-        team = make_team(Path(tmp))
-        row = {"M": "first123456789", "wo": "one", "zones": ["A"], "overlapping": []}
-        with patch.object(cl, "recheck_one", return_value={"checkout": "failed"}):
-            assert cl.run_recheck_tick(team, row) is None
-        with patch.object(cl, "recheck_one", return_value={"tests": []}):
-            assert cl.run_recheck_tick(team, row) is not None
 
 
 def test_land_check_digest_is_sha256_of_script():

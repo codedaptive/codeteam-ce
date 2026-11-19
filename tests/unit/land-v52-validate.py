@@ -381,7 +381,7 @@ def test_stage4_does_not_close_validation_findings():
         team = make_team(Path(tmp))
         finding = {"id": "validation#1", "by": "validation", "test": "tests a", "state": "open"}
         with patch.object(cl, "all_findings", return_value=[finding]), patch.object(cl, "update_finding") as update:
-            cl.apply_recheck_findings(team, {"M": "abc"}, {}, [{"name": "tests a", "result": "pass"}], "now")
+            cl.apply_recheck_findings(team, {"M": "abc"}, lambda test: ({}, {}), [{"name": "tests a", "result": "pass"}], "now")
         update.assert_not_called()
 
 

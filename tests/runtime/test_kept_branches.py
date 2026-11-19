@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import os
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -140,3 +141,34 @@ def test_branch_leftovers_leaves_a_v55_teams_zone_bookmarks_here_and_reports_the
     assert here == (["scratch/x"] if v55 else ["scratch/x", "zone/gitio", "zone/orc"])
     assert github == ["zone/gitio"]
     assert "zone/gitio" not in unmirrored and "zone/orc" not in unmirrored
+
+
+
+def test_branch_leftovers_counts_what_detached_wo_branches_gives_as_checked_out(codeteam, monkeypatch, tmp_path):
+    # Branch_leftovers hands the team's land/wo folder and git's worktree lines to
+    # detached_wo_branches (faked here; share/codeteam_detached_wo_branches.py has its own tests, and
+    # tests/integration/test_kept_branches_detached.py runs the two together) and counts what it gives as checked out.
+    team = FakeTeam({"land": {"enabled": True}})
+    team.root = tmp_path
+    porcelain = ["worktree /fake/repo", "branch refs/heads/main", f"worktree {tmp_path}/wo/z/w1", "HEAD aaa", "detached"]
+    calls = []
+    fake = types.ModuleType("codeteam_detached_wo_branches")
+    fake.detached_wo_branches = lambda wo_dir, lines: calls.append((wo_dir, list(lines))) or {"wo/z/w1"}
+    monkeypatch.setitem(sys.modules, "codeteam_detached_wo_branches", fake)
+
+    def fake_run(args, *, capture_output, text):
+        outputs = {
+            ("worktree", "list", "--porcelain"): "\n".join(porcelain) + "\n",
+            ("for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads"):
+                "aaa main\nbbb wo/z/w1\nccc wo/z/w2\n",
+            ("ls-remote", "--heads", "origin"): "aaa\trefs/heads/main\nbbb\trefs/heads/wo/z/w1\n",
+        }
+        return SimpleNamespace(stdout=outputs[tuple(args[3:])])
+
+    monkeypatch.setattr(codeteam.subprocess, "run", fake_run)
+
+    here, github, unmirrored, *_ = codeteam.branch_leftovers(team, LANES)
+    assert calls == [(tmp_path / "land" / "wo", porcelain)]
+    assert here == ["wo/z/w2"]
+    assert github == []
+    assert "wo/z/w1" not in unmirrored

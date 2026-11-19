@@ -67,16 +67,37 @@ def main(argv: list[str]) -> int:
     disclaim(ctypes.byref(attr), 1)
     args = (ctypes.c_char_p * (len(cmd) + 1))(*[a.encode() for a in cmd], None)
     env = (ctypes.c_char_p * (len(os.environ) + 1))(*[f"{k}={v}".encode() for k, v in os.environ.items()], None)
-    pid = ctypes.c_int()
+    pid, early = ctypes.c_int(), []
+
+    def forward(n, _frame):
+        if not pid.value:
+            early.append(n)
+            return
+        try:
+            os.kill(pid.value, n)
+        except ProcessLookupError:   # the command has already gone; waitpid reports how
+            pass
+
+    # The handlers go in before the spawn: a TERM between posix_spawn and the handlers
+    # killed the wrapper and left the command running. Python runs a handler between bytecodes, never inside the
+    # posix_spawn call, so one sees either no pid yet (kept in early, sent on below) or the command's pid.
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, forward)
     err = libc.posix_spawn(ctypes.byref(pid), cmd[0].encode(), None, ctypes.byref(attr), args, env)
     if err:
         sys.stderr.write(f"codeteam-own: {cmd[0]}: {os.strerror(err)}\n")
         return 127
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(s, lambda n, _f: os.kill(pid.value, n))
+    for n in early:
+        forward(n, None)
+    return exit_status(pid.value)
+
+
+def exit_status(pid: int) -> int:
+    """Wait for the spawned command and return its exit status, or 128 plus the signal number if it was signalled; a
+    wait a forwarded signal interrupts is waited again."""
     while True:
         try:
-            _, status = os.waitpid(pid.value, 0)
+            _, status = os.waitpid(pid, 0)
             break
         except InterruptedError:
             continue

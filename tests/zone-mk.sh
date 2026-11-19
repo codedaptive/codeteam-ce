@@ -4,7 +4,8 @@
 set -u
 # A session exports MAKEFILES (the live zone.mk), which make would read before the include below.
 # A caller's CLASS (a runner's own class) would pick the class checks 15 to 17 read.
-unset MAKEFILES CLASS
+# A RIT step exports CODETEAM_RIT_SELECTOR to the tests it runs; it would add a word to every key below.
+unset MAKEFILES CLASS CODETEAM_KINDS_BY_NAME CODETEAM_RIT_SELECTOR
 # Stage 2 (v5.2) sets GROUP and CODETEAM_TEST_GROUP: children must not inherit them or their record keys change.
 # export -n keeps the outer values available to this script without exporting them.
 export -n GROUP CODETEAM_TEST_GROUP
@@ -90,4 +91,87 @@ expect "23 the repo's own Makefile can name it, after zone.mk" \
 expect "24 zone-test gets no salt without it" eval '! has "$(args_of zone-test ZONE_TEST_KEY_VARS=ACME_X)" "--salt"'
 expect "25 and the word as its salt with it" \
   has "$(args_of zone-test ZONE_TEST_KEY_VARS=ACME_X ACME_X=1)" "--salt env:ACME_X=1 "
+expect "26 kinds on command line adds the suite salt" \
+  has "$(args_of zone-test CODETEAM_KINDS_BY_NAME=1)" "--salt env:CODETEAM_KINDS_BY_NAME=1 "
+export CODETEAM_KINDS_BY_NAME=1
+expect "27 kinds in the environment adds the suite salt" \
+  has "$(args_of zone-test)" "--salt env:CODETEAM_KINDS_BY_NAME=1 "
+expect "28 listing kinds does not duplicate the suite salt" \
+  has "$(args_of zone-test ZONE_TEST_KEY_VARS=CODETEAM_KINDS_BY_NAME)" "--salt env:CODETEAM_KINDS_BY_NAME=1 --"
+unset CODETEAM_KINDS_BY_NAME
+plain_suite=$(args_of zone-test)
+expect "29 empty kinds keeps the suite arguments" test "$plain_suite" = "$(args_of zone-test CODETEAM_KINDS_BY_NAME=)"
+expect "30 zero kinds keeps the suite arguments" test "$plain_suite" = "$(args_of zone-test CODETEAM_KINDS_BY_NAME=0)"
+expect "31 yes kinds keeps the suite arguments" test "$plain_suite" = "$(args_of zone-test CODETEAM_KINDS_BY_NAME=yes)"
+# A calling zone's RIT step exports CODETEAM_RIT_SELECTOR: a RIT-only run never shares a record with a whole one.
+expect "32 an empty RIT selector keeps the key byte for byte" \
+  test "$plain" = "$(args_of zone-test-one DIR=pkg CODETEAM_RIT_SELECTOR=)"
+export CODETEAM_RIT_SELECTOR=rit_
+expect "33 a RIT selector in the environment keys the record" \
+  has "$(args_of zone-test-one DIR=pkg)" "--key one pkg   env:CODETEAM_RIT_SELECTOR=rit_ "
+expect "34 listed in ZONE_TEST_KEY_VARS it keys the record once" \
+  test "$(args_of zone-test-one DIR=pkg ZONE_TEST_KEY_VARS=CODETEAM_RIT_SELECTOR | grep -o CODETEAM_RIT_SELECTOR | wc -l | tr -d ' ')" = 1
+expect "35 it comes after the kinds word" \
+  has "$(args_of zone-test-one DIR=pkg CODETEAM_KINDS_BY_NAME=1)" "env:CODETEAM_KINDS_BY_NAME=1 env:CODETEAM_RIT_SELECTOR=rit_ "
+expect "36 it salts the suite" has "$(args_of zone-test)" "--salt env:CODETEAM_RIT_SELECTOR=rit_ "
+unset CODETEAM_RIT_SELECTOR
+
+clean_case() {
+  local label=$1 present=$2 cli_exit=$3; shift 3
+  local stub="$W/codegraph.$label" out rc physical
+  export CG_CALLS="$W/calls.$label" CG_EXIT="$cli_exit" CODETEAM_CODEGRAPH="$stub"
+  cat > "$stub" <<'T'
+#!/bin/bash
+printf '%s\n' "$*" >> "$CG_CALLS"
+if [ -d "$3/.codegraph" ]; then echo present >> "$CG_CALLS"; else echo absent >> "$CG_CALLS"; fi
+exit "$CG_EXIT"
+T
+  chmod +x "$stub"
+  rm -f "$CG_CALLS"
+  rm -rf "$W/.codegraph"
+  if [ "$present" = yes ]; then mkdir -p "$W/.codegraph"; echo data > "$W/.codegraph/index"; fi
+  physical=$(cd "$W" && pwd -P)
+  out=$(make -C "$W" --no-print-directory ZONE_ROOT="$W" zone-clean "$@" 2>&1); rc=$?
+  expect "$label exits successfully" test "$rc" = 0
+  expect "$label removes .codegraph" test ! -e "$W/.codegraph"
+  if [ "$present" = yes ]; then
+    expect "$label unregisters once before removal" test "$(cat "$CG_CALLS" 2>/dev/null)" = "$(printf 'project remove %s\npresent' "$physical")"
+    expect "$label reports the removed size" bash -c '[[ "$1" =~ removing[[:space:]]+[^[:space:]]+[[:space:]]+\.codegraph ]]' _ "$out"
+  else
+    expect "$label makes no call" test ! -s "$CG_CALLS"
+  fi
+}
+clean_case clean-index yes 0
+clean_case clean-override yes 0 CLEAN_DIRS=cargo-target
+clean_case clean-cli-fails yes 1
+clean_case clean-no-index no 0
+
+clean_env_case() {
+  local label=$1 value=$2 keep=$3 out rc physical
+  local stub="$W/codegraph.$label"
+  export CG_CALLS="$W/calls.$label" CODETEAM_CODEGRAPH="$stub"
+  cat > "$stub" <<'T'
+#!/bin/bash
+printf '%s\n' "$*" >> "$CG_CALLS"
+T
+  chmod +x "$stub"
+  rm -f "$CG_CALLS"
+  rm -rf "$W/.codegraph" "$W/target"
+  mkdir -p "$W/.codegraph" "$W/target"
+  printf 'index data\n' > "$W/.codegraph/index"
+  printf 'build output\n' > "$W/target/out"
+  physical=$(cd "$W" && pwd -P)
+  out=$(env ZONE_CLEAN_KEEP_INDEX="$value" make -C "$W" --no-print-directory ZONE_ROOT="$W" zone-clean 2>&1); rc=$?
+  expect "$label exits successfully" test "$rc" = 0
+  expect "$label removes build output" test ! -e "$W/target"
+  if [ "$keep" = yes ]; then
+    expect "$label preserves index content" test "$(cat "$W/.codegraph/index" 2>/dev/null)" = 'index data'
+    expect "$label makes no CodeGraph call" test ! -e "$CG_CALLS"
+  else
+    expect "$label removes .codegraph" test ! -e "$W/.codegraph"
+    expect "$label unregisters once" test "$(cat "$CG_CALLS" 2>/dev/null)" = "project remove $physical"
+  fi
+}
+clean_env_case clean-keep-index 1 yes
+clean_env_case clean-keep-index-zero 0 no
 exit $fail

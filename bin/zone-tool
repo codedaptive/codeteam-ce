@@ -34,6 +34,14 @@ if sys.version_info < (3, 11):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "share"))
 import codeteam_hang
+import codeteam_settled_env
+from codeteam_build_clock import BuildClock
+from codeteam_build_part import build_part
+from codeteam_child_command import child_command
+from codeteam_dir_paths import dir_paths
+from codeteam_kinds_mode import kinds_mode
+from codeteam_run_planned import run_planned
+from codeteam_shell_gate import shell_skip_kind
 
 # launchd owns this job so the runner is outside every client's process tree.
 BUILDQ_LABEL = (os.environ.get("CODETEAM_LAUNCHD_PREFIX") or "com.codeteam") + ".codeteam-buildq"
@@ -72,7 +80,12 @@ def top():
 
 
 def ledger_root() -> Path:
-    # Use the checkout root, or the current folder outside a checkout (such as a v5 zone folder).
+    # A lane session's launch script names the folder codeteam's patrol, sweep and push-up read the ledger from
+    # (bin/codeteam lane_ledger_dir), so a write lands there whatever the cwd (a coordinator
+    # in its ledger/ folder wrote rows the patrol never saw). Else the checkout root, or the current folder outside one.
+    named = os.environ.get("CODETEAM_LEDGER_ROOT", "").strip()
+    if named:
+        return Path(named).expanduser()
     try:
         return top()
     except subprocess.CalledProcessError:
@@ -107,52 +120,63 @@ def snapshot(root):
     return tree.stdout.strip(), untracked
 
 
-def scope_dirs(root, d, depth=None):
-    """What a test of DIR can touch (a test runs once and not again unless something that
-    touches it changed): the package that holds DIR, every local package it depends on by path
-    (Package.swift `path: "..."`, Cargo.toml `path = "..."`, followed through each one, and the manifests one
-    folder down, so a Swift package's rust/ crate brings its own dependencies), plus ZONE_SCOPE_ALWAYS
-    (default `scripts`, the test runner). None means the whole worktree: no manifest found, or the
-    package is the repo itself. depth=1: the package's direct path dependencies only, not followed through (the
-    landing gate's reach: change X and B calls X, test X and B, not A, which calls B)."""
-    d = os.path.normpath(d or ".").strip("/")
-    if d in ("", "."):
-        return None
+def _package_of(root, d):
+    """The folder at or above DIR that holds a Package.swift or Cargo.toml, or None when there is none inside the
+    worktree or it is the worktree itself."""
     rroot = root.resolve()
     p = (root / d).resolve()
     while not ((p / "Package.swift").exists() or (p / "Cargo.toml").exists()):
         if p == rroot or rroot not in p.parents:
             return None
         p = p.parent
-    if p == rroot:
-        return None
-    # A Swift package's own Rust port (a child folder with a Cargo.toml and no Package.swift that no Swift source or
-    # test names) is the other port, not something Swift tests can touch: a Rust-only commit leaves the Swift records
-    # current (otherwise the full Swift set was rerun after every Rust commit). It is written into the scope as
-    # "<package>!<child>" so code_hash leaves it out, and its manifest is not followed. Applied to every Swift package
-    # on the walk; a Rust test's scope (DIR inside the crate) is unchanged.
-    swift_root = (p / "Package.swift").exists()
-    excl = {}
+    return None if p == rroot else p
 
-    def rust_ports(q):
-        if not (swift_root and (q / "Package.swift").exists()):
-            return []
-        out = []
-        for child in sorted(c for c in q.iterdir() if c.is_dir() and (c / "Cargo.toml").exists()
-                            and not (c / "Package.swift").exists()):
-            pat = _re.compile(rf"(^|[^\w./-]|\.\./){_re.escape(child.name)}/")
-            named = False
-            for f in [*q.glob("Sources/**/*.swift"), *q.glob("Tests/**/*.swift")]:
-                for line in f.read_text(errors="replace").splitlines():
-                    if not line.lstrip().startswith("//") and pat.search(line):
-                        named = True
-                        break
-                if named:
-                    break
-            if not named:
-                out.append(child.name)
-        return out
-    seen, reads, todo = set(), set(), [(p, 0)]
+
+def _names_child(q, child):
+    """Whether a line of package Q's Swift sources or tests, other than a // comment, names the folder child/."""
+    pat = _re.compile(rf"(^|[^\w./-]|\.\./){_re.escape(child)}/")
+    return any(not line.lstrip().startswith("//") and pat.search(line)
+               for f in [*q.glob("Sources/**/*.swift"), *q.glob("Tests/**/*.swift")]
+               for line in f.read_text(errors="replace").splitlines())
+
+
+# A Swift package's own Rust port (a child folder with a Cargo.toml and no Package.swift that no Swift source or
+# test names) is the other port, not something Swift tests can touch: a Rust-only commit leaves the Swift records
+# current (2026-11-04: the full Swift set was rerun after every Rust commit). It is written into the scope as
+# "<package>!<child>" so code_hash leaves it out, and its manifest is not followed. Applied to every Swift package
+# on the walk; a Rust test's scope (DIR inside the crate) is unchanged.
+def _rust_ports(q, swift_root):
+    """The names of package Q's unused Rust ports, in order; none unless the walk started at a Swift package
+    (swift_root) and Q is one."""
+    if not (swift_root and (q / "Package.swift").exists()):
+        return []
+    children = sorted(c for c in q.iterdir() if c.is_dir() and (c / "Cargo.toml").exists()
+                      and not (c / "Package.swift").exists())
+    return [child.name for child in children if not _names_child(q, child.name)]
+
+
+def _path_deps(q, ports):
+    """The folders package Q's manifests name by path: its own Package.swift and Cargo.toml and those one folder
+    down, leaving out the manifests of its unused Rust ports (ports) and paths to a file or a source file."""
+    mans = [q / "Package.swift", q / "Cargo.toml"] + sorted(q.glob("*/Package.swift")) + sorted(
+        m for m in q.glob("*/Cargo.toml") if m.parent.name not in ports)
+    out = []
+    for man in mans:
+        if not man.is_file():
+            continue
+        for m in _re.finditer(r'\bpath\s*[:=]\s*"([^"]+)"', man.read_text(errors="replace")):
+            t = (man.parent / m.group(1)).resolve()
+            if t.is_file() or t.suffix in (".rs", ".swift"):
+                continue
+            out.append(t)
+    return out
+
+
+def _walk(p, rroot, depth, swift_root):
+    """The walk from package P through its path dependencies (to depth, or all of them with None): the folders
+    reached, the folders their crates' Rust sources read (rust_reads), and each reached package's unused Rust ports
+    by folder."""
+    seen, reads, excl, todo = set(), set(), {}, [(p, 0)]
     while todo:
         q, level = todo.pop()
         try:
@@ -162,23 +186,34 @@ def scope_dirs(root, d, depth=None):
         if rel in seen:
             continue
         seen.add(rel)
-        if depth is not None and level >= depth:
-            continue                        # a direct dependency: in the scope, its own dependencies not
-        ports = rust_ports(q)
+        # A direct dependency's unused Rust port stays out too: a dependent's Swift cannot reach a twin its kit never
+        # names (Rust-only sets ran every Swift dependent's tests at landing).
+        ports = _rust_ports(q, swift_root)
         if ports:
             excl[rel] = ports
+        if depth is not None and level >= depth:
+            continue                        # a direct dependency: in the scope, its own dependencies not
         if (q / "Cargo.toml").is_file():
             reads |= rust_reads(q, rroot)
-        mans = [q / "Package.swift", q / "Cargo.toml"] + sorted(q.glob("*/Package.swift")) + sorted(
-            m for m in q.glob("*/Cargo.toml") if m.parent.name not in ports)
-        for man in mans:
-            if not man.is_file():
-                continue
-            for m in _re.finditer(r'\bpath\s*[:=]\s*"([^"]+)"', man.read_text(errors="replace")):
-                t = (man.parent / m.group(1)).resolve()
-                if t.is_file() or t.suffix in (".rs", ".swift"):
-                    continue
-                todo.append((t, level + 1))
+        todo += [(t, level + 1) for t in _path_deps(q, ports)]
+    return seen, reads, excl
+
+
+def scope_dirs(root, d, depth=None):
+    """What a test of DIR can touch (2026-11-01: a test runs once and not again unless something that
+    touches it changed): the package that holds DIR, every local package it depends on by path
+    (Package.swift `path: "..."`, Cargo.toml `path = "..."`, followed through each one, and the manifests one
+    folder down, so a Swift package's rust/ crate brings its own dependencies), plus ZONE_SCOPE_ALWAYS
+    (default `scripts`, the test runner). None means the whole worktree: no manifest found, or the
+    package is the repo itself. depth=1: the package's direct path dependencies only, not followed through (the
+    landing gate's reach: change X and B calls X, test X and B, not A, which calls B)."""
+    d = os.path.normpath(d or ".").strip("/")
+    if d in ("", "."):
+        return None
+    p = _package_of(root, d)
+    if p is None:
+        return None
+    seen, reads, excl = _walk(p, root.resolve(), depth, (p / "Package.swift").exists())
     extra = [e.strip().strip("/") for e in os.environ.get("ZONE_SCOPE_ALWAYS", "scripts").split(":") if e.strip()]
     return [f"{d}!{'!'.join(excl[d])}" if d in excl else d for d in sorted(seen | reads | set(extra))]
 
@@ -319,8 +354,10 @@ def commit_state(root: Path) -> tuple[str | None, bool]:
     tracked = git("status", "--porcelain", "--untracked-files=no", cwd=root)
     untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=root).split("\0")
     skip = {RECORD, LEDGER, LEDGER_CLOSED, REVIEW_MARK}
+    # The CodeGraph server writes .codegraph/.gitignore into every worktree; it is no part of the code.
     return commit, not tracked and not any(
-        u and Path(u).name not in skip and not Path(u).name.startswith(".test-record") for u in untracked)
+        u and Path(u).name not in skip and not Path(u).name.startswith(".test-record")
+        and Path(u).parts[0] != ".codegraph" for u in untracked)
 
 
 
@@ -344,13 +381,18 @@ def record_hit(root, key, salt, scope_arg, command=None):
     PASS or FAIL with this salt and either the same whole tree or, with a scope, the same scope and nothing in it
     changed. Given the run's command (its words joined by spaces, as the record stores it), a record of another
     command never answers: a run corrected by its command alone runs (a FAIL from a
-    wrong invocation answered the corrected one, so it could not be corrected without a code change)."""
+    wrong invocation answered the corrected one, so it could not be corrected without a code change).
+    A record answers, in either way, only a run of its own kinds mode: one with "kinds": "by-name" a run with
+    CODETEAM_KINDS_BY_NAME=1, one without "kinds" a run without it (kinds_mode), since the two select different
+    tests under the same command."""
     snap = snapshot(root)
     before = code_hash(root, None, snap)
     scope = scope_dirs(root, scope_arg) if scope_arg else None
     sbefore = code_hash(root, scope, snap) if scope else None
     rec = read_record(root, key)
     if rec and command is not None and rec.get("command", command) != command:
+        rec = None
+    if rec and rec.get("kinds") != kinds_mode(os.environ):
         rec = None
     hit = rec and rec.get("result") in ("PASS", "FAIL") and rec.get("salt", "") == salt and (
         rec.get("hash") == before or (scope and rec.get("scope") == scope and rec.get("scope_hash") == sbefore))
@@ -379,7 +421,8 @@ def answer_from_record(root, key, rec, before):
         bool({f"group={group}", f"test-group={group}"} & set(key.split()))
     if relabel:
         rec["group"] = group
-    if clean and rec.get("group", "unit") == group:
+    logged = bool(commit) and clean and rec.get("group", "unit") == group
+    if logged:
         append_commit_record(root, key, rec | {"commit": commit, "clean": clean, "group": group,
                                              "time": now().isoformat(timespec="seconds")}, answered=True)
     when = dt.datetime.fromisoformat(rec["time"]).strftime("%H:%M")
@@ -395,6 +438,13 @@ def answer_from_record(root, key, rec, before):
         record_path(root, key).write_text(json.dumps(rec, indent=1) + "\n")
         print(f"zone-test: {rec['result']} at {when} already recorded; nothing these tests touch has changed "
               f"since; not run again", flush=True)
+    # The record file keeps the commit its run was made at; landing reads the commit log, so say what went there
+    # (a lane read the record file's old commit and took a logged answer for a missing one).
+    if commit:
+        why = "" if logged else (": the tree has uncommitted or untracked changes; commit them and run again"
+                                 if not clean else f": the record is {rec.get('group', 'unit')}-group, this run {group}")
+        print(f"zone-test: {'logged' if logged else 'not logged'} as {group} evidence at commit {commit[:10]}, "
+              f"which landing reads (zone-tool commit-record){why}", flush=True)
     for l in (rec.get("counts") or []) + ([] if rec["result"] == "PASS" else ["--- last lines of that run ---"] + (rec.get("tail") or [])[-25:]):
         print(f"  {l}", flush=True)
     return rec.get("exit", 0 if rec["result"] == "PASS" else 1)
@@ -442,9 +492,13 @@ def cmd_test(args):
                stays the code's alone, so test-status and covered need no salt.
 
     --cached   a record for exactly this code (or, with --scope, for the same scope with nothing
-               in it changed), the same salt and the same test command answers without running
-               (2026-10-22: 63% of suite runs repeated an unchanged tree within the hour; a
-               changed command runs).
+               in it changed), the same salt, the same test command and the same kinds mode answers
+               without running (2026-10-22: 63% of suite runs repeated an unchanged tree within the
+               hour; a changed command runs). With CODETEAM_KINDS_BY_NAME=1 (exactly 1 after
+               strip) the record says "kinds": "by-name" and answers only runs with it; without it the
+               record has no "kinds" and answers only runs without it. A run with it on is recorded
+               by-name whatever its command, including landing's direct runs of a repo test folder,
+               where the folder already names the kind.
     --single   one run at a time per worktree and key; a second caller waits for the first,
                then is answered only by a matching PASS or FAIL record with the same salt and command.
     --timeout  accepted as --timeout SECONDS or --timeout=SECONDS and ignored; no effect since v5.2.
@@ -513,13 +567,19 @@ def cmd_test(args):
     window, cpu_pct = codeteam_hang.settings(os.environ)
     watch = codeteam_hang.HangWatch(window, cpu_pct, time.monotonic())
     poll = min(10, max(0.05, window / 20))
+    # A build is not test run time: the clock reads build seconds from the output, timed from just
+    # before the command starts, and the record keeps them as build_seconds (0.0 for a run that builds nothing).
+    clock = BuildClock()
+    t0 = time.monotonic()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, text=True, errors="replace")
     logf = open(log_path, "w")
     out_of_space = None
     def pump():
         nonlocal out_of_space
         for line in proc.stdout:
-            watch.output(time.monotonic())
+            seen = time.monotonic()
+            watch.output(seen)
+            clock.line(seen - t0, line)
             if out_of_space is None:
                 stripped = line.strip()
                 for label, pattern in FAULTS:
@@ -580,7 +640,9 @@ def cmd_test(args):
         "exit": rc,
         "time": start.isoformat(timespec="seconds"),
         "seconds": round((now() - start).total_seconds()),
-    }
+    } | clock.record(time.monotonic() - t0)
+    if kinds := kinds_mode(os.environ):
+        record["kinds"] = kinds
     record_path(root, key).write_text(json.dumps(record, indent=1) + "\n")
     append_commit_record(root, key, record)
     return rc
@@ -881,7 +943,8 @@ def _is_py_test(name):
 
 # The repo's unit, integration and validation test folders and the group each belongs to: the defaults of a
 # manifest's [land] unit_tests, integration_tests and validation_tests, which no team overrides. The landing tool
-# (bin/codeteam-land repo_test_steps) runs every .py and .sh file directly inside one, except conftest.py and
+# (bin/codeteam-land repo_test_steps) runs every .py and .sh file directly inside one (with changed files, those that
+# reach one), except conftest.py and
 # __init__.py (REPO_TEST_NOT_SCRIPTS), a .py that is not a pytest file by name as a plain script: tests/unit in
 # Stage 2's unit step, tests/integration in its integration step and tests/validation in Stage 6's validate-suite.
 # test-one runs them the same way, so a lane's receipt covers what the landing tool will run (codeteam's
@@ -889,6 +952,18 @@ def _is_py_test(name):
 # run; a validation script once ran under pytest, whose INTERNALERROR on its sys.exit(0) recorded FAIL).
 REPO_TEST_FOLDERS = {"tests/unit": "unit", "tests/integration": "integration", "tests/validation": "validation"}
 REPO_TEST_NOT_SCRIPTS = ("conftest.py", "__init__.py")
+# The kind folders a path's own tests folder may hold, each run as a repo test folder of that group
+# (so the landing tool's land-*.py scripts can live in the zone lane's zone/tests/integration).
+KIND_FOLDERS = ("unit", "integration", "validation")
+
+
+def _kind_folder_group(norm_dir):
+    """The group whose scripts a folder (repo-relative, normalized) holds: a repo test folder's (REPO_TEST_FOLDERS), or
+    <kind> for a folder <...>/tests/<kind> (KIND_FOLDERS); None for any other folder."""
+    if norm_dir in REPO_TEST_FOLDERS:
+        return REPO_TEST_FOLDERS[norm_dir]
+    parent, kind = os.path.split(norm_dir)
+    return kind if kind in KIND_FOLDERS and os.path.basename(parent) == "tests" else None
 
 
 def _repo_script_kind(name):
@@ -909,14 +984,19 @@ def _has_py_tests(folder):
     return False
 
 
-def _test_one_plan(path, rel, owned, group="unit"):
+def _test_one_plan(path, rel, owned, group="unit", kinds=False):
     """The runs for one path as [(kind, rel)], kind "py" (pytest), "script" (python3 FILE) or "sh" (bash), plus the
-    skipped paths as [(rel, why)], why "run.sh" or the group a repo test folder's script belongs to.
+    skipped paths as [(rel, why)], why "run.sh" or the group a skipped script belongs to.
+    kinds (CODETEAM_KINDS_BY_NAME=1): every other shell test, found in a tests folder, owned or given as DIR, runs
+    only when its shell_test_kind is this group or None (a script that reads the group itself); one of another
+    kind is skipped with that kind. A script directly inside a repo test folder keeps that folder's gate below.
     owned: the path came from CODETEAM_OWNS, where a FILE runs only if it is a test by name
     (a Python test file, or a .sh in a folder named tests) or a script in a repo test folder;
     given directly as DIR, any .py or .sh file runs. A repo test folder (REPO_TEST_FOLDERS), or a
     folder holding one, also runs each script directly inside it as Stage 2 does, but only in that
     folder's group; an owned script outside its group is skipped too, while one given as DIR runs.
+    The kind folders of the path's own tests folder (<path>/tests/unit, /integration, /validation;
+    KIND_FOLDERS), and the path itself when it is one, count as repo test folders of that kind.
     A file named run.sh is never run: by convention it is a manual runner for the folder's other
     tests (codeteam's tests/run.sh is slow and makes worktrees)."""
     runs, skipped, shells = [], [], []
@@ -926,7 +1006,7 @@ def _test_one_plan(path, rel, owned, group="unit"):
         if gate and folder_group != group:
             skipped.append((rel_file, folder_group))
         elif kind == "sh":
-            shells.append(rel_file)
+            shells.append((rel_file, None))
         else:
             runs.append((kind, rel_file))
 
@@ -937,9 +1017,14 @@ def _test_one_plan(path, rel, owned, group="unit"):
         if shdir.is_dir():
             for sh in sorted(shdir.glob("*.sh")):
                 if sh.is_file():
-                    shells.append(str(Path(rel) / sh.relative_to(path)))
-        for folder, folder_group in REPO_TEST_FOLDERS.items():
-            if folder != norm and not folder.startswith(norm + "/"):
+                    shells.append((str(Path(rel) / sh.relative_to(path)), sh))
+        # The repo test folders at or below the path, then the kind folders of the path's own tests folder (the path
+        # itself when it is named tests) and the path itself when it is one; each folder once.
+        own_tests = norm if path.name == "tests" else os.path.join(norm, "tests")
+        candidates = [*REPO_TEST_FOLDERS, *(os.path.join(own_tests, k) for k in KIND_FOLDERS), norm]
+        for folder in dict.fromkeys(os.path.normpath(c) for c in candidates):
+            folder_group = _kind_folder_group(folder)
+            if not folder_group or (folder != norm and not folder.startswith(norm + "/")):
                 continue
             inside = path / os.path.relpath(folder, norm)
             if not inside.is_dir():
@@ -949,17 +1034,20 @@ def _test_one_plan(path, rel, owned, group="unit"):
                 if kind:
                     script(str(Path(rel) / f.relative_to(path)), kind, folder_group, gate=True)
     elif path.is_file():
-        folder_group = REPO_TEST_FOLDERS.get(os.path.dirname(norm))
+        folder_group = _kind_folder_group(os.path.dirname(norm))
         kind = _repo_script_kind(path.name) if folder_group else None
         if kind:
             script(rel, kind, folder_group, gate=owned)
         elif path.suffix == ".py" and (not owned or _is_py_test(path.name)):
             runs.append(("py", rel))
         elif path.suffix == ".sh" and (not owned or path.parent.name == "tests"):
-            shells.append(rel)
-    for sh in shells:
+            shells.append((rel, path))
+    for sh, sh_path in shells:
         if Path(sh).name == "run.sh":
             skipped.append((sh, "run.sh"))
+        # sh_path is None for a repo test folder's script, which its folder's gate already placed.
+        elif kinds and sh_path and (sh_kind := shell_skip_kind(sh_path, sh, group)):
+            skipped.append((sh, sh_kind))
         else:
             runs.append(("sh", sh))
     return runs, skipped
@@ -973,11 +1061,13 @@ def cmd_test_one(args):
     pytest's exit 5, no tests collected, is not a failure), then each *.sh, sorted, in the
     folder itself when it is named tests, else in <folder>/tests/, each as `bash <file>`.
     tests/unit, tests/integration and tests/validation (REPO_TEST_FOLDERS), as a folder or inside
-    one, also run each script directly in them as the landing tool does: a .py that is not a pytest
+    one, and the same kind folders in the folder's own tests folder (zone/tests/integration for
+    DIR=zone), also run each script directly in them as the landing tool does: a .py that is not a pytest
     file by name as `python3 <file>`, a .sh under bash; each folder's only when the group
     (test_group) is its own, with one "skipped" line per folder left out.
-    A .py file runs under pytest, a .sh file under bash, a script in a repo test folder as above
-    whatever the group. A file named run.sh is never run:
+    A .py file given as DIR runs under pytest, a .sh file under bash (with kinds by name, below, only
+    in its kind's run), and a script in a repo test folder as above whatever the group. A file named
+    run.sh is never run:
     by convention it is a manual runner for the folder's other tests (codeteam's
     tests/run.sh is slow and makes worktrees).
     A missing path, or one with no tests, prints "no tests" and exits 0.
@@ -987,31 +1077,30 @@ def cmd_test_one(args):
     folder of this run's group, and each run happens once. With CODETEAM_OWNS empty or
     unset, the root is refused (exit 2) rather than passing with no tests or running the
     whole repo.
+    With CODETEAM_KINDS_BY_NAME=1 (exactly 1 after strip; kinds_mode), the run selects its group's tests by name
+    (the test kinds rule): pytest loads codeteam_kinds_pytest with --codeteam-kind=<group>, from codeteam's share
+    folder put first on the children's PYTHONPATH, and runs only the tests under a folder named the group; a test
+    under no such folder is a unit test, run only in the unit run unless its own markers keep it out of a unit run. A .sh outside the repo test folders, found, owned or
+    given as DIR, runs only when its folder names this group, or none does and it is a unit run, or it reads the
+    group itself (shell_test_kind); the rest are skipped with one "skipped" line per folder and kind. Without it,
+    pytest runs every test it collects, every such .sh runs whatever the group, and PYTHONPATH is the inherited one.
     Python is ZONE_PYTHON, default CODETEAM_PYTHON, else the Python running zone-tool. Children drop CODETEAM_* and
     HERDR_* except CODETEAM_HOME, CODETEAM_BUILD_JOBS, CODETEAM_BUILDQ_TICKET,
-    CODETEAM_LANDING and CODETEAM_TEST_GROUP. They also drop MAKEFLAGS, MFLAGS, MAKELEVEL,
+    CODETEAM_LANDING, CODETEAM_TEST_GROUP and CODETEAM_RIT_SELECTOR. They also drop MAKEFLAGS, MFLAGS, MAKELEVEL,
     MAKEOVERRIDES and DIR, so a command-line DIR=x does not reach a test that itself runs make.
-    Exit 1 if any test failed, else 0."""
-    import glob
-    import shlex
+    Exit 1 if any test failed, else 0. The paths, the children's command and environment, and the run and its
+    report are share/codeteam_dir_paths.py, codeteam_child_command.py and codeteam_run_planned.py."""
     if len(args) != 1 or not args[0]:
         sys.exit("usage: zone-tool test-one <DIR>")
     target = args[0]
     root = top()
-    # Resolved, not compared as text: ./ or zone/.. is the root too, and must not run as a
-    # plain folder (pytest over every lane's tests).
-    if (root / target).resolve() == root.resolve():
-        owns = [e for e in os.environ.get("CODETEAM_OWNS", "").split(":") if e]
-        if not owns:
-            print(f"test-one: DIR={target} is the repo root, which means the lane's owned "
-                  "paths, and CODETEAM_OWNS is empty; set CODETEAM_OWNS or give DIR a folder")
-            return 2
-        paths = [(m, True) for e in owns for m in sorted(glob.glob(e, root_dir=root))]
-    else:
-        paths = [(target, False)]
+    paths = dir_paths(target, root, os.environ)
+    if paths is None:
+        return 2
     runs, skipped, group = [], [], test_group()
+    kinds = kinds_mode(os.environ) is not None
     for rel, owned in paths:
-        r, s = _test_one_plan(root / rel, rel, owned, group)
+        r, s = _test_one_plan(root / rel, rel, owned, group, kinds)
         runs += r
         skipped += s
     # An owns list may name a folder and files in it (tests/unit and tests/unit/land-*.py): each runs once.
@@ -1025,34 +1114,9 @@ def cmd_test_one(args):
     for (folder, why), files in other_group.items():
         print(f"skipped {len(files)} script(s) in {folder}: the {why} group's, and this run is {group}; "
               f"run them with CODETEAM_TEST_GROUP={why}")
-    py = os.environ.get("ZONE_PYTHON") or os.environ.get("CODETEAM_PYTHON") or sys.executable
-    # Drop CODETEAM_* and HERDR_* except the keep list: an inherited CODETEAM_MANIFEST can make a hook test
-    # act on a live team. Keep codeteam's location, the build queue's variables, landing and the test group;
-    # CODETEAM_TEST_GROUP names tests, not a team.
-    keep = ("CODETEAM_HOME", "CODETEAM_BUILD_JOBS", "CODETEAM_BUILDQ_TICKET", "CODETEAM_LANDING",
-            "CODETEAM_TEST_GROUP")
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "DIR")
-           and (k in keep or not k.startswith(("CODETEAM_", "HERDR_")))}
-    passed, failed = 0, []
-    for kind, rel in runs:
-        # -p no:cacheprovider: no .pytest_cache folder in the worktree.
-        cmd = {"py": [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", rel], "script": [py, rel]}.get(kind, ["bash", rel])
-        print(f"test-one: run {shlex.join(cmd)}", flush=True)
-        rc = subprocess.run(cmd, cwd=root, env=env).returncode
-        if kind == "py" and rc == 5:  # pytest collected nothing: no tests, not a failure
-            continue
-        if rc == 0:
-            passed += 1
-            print(f"ok   {rel}")
-        else:
-            failed.append(rel)
-            print(f"FAIL {rel} (exit {rc})")
-    if not passed and not failed:
-        print(f"test-one: {target}: no tests")
-        return 0
-    print(f"test-one: {passed} passed, {len(failed)} failed" + (": " + " ".join(failed) if failed else ""))
-    return 1 if failed else 0
+    py = os.environ.get("ZONE_PYTHON") or "python3"
+    pytest, env = child_command(os.environ, py, group, kinds)
+    return run_planned(runs, pytest, py, root, env, target)
 
 
 # The build queue: `zone-tool job submit` hands a test run to the runner (bin/codeteam-buildq), which starts it
@@ -1099,10 +1163,11 @@ def read_jobs(q):
 
 
 def write_job(q, job):
-    """Atomic (temp file, then rename), 0600: the job holds the submitter's whole environment."""
+    """Atomic (temp file, then rename), 0600: the job holds the submitter's whole environment while it is queued or
+    running, and its env is emptied when it settles."""
     tmp = q / f".{job['ticket']}.json.tmp"
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(job, f)
+        json.dump(codeteam_settled_env.settled_env(job), f)
     os.replace(tmp, q / f"{job['ticket']}.json")
 
 
@@ -1305,18 +1370,32 @@ def claim_fallback(q, ticket, why, record):
     return True
 
 
+def _read_record(path) -> dict:
+    """The record at path as parsed JSON, or {} when it is missing or unreadable."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def print_done(q, job):
     """A done job's log, then how long it waited in the queue and ran (a job that ran), then its summary line; for a
     job whose test was answered from an existing record (it ran nothing), the summary says so. codeteam-land records
-    the wait apart from the step's seconds; the summary stays last, which records_pass needs."""
+    the wait apart from the step's seconds; the summary stays last, which records_pass needs.
+
+    A job that ran and whose record holds a numeric build_seconds gets `, build B s` inside the parentheses (the slow-test
+    rule); a record that is missing, unreadable or without the number leaves the line as it was. The build part sits
+    inside the parentheses because JOB_RAN (share/codeteam_ran.py) and QUEUED (bin/codeteam-land) read
+    `[^)\\n]+` after "job ", so both still parse the line."""
     with contextlib.suppress(FileNotFoundError):
         log = (q / f"{job['ticket']}.log").read_text(errors="replace")
         sys.stdout.write(log if log.endswith("\n") or not log else log + "\n")
     times = [job.get(key) for key in ("submitted", "started", "finished")]
     if not job.get("answered") and all(isinstance(t, (int, float)) for t in times):
         submitted, started, finished = times
+        built = build_part(_read_record(job["record"]))
         print(f"zone-tool: queued {max(0, started - submitted):.0f} s, ran {max(0, finished - started):.0f} s "
-              f"(job {job['ticket']})")
+              f"(job {job['ticket']}{built})")
     code = job.get("exit")
     source = "answered from record" if job.get("answered") else "record"
     print(f"zone-test: {job.get('result') or ('PASS' if code == 0 else 'FAIL')} (exit {code}); {source} {job['record']}")
@@ -1689,8 +1768,9 @@ def job_detail(j):
 
 def job_line(j):
     cost = "-" if j.get("cost") is None else f"{j['cost']:g}"
+    guarantee = f" guarantee={j['guarantee']}" if j.get("guarantee") else ""    # why the runner started it
     return (f"{j['ticket']} {j['class']} {j['state']} {j.get('team') or '-'} {j.get('session') or '-'} "
-            f"{j.get('worktree') or '-'} cost={cost} {job_detail(j)}")
+            f"{j.get('worktree') or '-'} cost={cost} {job_detail(j)}{guarantee}")
 
 
 def cmd_job_status(args):

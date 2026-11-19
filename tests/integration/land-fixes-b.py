@@ -24,8 +24,13 @@ def load(name, path):
     return mod
 
 
-cl = load("cl", LAND)
 W = Path(tempfile.mkdtemp(prefix="land-fixes-b-"))
+CG = W / "codegraph"
+CG.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{W / "codegraph.calls"}"\n'
+              f'if [ -d "$3" ]; then echo present >> "{W / "codegraph.calls"}"; else echo absent >> "{W / "codegraph.calls"}"; fi\n')
+CG.chmod(0o755)
+os.environ["CODETEAM_CODEGRAPH"] = str(CG)
+cl = load("cl", LAND)
 REPO, ROOT = W / "repo", W / "team"
 fails = 0
 
@@ -52,6 +57,7 @@ def land(*args, env=None):
                  ("GIT_COMMITTER_EMAIL", "t@t")):
         e.setdefault(k, v)
     e.update(env or {})
+    e["CODETEAM_CODEGRAPH"] = str(CG)
     return subprocess.run([LAND, str(W / "team.toml"), *args], capture_output=True, text=True, env=e)
 
 

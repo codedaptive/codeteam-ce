@@ -52,7 +52,7 @@ Set all of these in the new team's manifest before the first session starts, and
 | `CODETEAM_CARGO_TARGET = "1"` | builds go to `<worktree>/cargo-target`, which warm clones and the sweep clean |
 | `CODETEAM_WARM = "1"` | every new request worktree starts as a copy-on-write clone of its lane's build |
 | `RUSTC_WRAPPER = ".../bin/sccache-wt/sccache"`, `SCCACHE_CACHE_SIZE = "20G"` (optional, needs sccache) | compiled dependencies shared machine-wide |
-| `CARGO_INCREMENTAL = "1"` | a small edit recompiles only what changed (sccache-wt sends these compiles straight to rustc) |
+| `CARGO_INCREMENTAL = "1"` | a small edit recompiles only what changed (sccache-wt sends these compiles straight to rustc); the landing tool's own builds run with 0 |
 | `CARGO_PROFILE_DEV_DEBUG = "line-tables-only"`, same for TEST | smaller build folders, backtraces keep file:line |
 | `CARGO_PROFILE_RELEASE_LTO = "false"`, `..._CODEGEN_UNITS = "16"` | a stray `--release` costs minutes, not an hour |
 | Swift: `CODETEAM_SWIFT_XCODE = "1"` (or the product's equivalent) | Swift through Xcode's compile cache |
@@ -81,8 +81,8 @@ The product's Makefile (or codeteam's zone.mk defaults) must have, before lanes 
   port for a whole zone; a filter only for a handful.
 - `make zone-test`: the zone's whole suite (its `ZONE_TEST`), through the build queue at the `full` class by default.
 - `make warm`: what codeteam's worktree hook runs.
-- `make zone-clean`: removes the worktree's build output (codeteam's zone.mk gives it to every team; a product
-  Makefile may add its own `clean`).
+- `make zone-clean`: removes the worktree's build output and its CodeGraph index (the index stays when `ZONE_CLEAN_KEEP_INDEX=1`)
+  (codeteam's zone.mk gives it to every team; a product Makefile may add its own `clean`).
 
 Write the exact commands, per port, in the product notes' "Test calls" table, including a **whole zone** row.
 

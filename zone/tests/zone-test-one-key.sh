@@ -3,7 +3,7 @@
 # preserves the existing key byte for byte, and zone-tool receives it literally.
 set -u
 unset MAKEFILES MAKEFLAGS MFLAGS MAKELEVEL MAKEOVERRIDES DIR CODETEAM_OWNS GROUP \
-  CODETEAM_TEST_GROUP SWIFT_TEST_ARGS CARGO_TEST_ARGS PYTEST_ARGS PYTEST_ADDOPTS CLASS
+  CODETEAM_TEST_GROUP CODETEAM_KINDS_BY_NAME SWIFT_TEST_ARGS CARGO_TEST_ARGS PYTEST_ARGS PYTEST_ADDOPTS CLASS
 for name in ${!ZONE_@}; do unset "$name"; done
 here="$(cd "$(dirname "$0")/../.." && pwd)"
 zone_mk="$here/zone/zone.mk"
@@ -63,6 +63,14 @@ run_key repo r-repo-whitespace-only '[one pkg  ]' UNUSED=1 'PYTEST_ARGS=   '
 run_key no-make l-double-quotes '[one pkg owns= pytest=-k "a or b"]' UNUSED=1 'PYTEST_ARGS=-k "a or b"'
 run_key no-make m-single-quote "[one pkg owns= pytest=-k it's]" UNUSED=1 "PYTEST_ARGS=-k it's"
 run_key no-make n-backticks '[one pkg owns= pytest=-k `echo x`]' UNUSED=1 'PYTEST_ARGS=-k `echo x`'
+run_key repo kinds-on-env '[one pkg   env:CODETEAM_KINDS_BY_NAME=1]' CODETEAM_KINDS_BY_NAME=1
+run_key repo kinds-on-command '[one pkg   env:CODETEAM_KINDS_BY_NAME=1]' UNUSED=1 CODETEAM_KINDS_BY_NAME=1
+run_key repo kinds-on-listed '[one pkg   env:CODETEAM_KINDS_BY_NAME=1]' CODETEAM_KINDS_BY_NAME=1 ZONE_TEST_KEY_VARS=CODETEAM_KINDS_BY_NAME
+run_key no-make kinds-on-no-make '[one pkg owns= env:CODETEAM_KINDS_BY_NAME=1]' CODETEAM_KINDS_BY_NAME=1
+run_key repo kinds-empty '[one pkg  ]' CODETEAM_KINDS_BY_NAME=
+run_key repo kinds-zero '[one pkg  ]' CODETEAM_KINDS_BY_NAME=0
+run_key repo kinds-yes '[one pkg  ]' CODETEAM_KINDS_BY_NAME=yes
+run_key repo kinds-trimmed '[one pkg   env:CODETEAM_KINDS_BY_NAME=1]' 'CODETEAM_KINDS_BY_NAME= 1 '
 for pair in 'a-repo-unset c-repo-pytest' 'g-no-make-unset h-no-make-pytest'; do
   set -- $pair
   if [ -f "$tmp/$1.key" ] && [ -f "$tmp/$2.key" ] && ! cmp -s "$tmp/$1.key" "$tmp/$2.key"; then

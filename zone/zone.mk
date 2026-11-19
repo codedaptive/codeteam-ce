@@ -59,7 +59,16 @@ zone_skip_no_exec = skip=; first=1; for w in $$MAKEFLAGS; do case "$$w" in --|*=
 # on make's command line or in the environment, adds the word env:NAME=value to zone-test-one's key and to
 # zone-test's salt. Names unset or empty add nothing, so every other record keeps its key byte for byte. A value is
 # one word with no quotes or $.
-ZONE_TEST_ENV_WORDS = $(strip $(foreach v,$(ZONE_TEST_KEY_VARS),$(if $(strip $($(v))),env:$(v)=$(strip $($(v))))))
+# CODETEAM_KINDS_BY_NAME=1 (exactly 1 after strip, on make's command line or in the environment) makes zone-tool
+# test-one select its group's tests by name, so it adds env:CODETEAM_KINDS_BY_NAME=1 after
+# the ZONE_TEST_KEY_VARS words whether or not it is listed there, once. Any other value adds nothing of its own.
+# CODETEAM_RIT_SELECTOR, which a calling zone's RIT step exports and zone-tool test-one passes to the tests,
+# narrows a run to the RITs wherever the tests read it, so whenever it is set and non-empty it adds
+# env:CODETEAM_RIT_SELECTOR=<value> last, listed in ZONE_TEST_KEY_VARS or not, once: a RIT-only record never
+# answers a whole run, nor a whole one a RIT-only run.
+ZONE_TEST_KINDS_WORD = $(if $(filter 1,$(strip $(CODETEAM_KINDS_BY_NAME))),env:CODETEAM_KINDS_BY_NAME=1)
+ZONE_TEST_RIT_WORD = $(if $(strip $(CODETEAM_RIT_SELECTOR)),env:CODETEAM_RIT_SELECTOR=$(strip $(CODETEAM_RIT_SELECTOR)))
+ZONE_TEST_ENV_WORDS = $(strip $(filter-out $(ZONE_TEST_KINDS_WORD),$(foreach v,$(filter-out CODETEAM_RIT_SELECTOR,$(ZONE_TEST_KEY_VARS)),$(if $(strip $($(v))),env:$(v)=$(strip $($(v)))))) $(ZONE_TEST_KINDS_WORD) $(ZONE_TEST_RIT_WORD))
 ZONE_TEST_SALT = $(if $(ZONE_ROOT_MAKEFILE),$(if $(ZONE_TEST_ENV_WORDS),--salt "$(ZONE_TEST_ENV_WORDS)"),--salt "owns=$(CODETEAM_OWNS)$(if $(ZONE_TEST_ENV_WORDS), $(ZONE_TEST_ENV_WORDS))")
 
 zone-test:
@@ -88,8 +97,9 @@ ZONE_ROOT_MAKEFILE := $(wildcard $(ZONE_ROOT)/GNUmakefile $(ZONE_ROOT)/makefile 
 # is new, so it is stripped to single spaces ("one pkg owns=a:b").
 # Test groups (unit, integration, validation): a repo Makefile's test-one reads GROUP (default unit).
 # zone.mk's own test-one does not hand GROUP to tests; it passes CODETEAM_TEST_GROUP through zone-tool
-# test-one to the tests, which decide what to run. Keep their key terms separate. Non-unit values go in
-# the key so a unit record never answers for an integration run; unset or unit keeps the existing key
+# test-one to the tests, which decide what to run; with CODETEAM_KINDS_BY_NAME=1 zone-tool test-one also runs
+# only the tests named the group (an unnamed test in the unit run only). Keep their key terms separate. Non-unit
+# values go in the key so a unit record never answers for an integration run; unset or unit keeps the existing key
 # so no record is invalidated.
 ZONE_TEST_GROUP_KEY = $(if $(filter-out unit,$(GROUP)), group=$(GROUP))$(if $(filter-out unit,$(CODETEAM_TEST_GROUP)), test-group=$(CODETEAM_TEST_GROUP))
 # Unset, empty or whitespace-only values add nothing, keeping the key byte for byte. Labels distinguish pytest terms
@@ -124,7 +134,8 @@ zone-test-status:
 # MAKEFILES). Any of GNUmakefile, makefile or Makefile at the root counts as having one;
 # then this rule is not defined and the repo's own test-one is the only one.
 # zone-tool test-one runs pytest and the tests/*.sh of DIR, from the root, and the scripts in
-# tests/unit, tests/integration and tests/validation as the landing tool does, each in its own group. DIR=. (or any DIR
+# tests/unit, tests/integration and tests/validation (the repo's, and DIR's own tests/<kind>) as the landing tool
+# does, each in its own group. DIR=. (or any DIR
 # that resolves to the root, such as ./) means the lane's owned paths (CODETEAM_OWNS, colon-separated): in a repo shared by several lanes a
 # lane's zone path is `.`, so a zone-test of `.` must run only the paths that lane owns, not
 # every lane's tests. With CODETEAM_OWNS empty zone-tool refuses rather than pass on no
@@ -146,12 +157,21 @@ endif
 WARM_BUILD ?= 1
 .PHONY: warm-build zone-clean
 
-# zone-clean: remove this worktree's build output (cargo-target, target, .build, node_modules' build caches are
-# left). Everything removed is rebuilt on the next build, or cloned again by `make warm`. A product Makefile that
-# has its own `clean` keeps it; this one is codeteam's, for every team (some products have none).
+# zone-clean: remove this worktree's build output (CLEAN_DIRS: cargo-target, target, .build; node_modules' build
+# caches are left) and its CodeGraph index (.codegraph). Everything removed is rebuilt on the next build, or cloned
+# again by `make warm`. An idle tree gives up its index: the tree is seeded again from a sibling on its
+# lead's first query. .codegraph is handled outside CLEAN_DIRS so a product's `CLEAN_DIRS ?=` cannot keep it.
+# ZONE_CLEAN_KEEP_INDEX=1 in the environment keeps .codegraph and skips the CodeGraph call: the idle exit sets it for a
+# lane's standing tree, the seed source for new trees. It is read in the recipe's shell, not as a make
+# variable, so only the environment decides; unset, empty or any other value removes the index.
+# `codegraph project remove` first unregisters the project so the server lets go of the index (it deletes nothing
+# itself); best effort, since the index goes either way. A product Makefile that has its own `clean` keeps it;
+# this one is codeteam's, for every team (2026-11-05: widgets had none).
 CLEAN_DIRS ?= cargo-target target .build
 zone-clean:
-	@cd $(ZONE_ROOT) && for d in $(CLEAN_DIRS); do if [ -d "$$d" ]; then du -sh "$$d" | sed 's/^/removing /'; rm -rf "$$d"; fi; done; echo "zone-clean: done"
+	@cd $(ZONE_ROOT) && for d in $(CLEAN_DIRS); do if [ -d "$$d" ]; then du -sh "$$d" | sed 's/^/removing /'; rm -rf "$$d"; fi; done; \
+	if [ "$${ZONE_CLEAN_KEEP_INDEX:-}" != 1 ] && [ -d .codegraph ]; then "$${CODETEAM_CODEGRAPH:-codegraph}" project remove "$$(pwd -P)" >/dev/null 2>&1; \
+	  du -sh .codegraph | sed 's/^/removing /'; rm -rf .codegraph; fi; echo "zone-clean: done"
 warm:
 	@cd $(ZONE_ROOT) && for d in $(WARM_DIRS); do $(ZONE_TOOL) warm --from $(WARM_FROM) --target $$d; done
 	@if [ "$(WARM_BUILD)" = 1 ]; then $(MAKE) --no-print-directory -C $(ZONE_ROOT) warm-build; fi

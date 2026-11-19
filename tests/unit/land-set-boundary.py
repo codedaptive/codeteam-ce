@@ -1,8 +1,10 @@
 #!/usr/bin/env -S python3 -u
 """Stages 6 and 7 treat a --with set's landing as one step: Stage 4 merges the members one by one and moves landing
-once, to the last, so the commits before it are never validated or promoted (a three-member
-set once landed as d5e8bf8a9b, e2016f811f, db0e5c3f12; Stage 6 passed at e2016f811f, the middle one, and Stage 7
-promoted a package's changed API without the app's caller change). Git is faked; records live in a temp folder."""
+once, to the last, so the commits before it are never validated or promoted (acme's reindex
+set landed as d5e8bf8a9b, e2016f811f, db0e5c3f12; Stage 6 passed at e2016f811f, the middle one, and Stage 7 promoted
+WidgetStoreKit's changed API without acmex's caller change). Git is faked; records live in a temp folder.
+The unit tests (rule 11); the test of stage6_target, which reads under the real Lock, is in
+tests/integration/land-set-boundary.py."""
 import importlib.machinery
 import importlib.util
 import json
@@ -69,17 +71,6 @@ def test_stage6_never_stops_inside_a_set_while_its_recheck_is_pending():
     assert cl.rechecked_commit(commits, ["db0"], None, is_ancestor) == "e20"          # what promoted e2016f811f
     assert cl.rechecked_commit(commits, ["db0"], None, is_ancestor, {"d5e", "e20"}) == "f47"
     assert cl.rechecked_commit(commits, [], None, is_ancestor, {"d5e", "e20"}) == "d15"
-
-
-def test_stage6_target_reads_the_sets_from_landed_log():
-    with tempfile.TemporaryDirectory() as tmp:
-        team = team_at(Path(tmp))
-        acme_rows(team)
-        (team.dir / "recheck.jsonl").write_text(json.dumps({"M": "db0", "wo": "corpus", "set": SET}) + "\n")
-        after = {"db0": {"db0", "d15"}}
-        with patch.object(cl, "out", return_value="d15\ndb0\ne20\nd5e\nf47\n"), \
-                patch.object(cl, "ancestry", return_value=lambda a, b: b in after.get(a, {a})):
-            assert cl.stage6_target(team) == "f47"
 
 
 def test_stage7_never_promotes_inside_a_set():

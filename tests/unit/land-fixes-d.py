@@ -1,7 +1,9 @@
 #!/usr/bin/env -S python3 -u
 """codeteam fixes, fourth set (2026-11-08, from the messages Orc-Codeteam sent the creator): walls ask about the
 landing's own zone; a step whose zone-test records all passed passes; a duplicate ruling number fails the gate; the
-union-log block keeps a team's own rules; mail for the creator reaches an inbox. Throwaway folders only."""
+union-log block keeps a team's own rules (mail for the creator reaching its inbox is v2/tests/test_for_creator.py).
+Throwaway folders only. A unit test script (rule 11): each check calls one codeteam-land function on values or on fixture files it
+writes in its temp folder, and codeteam-land's import-time launchctl call is faked."""
 import importlib.machinery
 import importlib.util
 import json
@@ -10,14 +12,14 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 HOME = Path(__file__).resolve().parents[2]
 ld = importlib.machinery.SourceFileLoader("cl", str(HOME / "bin" / "codeteam-land"))
 sp = importlib.util.spec_from_loader("cl", ld)
 cl = importlib.util.module_from_spec(sp)
-ld.exec_module(cl)
-sys.path.insert(0, str(HOME / "v2"))
-from codeteam2 import cli  # noqa: E402
+with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=0)):
+    ld.exec_module(cl)
 
 W = Path(tempfile.mkdtemp(prefix="land-fixes-d-"))
 fails = 0
@@ -73,16 +75,6 @@ txt = f.read_text()
 t("a team's own union rule after codeteam's block stays", "NOTES.md merge=union" in txt and "*.png binary" in txt, txt)
 t("codeteam's block is written once, without RULINGS.md", txt.count("DECISIONS.md merge=union") == 1
   and "RULINGS.md" not in txt, txt)
-
-print("== mail for the creator reaches its inbox (2026-11-08)")
-cli.CREATOR_INBOX = W / "creator-inbox.log"
-a = SimpleNamespace(sender="Orc-Codeteam")
-t("a NOTE to codeteam is for the creator", cli.for_creator(a, "NOTE", "codeteam", "a gap in your fix"))
-t("a patrol ANSWER to codeteam is not", not cli.for_creator(a, "ANSWER", "codeteam", "BRANCHES: all mirrored"))
-t("a designer's ANSWER to codeteam is", cli.for_creator(SimpleNamespace(sender="Designer-Codeteam"), "ANSWER",
-                                                       "codeteam", "#1878: one still bites"))
-t("codeteam's own messages are not", not cli.for_creator(SimpleNamespace(sender="codeteam"), "NOTE", "codeteam", "x"))
-t("the inbox holds the two", len(cli.CREATOR_INBOX.read_text().splitlines()) == 2)
 
 print(f"\n{'all passed' if not fails else f'{fails} failed'}  ({W})")
 sys.exit(1 if fails else 0)

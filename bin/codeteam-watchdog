@@ -4,7 +4,9 @@ ssh prompt and the patrol, which runs inside the loop, saw nothing). Run by laun
 (`codeteam-watchdog install`, which polls after bootout before reinstalling and exits non-zero on failure).
 For each team that is up (team/v2/up, no team/v2/down, no team/HALTED): a loop heartbeat
 older than 10 minutes, or a landing queue, recheck or validation runner that launchd shows as not running, is told
-to the owner once per episode (a herdr notice), and a missing loop is started again (codeteam2 ensure-loop)."""
+to the owner once per episode (a herdr notice); a runner that is down is also told to the team's orchestrator (a NOTE with
+launchd's state and last exit code, at most once per runner in 6 hours); and a missing loop is started again
+(codeteam2 ensure-loop)."""
 import json
 import os
 import plistlib
@@ -21,11 +23,20 @@ HERE = Path(__file__).resolve().parent
 # Prefer this checkout's shared module over one in the working directory.
 sys.path.insert(0, str(HERE.parent / "share"))
 import codeteam_launchd
+from codeteam_order_trees import order_trees
+from codeteam_prune_reused import prune_reused_trees
+from codeteam_runner_down import runner_down_note
+from codeteam_stale_target import sweep_stale_targets
 
 TEAMS = HERE.parent / "teams"
 WORKSPACE = Path(os.environ.get("CODETEAM_WORKSPACE") or Path.home() / "codeteam-work")   # every team-<x> folder
 STATE = HERE.parent / "run" / "watchdog.json"
 STALE_S = 600
+# A runner that is down is also told to the team's orchestrator, at most once per runner in this many seconds: a runner
+# that exits at start and is restarted by launchd shows as running in some passes, and each pass that sees it down
+# again opens a new episode.
+TELL_ORC_S = 6 * 3600
+RUNNER_JOBS = {"landing": "land", "recheck": "recheck", "validation": "validate"}
 # Disk (the disk once reached 99% full: work order trees held 18-28 GB of build output each, and
 # a gate died with "No space left on device"). Below DISK_MIN_GB free, the build output of work order trees idle
 # DISK_IDLE_S is removed, oldest first; it is rebuilt (through sccache and the compile caches) when its lead returns.
@@ -293,15 +304,7 @@ def sweep_disk(teams=None, q=None, min_gb=None, idle_s=None, free=None, land_min
         if have < land_min_gb and not elsewhere:
             trees |= {clone for kind, clone in land_clones(cfg, root).items()
                       if not {(os.path.realpath(m), kind), ("*", kind)} & land_busy}
-        for f in (root / "land" / "wo").glob("*.json"):
-            if f.name.endswith((".landed.json", ".retired.json")):
-                continue
-            try:
-                trees.add(Path(json.loads(f.read_text())["tree"]))
-            except (OSError, ValueError, KeyError):
-                continue
-        # and trees with no record: cancelled WorktreeCreate starts (19-27 GB each were seen)
-        trees |= {p for p in (root / "wo").glob("*/*") if p.is_dir() and (p / ".git").exists()}
+        trees |= order_trees(root)
         for tree in sorted(trees):
             dirs = [tree / d for d in BUILD_DIRS if (tree / d).is_dir() and not (tree / d).is_symlink()]
             if not dirs or os.path.realpath(tree) in busy:
@@ -477,10 +480,17 @@ def runner_problems(stem: str, run=subprocess.run, uid: int | None = None) -> li
 
 
 def check():
-    """One pass: the build queue sweep, the disk emergency, the disk floor, then each team's loop and landing
-    runners. Each part runs even when one before it fails, and the failure is logged when the log can be written: on
-    a full disk the state file cannot be written, and the pass used to stop there, before the floor."""
+    """One pass: the build queue sweep, the disk emergency, the disk floor, the stale target sweep (a
+    <tree>/target beside cargo-target in a CODETEAM_CARGO_TARGET=1 team, at any free space), the prune of old cargo
+    copies and incremental folders in idle landing clones (prune_reused_trees, at any free space), then each team's
+    loop and landing runners. Each part runs even when one before it fails, and the failure is logged when the log
+    can be written: on a full disk the state file cannot be written, and the floor after it must still run."""
+    q = Path(os.environ.get("CODETEAM_QUEUE_DIR") or HERE.parent / "run" / "queue")
     for name, part in (("sweep_queue", sweep_queue), ("disk_emergency", disk_emergency), ("sweep_disk", sweep_disk),
+                       ("sweep_stale_targets", lambda: sweep_stale_targets(
+                           manifests(), q, queued_trees, runs_from, free_gb(), quiet_s=DISK_IDLE_S)),
+                       ("prune_reused_trees", lambda: prune_reused_trees(
+                           manifests(), q, queued_trees, runs_from, land_clones, busy_land_clones)),
                        ("check_teams", check_teams)):
         try:
             part()
@@ -498,6 +508,8 @@ def check_teams():
     except (OSError, ValueError):
         state = {}
     now, seen = time.time(), {}
+    told = state.get("told") if isinstance(state.get("told"), dict) else {}
+    told = {k: t for k, t in told.items() if now - t < TELL_ORC_S}
     for m in manifests():
         checkout, manifest = runs_from(m.stem) or (HERE.parent, m)
         try:
@@ -523,8 +535,27 @@ def check_teams():
             if key not in state:
                 notify(f"codeteam watchdog: {m.stem}", p)
                 print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {m.stem}: {p}", flush=True)
+                if p.split(" ")[0] in RUNNER_JOBS and key not in told:
+                    told[key] = now
+                    tell_orchestrator(checkout, manifest, root, m.stem, p)
+    if told:
+        seen["told"] = told
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(seen))
+
+
+def tell_orchestrator(checkout, manifest, root, stem, problem, run=None, popen=None):
+    """One NOTE to the team's orchestrator about a runner that is down, through the codeteam2 of the checkout
+    the team runs (sprocket's is a v5.5 checkout's); started and not waited for. The note carries what launchd says."""
+    run, popen = run or subprocess.run, popen or subprocess.Popen
+    job = f"gui/{os.getuid()}/com.codeteam.codeteam-{RUNNER_JOBS[problem.split(' ')[0]]}.{stem}"
+    try:
+        printed = run(["launchctl", "print", job], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        printed = ""
+    popen([str(Path(checkout) / "v2" / "bin" / "codeteam2"), "say", str(manifest), "general", "codeteam", "NOTE", "orc",
+           runner_down_note(problem, printed, root, manifest)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def launchd_reinstall(label: str, plist: Path, uid: int, run=None, sleep=None,

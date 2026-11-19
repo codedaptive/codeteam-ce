@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, call, mock_open, patch
@@ -149,14 +149,17 @@ class Checks(unittest.TestCase):
                 patch.object(cl, "team_env", side_effect=lambda t, group: {"CODETEAM_TEST_GROUP": group}), \
                 patch.object(cl, "run_steps", return_value=(True, [])) as run:
             self.assertEqual(cl.check_integration(obj, rec, False), ["A", "B"])
-        repo.assert_called_once_with("tree", "tests/integration", "land", str(ROOT / "bin" / "zone-tool"))
+        repo.assert_not_called()
         self.assertEqual(run.call_args_list, [
             call("tree", [], {"CODETEAM_TEST_GROUP": "integration"}, concurrent=False, on_result=ANY),
             call("tree", [('unit tests (tests/unit)', 'run units')], {"CODETEAM_TEST_GROUP": "unit"}, concurrent=True, on_result=ANY),
-            call("tree", [('tests A', 'run A'), ('tests B', 'run B'),
-                          ('integration tests (tests/integration)', 'run repo')],
-                 {"CODETEAM_TEST_GROUP": "integration"}, concurrent=True, on_result=ANY),
         ])
+        with patch.object(cl, "compile_steps", return_value=[]), \
+                patch.object(cl, "zone_tests", side_effect=[[('tests A', 'run A')], [('tests B', 'run B')]]), \
+                patch.object(cl, "repo_integration_steps", return_value=[('integration tests (tests/integration)', 'run repo')]):
+            _, steps = cl.recheck_steps(obj, Path("tree"), ["A", "B"], ["a/x.py"])
+        self.assertEqual(steps, [('tests A', 'run A'), ('tests B', 'run B'),
+                                 ('integration tests (tests/integration)', 'run repo')])
 
 
 class RepoIntegration(unittest.TestCase):
@@ -269,17 +272,18 @@ class Sets(unittest.TestCase):
 
     def test_recheck_one_after_landing_receives_all_members_once(self):
         obj = team()
-        row = {"M": "m2", "wo": "one", "set": ["one", "two"], "overlapping": [], "zones": ["A"]}
+        row = {"time": "then", "M": "m2", "wo": "one", "set": ["one", "two"], "overlapping": [], "zones": ["A"]}
         records = {"one": {"wo": "one", "zone": "A", "fixes": ["f1"]},
                    "two": {"wo": "two", "zone": "B", "fixes": ["f2"]}}
-        with patch.object(cl, "itest_checkout", return_value=Path("tree")), \
+        with patch.object(cl, "itest_lock", return_value=nullcontext(), create=True), \
+                patch.object(cl, "itest_checkout", return_value=Path("tree")), \
                 patch.object(cl, "recheck_steps", return_value=([], [])), \
                 patch.object(cl, "team_env", return_value={}), patch.object(cl, "step_results", return_value=[]), \
                 patch.object(cl, "landed_rec", side_effect=lambda t, w: records[w]), \
                 patch.object(cl, "apply_recheck_findings"), patch.object(cl, "Lock"), \
                 patch.object(cl, "read_recheck", return_value=[row]), patch.object(cl, "_mark_recheck_done_unlocked"), \
                 patch.object(cl, "after_landing") as after:
-            cl.recheck_one(obj, row)
+            cl.recheck_one(obj, [row])
         after.assert_called_once_with(obj, [{"wo": "one", "zone": "A"}, {"wo": "two", "zone": "B"}])
 
 
@@ -298,6 +302,7 @@ class StageTwoSet(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(cl, "entry_path", return_value=None))
+        stack.enter_context(patch.object(cl, "carried_check", return_value=None))
         stack.enter_context(patch.object(cl, "check_work_order", side_effect=lambda t, r: ["a/x.py"] if r["wo"] == "w1" else ["b/x.py"]))
         self.current = stack.enter_context(patch.object(cl, "current_units", return_value=True))
         self.units = stack.enter_context(patch.object(cl, "test_units"))

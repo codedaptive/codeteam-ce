@@ -7,14 +7,30 @@ files, Claude home and v2 state, Claude Code's own settings, and herdr's config.
 session codeteam started (CODETEAM_MANIFEST set), except team-codeteam's, whose product the harness is.
 Reads are always fine. Sessions outside codeteam (the owner's own) are never touched.
 
-Covers Edit, Write, MultiEdit and NotebookEdit by path, and Bash commands that name a harness path together with
-something that writes (a redirect, tee, cp, mv, rm, ln, sed -i, git commit/add/push/checkout/reset...).
+Covers Edit, Write, MultiEdit and NotebookEdit by path, and Bash commands that write (a redirect, tee, cp, mv, rm, ln,
+sed -i, git commit/add/push/checkout/reset...) and either name a harness path or run in a harness folder. A write runs
+in its git command's `-C <dir>` when given, else in each folder part_folders follows the command's `cd`s to from the
+session's cwd (a piped cd moves none; parts joined by `&&` to one behind `&&` or `||` run in its folders alone;
+part_folders has the rest, `&` and `cd X ||` included). Each part's redirect target is checked, codeteam's tools too.
+
+Its helpers live beside this hook, one per file: segments.py (the command's parts; a redirect glued to a word is
+split off, and the `&` or `|` of `2>&1` does not split), redirects.py (a part's words apart from its redirects, and
+the files those write), command_words.py, part_folders.py and git_folder.py. A hyphenated hook can't be imported, so
+part_folders takes its HOME folder, and both part_folders and git_folder take its cwd resolver, as arguments.
 """
 import json
 import os
 import re
 import sys
 from pathlib import Path
+
+sys.dont_write_bytecode = True          # no __pycache__ beside the hooks in production's checkout
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from command_words import command_words
+from git_folder import git_folder
+from part_folders import part_folders
+from redirects import redirects
+from segments import segments
 
 HOME = Path.home()
 MANIFEST = os.environ.get("CODETEAM_MANIFEST", "")
@@ -70,38 +86,13 @@ def in_harness(p, roots):
 
 
 WRITES = re.compile(r"(^|[\s;&|(])(>>?|tee|cp|mv|rm|rmdir|ln|install|touch|mkdir|chmod|truncate|"
-                    r"sed\s+(-[a-zA-Z]*\s+)*-i|perl\s+-[a-z]*i|git\s+(-C\s+\S+\s+)?(commit|add|push|checkout|reset|"
+                    r"sed\s+(-[a-zA-Z]*\s+)*-i|perl\s+-[a-z]*i|git\s+(-C\s+\S+\s+)*(commit|add|push|checkout|reset|"
                     r"restore|rm|mv|merge|rebase|stash|apply|am|cherry-pick|switch|branch|tag|worktree))(\s|$)")
 PATHS = re.compile(r"""(?:^|[\s='"(>])((?:~|/)[^\s'";|&<>()]+)""")
 
 
 TOOLS = {"codeteam", "codeteam2", "codeteam-land", "watch-agent", "zone-tool", "codeteam-slot", "codeteam-statusline",
          "make", "cd"}
-SEPARATORS = {";", "&&", "||", "|", "&", "|&"}
-
-
-def segments(cmd):
-    """The parts of a compound command, split where the shell splits it: a separator inside quotes (a finding's
-    --what text quoting code, such as `a > b; c | d`) stays in its part. Unbalanced
-    quotes: split on every separator, as before."""
-    import shlex
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|")
-        lex.whitespace_split = True
-        lex.commenters = ""             # a mid-word '#' must not hide what follows
-        tokens = list(lex)
-    except ValueError:
-        return [(seg, seg.split()) for seg in re.split(r"&&|\|\||;|\|", cmd)]
-    out, words, raw = [], [], []
-    for tok in tokens:
-        if tok in SEPARATORS:
-            out.append((" ".join(raw), words))
-            words, raw = [], []
-        else:
-            words.append(tok)
-            raw.append(shlex.quote(tok) if tok != tok.strip() or " " in tok else tok)
-    out.append((" ".join(raw), words))
-    return out
 
 
 def deny(what):
@@ -121,32 +112,44 @@ def main():
         data = json.load(sys.stdin)
     except ValueError:
         return
-    tool = data.get("tool_name", "")
-    inp = data.get("tool_input") or {}
-    cwd = data.get("cwd") or os.getcwd()
-    roots = harness_roots()
+    what = refusal(data.get("tool_name", ""), data.get("tool_input") or {}, data.get("cwd") or os.getcwd(),
+                   harness_roots())
+    if what:
+        deny(what)
+
+
+def refusal(tool, inp, cwd, roots):
+    """What a tool call would change in the harness, as the refusal names it, or None."""
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         p = inp.get("file_path") or inp.get("notebook_path")
-        if p and in_harness(resolve(p, cwd), roots):
-            deny(f"{tool} of `{p}`")
-        return
+        return f"{tool} of `{p}`" if p and in_harness(resolve(p, cwd), roots) else None
     if tool == "Bash":
-        cmd = inp.get("command") or ""
-        # Each part of a compound command on its own. A part that runs one of codeteam's own tools (say, watch,
-        # push-up, watch-agent, zone-tool...) is how a team uses the harness, not a change to it: its arguments
-        # (the manifest path, a message's words) are never read as writes.
-        for seg, words in segments(cmd):
-            while words and ("=" in words[0] and not words[0].startswith(("/", "~", "."))):
-                words = words[1:]                                  # VAR=value prefixes
-            if not words or os.path.basename(words[0]) in TOOLS:
-                continue
-            if not WRITES.search(seg):
-                continue
-            hits = [m.group(1) for m in PATHS.finditer(seg) if in_harness(resolve(m.group(1), cwd), roots)]
-            if not hits and in_harness(resolve(cwd, cwd), roots):
-                hits = [cwd]                     # a write run from inside the harness (git commit there)
-            if hits:
-                deny(f"a command that writes and names `{hits[0]}`")
+        hit = next(filter(None, (part_target(seg, words, folder, roots) for seg, words, folders
+                                 in part_folders(segments(inp.get("command") or ""), cwd, str(HOME), resolve)
+                                 for folder in folders)), None)
+        return f"a command that writes and names `{hit}`" if hit else None
+    return None
+
+
+def part_target(seg, words, folder, roots):
+    """The harness path one part of a Bash command writes to, or None. Its redirects come first: each file a redirect
+    writes is checked against `folder`, one folder the part may run in (the session's cwd, or one of a `cd` before it,
+    as part_folders follows them), whatever the part runs. Then the part's other words: a part that runs one of
+    codeteam's own tools (say, watch, push-up, watch-agent, zone-tool...) is how a team uses the harness, not a change
+    to it, so its arguments (the manifest path, a message's words) are never read as writes, nor are those of a part
+    WRITES does not match. The program a part runs is not what it writes either: `~/.local/bin/uv pip install --python
+    <venv>/bin/python` writes into the venv. A write runs in `folder`, or a git `-C <dir>` in its
+    place; an argument that names a harness path is refused (an absolute or `~` path, or a relative word that is not
+    an option, resolved against where the write runs), and so is a write that runs inside the harness."""
+    plain, targets = redirects(words)
+    hit = next((t for t in targets if in_harness(resolve(t, folder), roots)), None)
+    plain = command_words(plain)
+    if hit or not plain or os.path.basename(plain[0]) in TOOLS or not WRITES.search(seg):
+        return hit
+    where = git_folder(plain, folder, resolve)
+    named = [m.group(1) for m in PATHS.finditer(" ".join(plain[1:]))] + [where]   # the folder before plain words,
+    named += (w for w in plain[1:] if not w.startswith("-"))                     # so a refusal names it
+    return next((p for p in named if in_harness(resolve(p, where), roots)), None)
 
 
 if __name__ == "__main__":

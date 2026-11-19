@@ -177,6 +177,61 @@ esac
         t("fallback executes absolute ssh without PATH", execute.call_args_list == [(("/usr/bin/ssh", ["/usr/bin/ssh", "h"]), {})]
           and not search.called, (execute.call_args_list, search.call_args_list))
 
+    # Signals around the spawn (the handlers went in after posix_spawn, so a TERM in between
+    # killed the wrapper and left the command running). A fake libc and fake signal, kill and waitpid: no process starts.
+    import signal as signals
+
+    class SpawningLibc(FakeLibc):
+        def __init__(self, handlers, before_pid):
+            super().__init__()
+            self.handlers, self.before_pid, self.at_spawn = handlers, before_pid, None
+
+        def posix_spawn(self, pid, path, actions, attr, args, env):
+            self.at_spawn = sorted(self.handlers)
+            for n in self.before_pid:            # a signal that lands before the child's pid is known
+                if n in self.handlers:           # with no handler yet the real wrapper dies: the signal is lost
+                    self.handlers[n](n, None)
+            pid._obj.value = 4242
+            return 0
+
+    handlers, kills, waits = {}, [], []
+
+    def kill(p, n):
+        kills.append((p, n))
+        if n == signals.SIGINT:
+            raise ProcessLookupError(p)          # the command has already gone
+
+    def waitpid(p, flags):
+        if not waits:
+            waits.append(p)
+            handlers[signals.SIGINT](signals.SIGINT, None)    # a signal while the command runs
+        return p, 0
+
+    libc = SpawningLibc(handlers, [signals.SIGTERM])
+    with patch.object(own.ctypes.util, "find_library", return_value="libc"), \
+         patch.object(own.ctypes, "CDLL", return_value=libc), \
+         patch.object(own.signal, "signal", side_effect=lambda n, f: handlers.__setitem__(n, f)), \
+         patch.object(own.os, "kill", side_effect=kill), patch.object(own.os, "waitpid", side_effect=waitpid):
+        try:
+            code = own.main(["ssh", "h"])
+        except Exception as err:                 # a fault in a handler ends the real wrapper with a traceback
+            code = repr(err)
+    t("TERM, INT and HUP are handled before the command is spawned",
+      libc.at_spawn == sorted([signals.SIGTERM, signals.SIGINT, signals.SIGHUP]), libc.at_spawn)
+    t("a signal from before the pid is known reaches the command once it is spawned",
+      kills[:1] == [(4242, signals.SIGTERM)], kills)
+    t("a signal while the command runs goes straight to it, and one it can no longer take is no fault",
+      kills[1:] == [(4242, signals.SIGINT)] and code == 0, (kills, code))
+
+    # exit_status, moved out of main: a fake waitpid gives hand-written wait statuses.
+    with patch.object(own.os, "waitpid", side_effect=[InterruptedError(), (4242, 7 << 8)]) as waited:
+        code = own.exit_status(4242)
+    t("exit_status: a wait a signal interrupts is waited again, and exit 7 is 7",
+      code == 7 and waited.call_count == 2, (code, waited.call_count))
+    with patch.object(own.os, "waitpid", return_value=(4242, signals.SIGTERM)):
+        code = own.exit_status(4242)
+    t("exit_status: a command ended by TERM is 143, 128 plus 15", code == 143, code)
+
     # The checks that start real processes (the stub harness: stdio, a command that cannot start, TERM, the time
     # limit; and the refusals run as a real process) are integration tests: tests/integration/test_own_e2e.py.
 finally:

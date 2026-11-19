@@ -152,6 +152,38 @@ def test_cached_answer_counts_at_new_commit(repo):
     assert answer.stdout.startswith("PASS ")
 
 
+def test_cached_answer_names_the_commit_it_logged_at(repo):
+    # The record file keeps its run's commit, so the answer says where landing's evidence went.
+    _, git, tool = repo
+    assert run_test(tool, cached=True).returncode == 0
+    git("commit", "--allow-empty", "-qm", "second")
+    cached = run_test(tool, cached=True)
+    assert f"logged as unit evidence at commit {git('rev-parse', 'HEAD')[:10]}" in cached.stdout
+
+
+def test_cached_answer_on_an_unclean_tree_says_not_logged(repo):
+    # Package.resolved is outside the code hash, so the record still answers, but the tree is not clean.
+    path, git, tool = repo
+    assert run_test(tool, cached=True).returncode == 0
+    git("commit", "--allow-empty", "-qm", "second")
+    (path / "Package.resolved").write_text("new\n")
+    cached = run_test(tool, cached=True)
+    assert "already recorded" in cached.stdout
+    assert "not logged as unit evidence" in cached.stdout
+    assert tool("commit-record", "HEAD").returncode == 2
+
+
+def test_untracked_codegraph_folder_leaves_the_tree_clean(repo):
+    # The CodeGraph server writes .codegraph/.gitignore into every worktree.
+    path, _, tool = repo
+    (path / ".codegraph").mkdir()
+    (path / ".codegraph" / ".gitignore").write_text("*\n!.gitignore\n")
+    assert run_test(tool).returncode == 0
+    answer = tool("commit-record", "HEAD")
+    assert answer.returncode == 0, answer.stdout
+    assert answer.stdout.startswith("PASS ")
+
+
 def test_record_contains_commit_clean_and_default_group(repo):
     path, git, tool = repo
     assert run_test(tool).returncode == 0

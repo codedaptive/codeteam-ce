@@ -46,9 +46,19 @@ def test_a_name_new_on_an_edited_line_is_still_reported():
     assert cl.missing_file_refs(["See a.swift and gone.rs."], TRACKED, NAMES, ["See a.swift."]) == ["gone.rs"]
 
 
+
+def test_a_swift_extension_name_keeps_its_plus_sign():
+    """Type+Extension.swift is the house name for an extension file; the check split it at the plus
+    sign and reported ManagerLane.swift, which no file is called."""
+    tracked = TRACKED + ["apps/d/Sources/D/CommunityResidentMain+ManagerLane.swift"]
+    names = {**NAMES, "CommunityResidentMain+ManagerLane.swift": tracked[-1:]}
+    line = "The seam is in `CommunityResidentMain+ManagerLane.swift` and D/CommunityResidentMain+ManagerLane.swift:40."
+    assert cl.missing_file_refs([line], tracked, names) == []
+    assert cl.missing_file_refs(["See EstateAdmin+NewDatabase.swift."], tracked, names) == ["EstateAdmin+NewDatabase.swift"]
+
 if __name__ == "__main__":
     for fn in (test_a_missing_file_is_reported_and_a_tracked_one_is_not, test_a_marked_line_is_skipped,
                test_the_mark_covers_its_own_line_only, test_a_name_already_on_the_edited_line_is_not_reported,
-               test_a_name_new_on_an_edited_line_is_still_reported):
+               test_a_name_new_on_an_edited_line_is_still_reported, test_a_swift_extension_name_keeps_its_plus_sign):
         fn()
     print("all passed")

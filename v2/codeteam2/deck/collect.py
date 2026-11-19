@@ -32,6 +32,7 @@ from ..scheduler import _record_state
 from ..store import RUNTIME
 from ..team import CT_HOME, WORKSPACE, Team, v1
 from . import model
+from .live_fields import live_fields
 
 # How much of a log or transcript a first read takes from the end: transcripts grow to many MB, so the deck
 # limits initial reads to 64 KB, enough for its latest records.
@@ -1187,8 +1188,10 @@ def read_runner(path, alive_pids, now):
     """The build queue runner as queue-runner.json shows it. state is "none" (no file), "?" (a file that cannot be
     read, is not a JSON object or has no numeric beat), "stale" (the beat is older than $CODETEAM_BUILDQ_STALE
     seconds, 60 by default, or its pid is not in alive_pids) or "live". Only a live runner gives its numbers
-    (finite ones; a hold only when it is a bool): of any other, the deck shows nothing it cannot vouch for. Only
-    reads: no lock of the runner's is taken or tested."""
+    (finite ones; a hold only when it is a bool) and, when its file has a "teams" object, "teams": each team's
+    {"running", "waiting"} job counts, the entries that are not two counts of 0 or more dropped. Of any other
+    runner the deck shows nothing it cannot vouch for, and it has no "teams" key. Only reads: no lock of the
+    runner's is taken or tested."""
     try:
         data = json.loads(Path(path).read_text())
     except FileNotFoundError:
@@ -1201,9 +1204,7 @@ def read_runner(path, alive_pids, now):
     gone = alive_pids is not None and pid is not None and pid not in alive_pids
     if age > _conf_num(os.environ.get("CODETEAM_BUILDQ_STALE"), RUNNER_STALE_S) or gone:
         return _runner("stale", pid=pid, beat_age_s=age)
-    return _runner("live", pid=pid, beat_age_s=age,
-                   **{k: data[k] if _finite(data.get(k)) else None for k in RUNNER_NUMBERS},
-                   **{k: data[k] if isinstance(data.get(k), bool) else None for k in RUNNER_HOLDS})
+    return _runner("live", pid=pid, beat_age_s=age, **live_fields(data, RUNNER_NUMBERS, RUNNER_HOLDS, _finite))
 
 
 def _queue_jobs(queue_dir):

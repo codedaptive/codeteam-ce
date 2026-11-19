@@ -115,9 +115,65 @@ class LiveServerTests(unittest.TestCase):
 
 
 @integration_only
+class LiveFileLookupTests(unittest.TestCase):
+    def setUp(self):
+        from codeteam2.deck.server.build_server import build_server
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.web = root / "web"
+        self.web.mkdir()
+        (self.web / "js").mkdir()
+        (self.web / "index.html").write_text("<html></html>")
+        (self.web / "js" / "removed.js").write_bytes(b"before deletion();")
+        (self.web / "notes.txt").write_text("private notes")
+        (root / "outside.js").write_bytes(b"outside();")
+        (self.web / "js" / "link.js").symlink_to(root / "outside.js")
+        env = patch.dict(os.environ, {"CODETEAM_DECK_LOG": str(root / "deck.log")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.server = build_server(FakeCollector(), port=0, web_dir=self.web, motion_on=False, interval=2.0)
+        self.addCleanup(self.server.server_close)
+        self.port = self.server.server_address[1]
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(self.server.shutdown)
+
+    def request(self, path):
+        try:
+            return LiveServerTests.request(self, "GET", path)
+        except http.client.RemoteDisconnected:
+            return None, {}, b""
+
+    def test_javascript_added_after_start_is_served(self):
+        (self.web / "js" / "late.js").write_bytes(b"late module();")
+        status, _, body = self.request("/js/late.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"late module();")
+
+    def test_served_file_deleted_after_start_is_not_found(self):
+        status, _, body = self.request("/js/removed.js")
+        self.assertEqual((status, body), (200, b"before deletion();"))
+        (self.web / "js" / "removed.js").unlink()
+        status, _, _ = self.request("/js/removed.js")
+        self.assertEqual(status, 404)
+
+    def test_symlink_to_javascript_outside_web_folder_is_not_found(self):
+        self.assertEqual(self.request("/js/link.js")[0], 404)
+
+    def test_disallowed_text_file_is_not_found(self):
+        self.assertEqual(self.request("/notes.txt")[0], 404)
+
+    def test_parent_path_to_javascript_outside_web_folder_is_not_found(self):
+        self.assertEqual(self.request("/../outside.js")[0], 404)
+
+
+@integration_only
 class PortZeroTests(unittest.TestCase):
     def test_port_zero_prints_the_port_the_server_bound(self):
-        # A review finding: --port 0 printed http://127.0.0.1:0/ while the server listened on a free port
+        # codeteam-jj S-12: --port 0 printed http://127.0.0.1:0/ while the server listened on a free port (D441)
         from http.server import ThreadingHTTPServer
 
         from codeteam2.deck.server import serve as serve_module

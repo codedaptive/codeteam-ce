@@ -27,7 +27,8 @@ NODE = shutil.which("node")
 needs_node = unittest.skipUnless(NODE, "node is not installed")
 # Box-drawing and block characters the terminal draws with; the page draws bars and boxes with CSS or SVG.
 TERMINAL_GLYPHS = "╭╮╰╯│─▰▱▮▯█▁▂▃▄▅▆▇▏▎▍▌▋▊▉"
-BASE_UI = {"cursor": 0, "expanded": [], "allAgents": False, "teamFilter": None, "flash": [], "motion": False}
+BASE_UI = {"cursor": 0, "expanded": [], "allAgents": False, "teamAgents": False, "teamFilter": None, "flash": [],
+           "motion": False}
 
 
 def call_js(module, export, *args):
@@ -132,9 +133,11 @@ class DeckCase(unittest.TestCase):
         return hits[0]
 
     def assertFacts(self, el, *facts):
+        """Each fact appears in el's text as a whole token: no letter or digit right before or after it, so
+        "1 running" does not pass on "11 running"."""
         for fact in facts:
             with self.subTest(fact):
-                self.assertIn(fact, el["text"])
+                self.assertRegex(el["text"], rf"(?<![0-9A-Za-z]){re.escape(fact)}(?![0-9A-Za-z])")
 
 
 @integration_only
@@ -225,7 +228,8 @@ class RenderDeckTests(DeckCase):
         self.assertLess(box["text"].index("build output 12.0 GB"), box["text"].index("Coord-a blocked for 3 min"))
 
     def test_keys(self):
-        self.assertFacts(self.at("keys"), "j k", "move", "expand", "all agents", "team", "disk now")
+        self.assertFacts(self.at("keys"), "j k move", "expand", "a all agents", "t team agents", "f team filter",
+                         "d disk now")
 
     def test_no_terminal_box_or_block_characters(self):
         self.assertEqual([c for c in TERMINAL_GLYPHS if c in self.markup], [])
@@ -239,12 +243,56 @@ class RenderDeckTests(DeckCase):
         self.assertFacts(self.panel(els, "agents"), "1 running", "2 total", "all sessions", "baseline tests",
                          "port the parser", "Coord-a")
 
+    def test_team_agents_show_the_cursor_teams_subagents_and_all_agents_every_teams(self):
+        snap = snapshot()
+        kong = next(s for t in snap["teams"] if t["name"] == "beta" for s in t["sessions"])
+        kong["agents"] = [test_deck.render_agent("k1", description="guard the review", finished=True)]
+        _, els = self.render(snap, teamAgents=True)
+        team = self.panel(els, "agents")
+        self.assertFacts(team, "1 running", "2 total", "team alpha", "baseline tests", "port the parser", "Coord-a")
+        self.assertNotIn("guard the review", team["text"])
+        _, els = self.render(snap, allAgents=True)
+        self.assertFacts(self.panel(els, "agents"), "1 running", "3 total", "all sessions", "guard the review", "Kong")
+
     def test_names_are_escaped(self):
         snap = snapshot()
         snap["teams"][0]["sessions"][0]["name"] = "<b>x</b>"
         markup, _ = self.render(snap)
         self.assertNotIn("<b>x</b>", markup)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", markup)
+
+
+@integration_only
+@needs_node
+class TwoColumnTests(DeckCase):
+    def test_middle_has_two_columns_with_all_panels(self):
+        _, els = self.render()
+        middle = next(el for el in els if el["tag"] == "main" and "middle" in classes(el))
+        inside = [el for el in self.inside(els, middle) if el is not middle]
+        direct = sorted((el for el in inside if not any(
+            parent is not el and parent["start"] < el["start"]
+            and el["start"] < parent["start"] + len(parent["markup"])
+            for parent in inside)), key=lambda el: el["start"])
+        self.assertEqual([(el["tag"], classes(el)) for el in direct],
+                         [("div", ["col"]), ("div", ["col"])])
+        for col, first in zip(direct, ("team:alpha", "focus")):
+            panels = sorted((el for el in self.inside(els, col) if "data-panel" in el["attrs"]),
+                            key=lambda el: el["start"])
+            self.assertTrue(panels)
+            self.assertEqual(panels[0]["attrs"]["data-panel"], first)
+        names = [el["attrs"]["data-panel"] for el in inside if "data-panel" in el["attrs"]]
+        for name in ("team:alpha", "team:beta", "halted", "focus", "log", "builds", "disk"):
+            self.assertEqual(names.count(name), 1, name)
+        self.assertEqual([name for el in els for name in classes(el) if name in ("dock", "tcol", "teams")], [])
+
+    def test_fixture_places_teams_left_details_right_and_spills_builds_left(self):
+        # The team list runs out first, so BUILDS spills into the left column. By hand, in rows: alpha 5.5 left,
+        # focus 9.5 right, beta 3.5 and halted 3.5 left (12.5), log 5.5 right (15), BUILDS left, DISK right.
+        _, els = self.render()
+        cols = sorted((el for el in els if el["tag"] == "div" and classes(el) == ["col"]), key=lambda el: el["start"])
+        order = [[el["attrs"]["data-panel"] for el in sorted(self.inside(els, col), key=lambda el: el["start"])
+                  if "data-panel" in el["attrs"]] for col in cols]
+        self.assertEqual(order, [["team:alpha", "team:beta", "halted", "builds"], ["focus", "log", "disk"]])
 
 
 MOTION_CLASSES = ("pulse", "sweep", "flash", "flow")
@@ -329,9 +377,22 @@ class HandleKeyTests(unittest.TestCase):
         self.assertIs(self.key("a")[0]["ui"]["allAgents"], True)
         self.assertIs(self.key("a", {"allAgents": True})[0]["ui"]["allAgents"], False)
 
-    def test_t_cycles_teams_and_resets_the_cursor(self):
+    def test_t_toggles_team_agents(self):
+        # t shows the team's agents; shift-T (the old key) does nothing now.
+        self.assertIs(self.key("t")[0]["ui"]["teamAgents"], True)
+        self.assertIs(self.key("t", {"teamAgents": True})[0]["ui"]["teamAgents"], False)
+        self.assertIs(self.key("T")[0]["ui"]["teamAgents"], False)
+
+    def test_a_and_t_each_turn_the_other_off(self):
+        ui = self.key("t", {"allAgents": True})[0]["ui"]
+        self.assertEqual((ui["teamAgents"], ui["allAgents"]), (True, False))
+        ui = self.key("a", {"teamAgents": True})[0]["ui"]
+        self.assertEqual((ui["allAgents"], ui["teamAgents"]), (True, False))
+        self.assertEqual(self.key("t", {"teamFilter": "beta"})[0]["ui"]["teamFilter"], "beta")
+
+    def test_f_cycles_teams_and_resets_the_cursor(self):
         for before, after in ((None, "alpha"), ("alpha", "beta"), ("beta", "gamma"), ("gamma", None)):
-            result = self.key("t", {"teamFilter": before, "cursor": 2 if before is None else 0})[0]
+            result = self.key("f", {"teamFilter": before, "cursor": 2 if before is None else 0})[0]
             self.assertEqual(result["ui"]["teamFilter"], after)
             self.assertEqual(result["ui"]["cursor"], 0)
 
@@ -349,7 +410,7 @@ class HandleKeyTests(unittest.TestCase):
                   f"const snap = {json.dumps(snapshot())};\n"
                   f"const ui = {json.dumps(BASE_UI)};\n"
                   "const before = JSON.stringify(ui);\n"
-                  "for (const key of ['j', 'k', 'Enter', 'a', 't', 'd']) handleKey(key, ui, snap);\n"
+                  "for (const key of ['j', 'k', 'Enter', 'a', 'T', 't', 'd']) handleKey(key, ui, snap);\n"
                   "process.stdout.write(JSON.stringify(JSON.stringify(ui) === before));\n")
         done = subprocess.run([NODE, "--input-type=module", "-e", script], capture_output=True, text=True,
                               timeout=60)

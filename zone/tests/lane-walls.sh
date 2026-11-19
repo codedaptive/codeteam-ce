@@ -235,6 +235,10 @@ check("lockfile: Cargo.lock inside, outside and in another lane's area may be ed
                                    refused("model/benchmarks/Package.resolved", V2())))
 check("lockfile: Cargo.lock.bak is not a lockfile; no owner, so orchestrator", ORC,
       lambda: refused("Cargo.lock.bak", V2()))
+# Walls.lockfile is what the landing tool's wall check asks.
+check("Walls.lockfile: Cargo.lock at the root and Package.resolved in another lane's area are; Cargo.lock.bak and v2/x.rs are not",
+      (True, True, False, False), lambda: (V2().lockfile("Cargo.lock"), V2().lockfile("model/benchmarks/Package.resolved"),
+                                           V2().lockfile("Cargo.lock.bak"), V2().lockfile("v2/x.rs")))
 
 # ---- a walled lane (zone '.' with other lanes' areas)
 check("walled: zone lane refuses v2/x, owner v2", "v2", lambda: refused("v2/x", ZL()))
@@ -438,6 +442,9 @@ check("ahead of own reference doc: zone lane (zone 'zone') with entry docs/refer
 check("ahead of the lockfile rule: entry Cargo.lock -> ORCHESTRATOR for zoned v2; v2/sub/Cargo.lock and the lockfile without it stay allowed",
       (ORC, None, None), lambda: (refused("Cargo.lock", VO("Cargo.lock")), refused("v2/sub/Cargo.lock", VO("Cargo.lock")),
                                   refused("Cargo.lock", VO())))
+check("Walls.lockfile: entry Cargo.lock -> the root Cargo.lock is not one, v2/sub/Cargo.lock still is, both are without it",
+      (False, True, True), lambda: (VO("Cargo.lock").lockfile("Cargo.lock"), VO("Cargo.lock").lockfile("v2/sub/Cargo.lock"),
+                                    VO().lockfile("Cargo.lock")))
 
 # The walled lane and the unwalled '.' lane with no other area.
 check("walled: entry model/benchmarks -> ORCHESTRATOR for model/benchmarks/x.py (without it: model-benchmarks)",

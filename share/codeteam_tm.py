@@ -9,8 +9,8 @@ A sticky exclusion (CSBackupSetItemExcluded with excludeByPath false, what `tmut
 the folder itself and goes with it when the folder is deleted. So a folder is marked once it exists. The landing tool's
 own trees are marked whole when they are made (land/itest, land/validate). A work tree's build output is marked when the
 tree is cut, for what its warm clone brought, and by codeteam's hourly sweep (`exclude_team`) for what its builds made
-since. Nothing here pre-creates a folder: an empty build folder would make the idle sweep run zone-clean and mark the tree
-cleaned before anything was built, and zone-clean deletes the folders anyway. The build queue never marks anything
+since. Nothing here pre-creates a folder: an empty build folder would make the idle sweep run zone-clean on the tree
+before anything was built, and zone-clean deletes the folders anyway. The build queue never marks anything
 (zone/docs/TESTING.md: nothing on the queue path calls tmutil), so nothing here runs on it.
 
 Measured 2026-11-12: `tmutil addexclusion` took 11 s per folder, even for one already marked (33 s for three), so a

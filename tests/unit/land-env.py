@@ -43,10 +43,36 @@ def case():
     return got == want and not (W / "root").exists(), got
 
 
-ok, got = case()
-print(("  PASS" if ok else "  FAIL") + " {root}, {home} and ~ are expanded", "" if ok else got)
-if ok:
-    shutil.rmtree(W, ignore_errors=True)
+def test_landing_disables_incremental_for_every_group():
+    (W / "repo").mkdir(exist_ok=True)
+    (W / "incremental.toml").write_text(
+        f'repo = "{W / "repo"}"\nworktree_root = "{W / "root"}"\n'
+        f'[env]\nTMPDIR = "{W / "tmp"}/"\nCARGO_INCREMENTAL = "1"\n')
+    original = {k: v for k, v in os.environ.items() if k != "CARGO_INCREMENTAL"}
+    with (patch.dict(os.environ, original, clear=True),
+          patch("subprocess.run", side_effect=ran), patch("subprocess.Popen", side_effect=ran)):
+        team = cl.Team(str(W / "incremental.toml"), create=False)
+        envs = {group: cl.team_env(team, group) for group in ("unit", "integration", "validation", None)}
+        assert team.m["env"]["CARGO_INCREMENTAL"] == "1"
+        assert dict(os.environ) == original
+        assert not (W / "root").exists()
+        assert {group: env["CARGO_INCREMENTAL"] for group, env in envs.items()} == {
+            "unit": "0", "integration": "0", "validation": "0", None: "0"}
+
+
+if sys.argv[1:] == ["incremental"]:
+    try:
+        test_landing_disables_incremental_for_every_group()
+    finally:
+        shutil.rmtree(W, ignore_errors=True)
 else:
-    print(f"  ({W} kept for a look)")
-sys.exit(0 if ok else 1)
+    ok, got = case()
+    print(("  PASS" if ok else "  FAIL") + " {root}, {home} and ~ are expanded", "" if ok else got)
+    if ok:
+        try:
+            test_landing_disables_incremental_for_every_group()
+        finally:
+            shutil.rmtree(W, ignore_errors=True)
+    else:
+        print(f"  ({W} kept for a look)")
+    sys.exit(0 if ok else 1)

@@ -3,8 +3,8 @@ as v5.4 runs them: the fixture team has moved over (it has a `landing` branch), 
 work order at Stage 3 before it lands, Stage 4 lands on landing, and integration moves only when Stage 7 promotes.
 Each case builds its own repo with path lanes, a team manifest whose notices go to a file, and runs the real
 bin/codeteam-land: `land` (Stage 2), `reviewed` (Stage 3) and `queue-run --once` (Stage 4).
-  1. Two work orders change the same line; both pass Stage 2 and review. At Stage 4 the second conflicts: it is not
-     landed, leaves the queue, its zone is told with the file and the landed work order named and to wait for its
+  1. Two work orders change the same line; both pass Stage 2 at land. The first is reviewed and lands; the second,
+     reviewed after it, conflicts at Stage 4: it is not landed, leaves the queue, its zone is told with the file and the landed work order named and to wait for its
      promote, then merge integration (A2), and the conflict is logged.
   2. Two work orders change different files of one zone; the second's checked zone was changed by the first after
      its base, so Stage 4 lands it and writes one recheck line naming both.
@@ -14,12 +14,12 @@ bin/codeteam-land: `land` (Stage 2), `reviewed` (Stage 3) and `queue-run --once`
   5. A v5.1 queue entry ({wos, queued, state}) ahead of a v5.2 entry: one `queue-run --once` moves the old entry to
      land/queue-stale/, tells the orchestrator once, and lands the next entry without raising.
 Landing sets:
-  6. Two work orders in zones A and B, each failing the integration group without the other: alone each fails
-     Stage 2; with --with they pass as one queue entry, which lands only once both are reviewed, with refs/landed
-     refs.
+  6. Two work orders in zones A and B need one another for the integration group: with --with they pass as one
+     queue entry, which lands only once both are reviewed, with refs/landed refs. A separate unmatched failure lands
+     and opens a test finding rather than sending the work order back.
   7. A set whose second member conflicts at Stage 4 (another landing changed its file first) bounces every member,
      names the conflicting one, and leaves landing where it was.
-  8. A repo with tests/integration: Stage 2 runs it, through a throwaway build queue, under the integration group.
+  8. A repo with tests/integration: queue-run runs it, through a throwaway build queue, under the integration group.
   9. A set reaching zones A and B compiles both in the first member's tree, one after the other: both checks pass
      and neither fails on zone-tool's guard file.
 Stage 6 and Stage 4 recovery:
@@ -31,8 +31,9 @@ Stage 6 and Stage 4 recovery:
      told once and the row stays pending through a second poll; no review is asked, since Kong reviewed the
      work order before it landed. With the lock gone, the next poll runs the recheck at M and completes the row.
 Repo test folders:
- 13. A tests/integration folder mixing a pytest file and plain scripts, one of which fails: Stage 2 fails with exit 3
-     on that step, and the scripts after the failing one still ran.
+ 13. A tests/integration folder mixing a pytest file and plain scripts, one of which fails: the scripts after the
+     failing one still ran, and since the failure names no file the work order changed, queue-run lands it and opens
+     a test finding for the failing step's zone.
  14. A repo with tests/unit: Stage 2 runs it, through a throwaway build queue, under the unit group.
 Review before landing, the move-over, Stages 6 and 7:
  15. Two separate entries are asked of Kong at once; the later one, reviewed first, lands first, and the earlier one
@@ -189,8 +190,9 @@ def test_a_conflict_at_stage_3_goes_back_to_the_zone(team):
         r = team.land("land", wo)
         assert r.returncode == 0, r.stdout + r.stderr
     assert len(team.queued()) == 2
-    team.review("x1", "x2")
+    team.review("x1")                             # x1 lands first, alone in its batch
     first = team.land("queue-run", "--once")
+    team.review("x2")
     second = team.land("queue-run", "--once")
     assert "Traceback" not in first.stderr + second.stderr, first.stderr + second.stderr
     assert team.integ("A/value") == "7"
@@ -352,13 +354,9 @@ def test_a_set_that_only_works_together_lands_as_one_entry(team):
     base = team.tip()
     team.cut("A", "a1")
     team.cut("B", "b1")
-    trees = {"a1": team.edit("a1", "A/value", "2"), "b1": team.edit("b1", "B/value", "2")}
-    tips = {wo: sh("git rev-parse HEAD", tree).strip() for wo, tree in trees.items()}
-    for wo in ("a1", "b1"):                               # each alone breaks the integration group
-        r = team.land("land", wo)
-        assert r.returncode == GATE, (wo, r.returncode, r.stdout, r.stderr)
-        assert "A/value and B/value differ" in r.stdout, r.stdout
-    assert team.queued() == []
+    team.edit("a1", "A/value", "2")
+    team.edit("b1", "B/value", "2")
+    tips = {wo: sh("git rev-parse HEAD", Path(team.wo(wo)["tree"])).strip() for wo in ("a1", "b1")}
     r = team.land("land", "a1", "--with", "b1")
     assert r.returncode == 0, r.stdout + r.stderr
     assert len(team.queued()) == 1
@@ -379,6 +377,41 @@ def test_a_set_that_only_works_together_lands_as_one_entry(team):
     assert landed[0]["range"].split("..")[0] == base       # the first member merges onto the set's base
     assert landed[1]["range"].split("..")[0] == landed[0]["hash"]
     assert landed[1]["hash"] == team.tip()
+
+
+def test_land_one_with_unmatched_failure_lands_and_opens_finding(team):
+    (team.repo / "run-tests.sh").write_text(COUPLED)
+    commit_main(team, "coupled")
+    team.cut("A", "solo")
+    team.edit("solo", "A/value", "2")
+    result = team.land("land", "solo")
+    assert result.returncode == 0, result.stdout + result.stderr
+    team.review("solo")
+    result = team.land("land-one", "solo")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert team.queued() == []
+    assert team.integ("A/value") == "2"
+    items = json.loads((team.w / "team" / "land" / "findings" / "solo.json").read_text())
+    assert [(item["id"], item["zone"], item["kind"], item["state"], item["by"], item["wos"]) for item in items] == [
+        ("solo#1", "A", "test", "open", "queue-run", ["solo"]), ("solo#2", "B", "test", "open", "queue-run", ["solo"])]
+
+
+def test_land_one_with_matched_failure_is_sent_back(team):
+    (team.repo / "A" / "error.py").write_text("pass\n")
+    (team.repo / "run-tests.sh").write_text(
+        'echo "$1 $CODETEAM_TEST_GROUP" >> "$GATE_LOG"\n'
+        'if [ "$CODETEAM_TEST_GROUP" = integration ]; then python3 A/error.py; fi\n')
+    commit_main(team, "base-test")
+    team.cut("A", "broken")
+    team.edit("broken", "A/error.py", 'raise AssertionError("broken")')
+    result = team.land("land", "broken")
+    assert result.returncode == 0, result.stdout + result.stderr
+    team.review("broken")
+    result = team.land("land-one", "broken")
+    assert result.returncode == GATE, result.stdout + result.stderr
+    assert team.queued() == []
+    assert [row["wos"] for row in team.landed_log() if row.get("result") == "integration failed"] == [["broken"]]
+    assert "queued" not in team.wo("broken")
 
 
 def test_a_set_whose_second_member_conflicts_bounces_every_member(team):
@@ -472,10 +505,15 @@ def test_stage_2_runs_the_repo_integration_tests_under_the_integration_group(rep
     t.edit("i1", "A/value", "4")
     r = t.land("land", "i1")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "PASS integration tests (tests/integration)" in r.stdout, r.stdout
+    assert [line for line in t.gate_runs() if line.startswith("repo-integration")] == []
+    assert len(t.queued()) == 1
+    t.review("i1")
+    r = t.land("queue-run", "--once")
+    assert r.returncode == 0 and "Traceback" not in r.stderr, r.stdout + r.stderr
     assert [line for line in t.gate_runs() if line.startswith("repo-integration")] == \
         ["repo-integration integration"], t.gate_runs()
-    assert len(t.queued()) == 1
+    assert t.queued() == []
+    assert t.integ("A/value") == "4"
 
 
 def test_a_set_reaching_two_zones_compiles_both_in_one_tree(tmp_path):
@@ -535,7 +573,11 @@ def landed_with_recheck(team):
     rows = [json.loads(line) for line in (team.w / "team" / "land" / "recheck.jsonl").read_text().splitlines()]
     assert [(row["M"], row["wo"]) for row in rows] == [(M, "o2")] and "done" not in rows[0]
     itest = team.w / "team" / "land" / "itest"
-    sh(f"git worktree add -q --detach {itest} {base}", team.repo)     # an earlier recheck's tree, reused
+    # An earlier run's tree, reused: queue-run's integration step made it, else it is added here.
+    if itest.exists():
+        sh(f"git checkout -q --detach {base}", itest)
+    else:
+        sh(f"git worktree add -q --detach {itest} {base}", team.repo)
     return M, itest
 
 
@@ -623,13 +665,25 @@ def test_one_failing_script_fails_a_mixed_folder_and_the_rest_still_run(queued_p
     commit_main(t, "mixed")
     t.cut("A", "m1")
     t.edit("m1", "A/value", "6")
+    before = t.tip()
     r = t.land("land", "m1")
-    assert r.returncode == GATE, (r.returncode, r.stdout, r.stderr)
-    assert "FAIL integration tests (tests/integration)" in r.stdout, r.stdout
-    assert "a-fails: broken on purpose" in r.stdout, r.stdout
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert not {"pytest ran", "a-fails ran", "b-passes ran"}.intersection(t.gate_runs())
+    assert len(t.queued()) == 1
+    t.review("m1")
+    r = t.land("queue-run", "--once")
+    assert "Traceback" not in r.stderr, r.stdout + r.stderr
     ran = t.gate_runs()
-    assert {"pytest ran", "a-fails ran", "b-passes ran"} <= set(ran), ran   # b-passes sorts after the failure
+    assert {"pytest ran", "a-fails ran", "b-passes ran"} <= set(ran), ran
     assert t.queued() == []
+    assert t.tip() != before
+    assert t.integ("A/value") == "6"
+    assert not any(row.get("result") == "integration failed" for row in t.landed_log())
+    items = json.loads((t.w / "team" / "land" / "findings" / "m1.json").read_text())
+    # tests/integration is in no lane's paths, so the folder's step belongs to the orchestrator (step_owner)
+    assert [(item["kind"], item["state"], item["by"], item["wos"], item["zone"]) for item in items] == [
+        ("test", "open", "queue-run", ["m1"], "orc")]
+    assert items[0]["test"].startswith("integration tests"), items[0]
 
 
 def test_stage_2_runs_the_repo_unit_tests_under_the_unit_group(queued_plain_team):

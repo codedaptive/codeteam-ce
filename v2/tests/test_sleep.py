@@ -1,6 +1,7 @@
 """`sleep` on a working session ends nothing and queues nothing, and says so (the old reply,
 "it is ended once idle", read as a pending sleep that would end a coordinator, and its two background leads, between
-turns). The team and the runtime are fakes."""
+turns). `sleep` without --force sends /exit with the reason "sleep" (background work is spared) and --force with
+"asked", and each prints a line saying which. The team and the runtime are fakes."""
 import io
 import sys
 import unittest
@@ -30,7 +31,7 @@ class FakeTeam:
 
 class FakeRuntime:
     def __init__(self, status):
-        self.status, self.stopped = status, []
+        self.status, self.stopped, self.reasons = status, [], []
 
     def workspace(self):
         return "w"
@@ -38,8 +39,9 @@ class FakeRuntime:
     def observe(self, ws):
         return {"coord-extract": (self.status,)}
 
-    def stop(self, s, st):
+    def stop(self, s, st, reason="asked"):
         self.stopped.append(s.key)
+        self.reasons.append(reason)
         return True
 
 
@@ -64,6 +66,19 @@ class SleepTest(unittest.TestCase):
     def test_force_ends_a_working_session(self):
         team, rt, out = self.sleep("working", force=True)
         self.assertEqual(rt.stopped, ["coord-extract"])
+
+    def test_idle_sleep_uses_sleep_reason(self):
+        _, rt, _ = self.sleep("idle")
+        self.assertEqual(rt.reasons, ["sleep"])
+
+    def test_force_sleep_uses_asked_reason(self):
+        _, rt, _ = self.sleep("working", force=True)
+        self.assertEqual(rt.reasons, ["asked"])
+
+    def test_idle_sleep_explains_background_work_and_force(self):
+        _, _, out = self.sleep("idle")
+        self.assertIn("background work", out)
+        self.assertIn("--force", out)
 
 
 if __name__ == "__main__":

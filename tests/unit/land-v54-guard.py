@@ -320,11 +320,11 @@ def test_move_checkout_failure_remains_pending_and_notifies_once():
         row = {"M": T, "move": True, "wo": "v54-move", "overlapping": [], "zones": []}
         (team.dir / "recheck.jsonl").write_text(json.dumps(row) + "\n")
         with patch.object(cl, "itest_checkout", side_effect=cl.CheckoutFailed(T, "failed")):
-            cl.recheck_one(team, row)
+            cl.recheck_one(team, [row])
             current = cl.read_recheck(team)[0]
             assert "done" not in current, "checkout failure must leave the move pending"
             assert current.get("checkout_failed"), "checkout failure must record its notice"
-            cl.recheck_one(team, current)
+            cl.recheck_one(team, [current])
         assert team.notify.call_count == 1, "checkout NOTE must be sent once per move line"
         assert cl.stage6_target(team) is None, "pending move must hold Stage 6"
 
@@ -362,7 +362,7 @@ def test_move_findings_exception_leaves_line_pending():
                 patch.object(cl, "recheck_steps", return_value=([], [])), patch.object(cl, "team_env", return_value={}), \
                 patch.object(cl, "step_results", return_value=[]), patch.object(cl, "landed_rec", return_value={}), \
                 patch.object(cl, "apply_recheck_findings", side_effect=ValueError("failed")):
-            cl.recheck_one(team, row)
+            cl.recheck_one(team, [row])
         assert "done" not in cl.read_recheck(team)[0], "unrecorded findings must leave the move pending"
 
 

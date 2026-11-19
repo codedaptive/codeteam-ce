@@ -110,11 +110,10 @@ def test_c_d_stage2_uses_configured_unit_folder_and_batches_in_order(stage2):
     team, rec, repo_unit, repo_integration, run = stage2
     assert cl.check_integration(team, rec, False) == ["A", "B"]
     repo_unit.assert_called_once_with("tree", "custom/unit", "unit", "land", str(ROOT / "bin" / "zone-tool"))
-    repo_integration.assert_called_once_with("tree", "tests/integration", "land", str(ROOT / "bin" / "zone-tool"))
+    repo_integration.assert_not_called()
     assert run.call_args_list == [
         call("tree", [("compile", "check")], {"group": "integration"}, concurrent=False, on_result=ANY),
         call("tree", [("repo unit", "run unit")], {"group": "unit"}, concurrent=True, on_result=ANY),
-        call("tree", [("zone A", "run A"), ("zone B", "run B"), ("repo integration", "run integration")], {"group": "integration"}, concurrent=True, on_result=ANY),
     ]
 
 
@@ -145,7 +144,6 @@ def test_d_empty_unit_steps_skip_unit_batch(stage2):
     repo_unit.assert_called_once_with("tree", "custom/unit", "unit", "land", str(ROOT / "bin" / "zone-tool"))
     assert run.call_args_list == [
         call("tree", [("compile", "check")], {"group": "integration"}, concurrent=False, on_result=ANY),
-        call("tree", [("zone A", "run A"), ("zone B", "run B"), ("repo integration", "run integration")], {"group": "integration"}, concurrent=True, on_result=ANY),
     ]
 
 

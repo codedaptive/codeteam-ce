@@ -26,13 +26,12 @@
 # 20. An adopted job whose log has the already-recorded line, and whose record is older than record_mtime, is done:
 #     answered, PASS from the record, no history line.
 # 21. An adopted job whose log has the restamp line, and whose record is fresh, is done: answered, no history line.
-# 22. env kept in every state. An adopted running job keeps its env, as submitted, after the restarted
-#     runner's first decision.
+# 22. an adopted running job keeps its env, as submitted, after the restarted runner's first decision.
 # 23. An adopted job whose log has the already-recorded line only after other output (not zone-tool's own first
 #     line), with an older PASS record, is broken: process gone without a fresh record, not answered.
 # 24. An adopted job whose log has --single's wait line first and the already-recorded line second, with an older
 #     PASS record, is done: answered, PASS, no history line.
-# 25. an adopted job that then finishes keeps the env it was submitted with.
+# 25. An adopted job that then finishes has its env emptied.
 # Time Machine is never touched: a stub tmutil (first on PATH) stands in for it, as in buildq-sched.sh.
 set -u
 # Stage 2 (v5.2) sets GROUP and CODETEAM_TEST_GROUP: children must not inherit them or their record keys change.
@@ -319,8 +318,8 @@ def c22():
 
 def c25():
     j = job(S("r1-end"), "J1")
-    need(j["state"] == "done" and j.get("env", "absent") == SUBMITTED_ENV,
-         "state %r, env %r" % (j["state"], j.get("env", "absent")))
+    need(j["state"] == "done" and j.get("env", "absent") == {},
+         "adopted job must finish with empty env")
 
 
 CHECKS = [
@@ -343,7 +342,7 @@ CHECKS = [
     (22, "an adopted running job keeps its env, as submitted, after the first decision", c22),
     (23, "an answered line after other output is not zone-tool's: broken, not answered", c23),
     (24, "an answered line after --single's wait line is zone-tool's: done, answered", c24),
-    (25, "an adopted job that then finishes keeps the env it was submitted with", c25),
+    (25, "an adopted job that then finishes has empty env", c25),
 ]
 
 

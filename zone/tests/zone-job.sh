@@ -33,10 +33,11 @@
 #     file, no runner started.
 #  20 no runner (CODETEAM_BUILDQ=/nonexistent): stderr "build queue unavailable", the test runs here
 #     with its own exit, and any job file ends done with fallback true. env: the job file keeps the
-#     submitter's env once claimed (the test's own command reads it while it runs) and once done.
+#     submitter's env once claimed (the test's own command reads it while it runs); once done it is emptied.
 #  21 a stale heartbeat (a runner holds the lock and does not beat): the same as 20, the env check included.
 #  22 fallback compare-and-swap: a runner that already marked the job running runs it; the submitter
 #     does not run it again (exit 0, one run, fallback false).
+#     Integration group only (CODETEAM_TEST_GROUP=integration), skipped otherwise.
 #  23 zone-test --cached on unchanged code: answered from the record, not run again. This is zone-tool
 #     test's behaviour; the check guards that the shared record check did not change it.
 #  24 zone-test --scope: a change outside the scope restamps the record, and covered reads it as current.
@@ -278,6 +279,13 @@ runse() { local n=$1; shift; "$@" > "$c/$n.out" 2> "$c/$n.err"; rc=$?; }
 ck()    { local l=$1; shift; if "$@" 2>/dev/null; then echo "ok   $cn $l"; else echo "FAIL $cn $l"; fi >> "$res/$cn"; }
 eq()    { if [ "$2" = "$3" ]; then echo "ok   $cn $1"; else echo "FAIL $cn $1: got [$2], want [$3]"; fi >> "$res/$cn"; }
 jcheck() { "$PY" -I "$JCHECK" "$cn" "$@" >> "$res/$cn"; }  # the checks on stdin, one Python run for all of them
+# A case whose answer turns on how fast a real runner process gets going is an integration test (rule 11):
+# it runs when CODETEAM_TEST_GROUP is integration and is skipped, with one skip line, otherwise.
+integration_only() {
+  [ "${CODETEAM_TEST_GROUP:-unit}" = integration ] && return 0
+  echo "skip $cn $1: integration group only; run with CODETEAM_TEST_GROUP=integration" >> "$res/$cn"
+  return 1
+}
 jx()    { "$PY" -I -c 'import hashlib,json,os,sys; d=json.load(open(sys.argv[1])); a=sys.argv[3:]; sys.exit(0 if eval(sys.argv[2]) else 1)' "$@"; }
 count() { [ -e "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
 lastline() { tail -n 1 "$1"; }
@@ -287,14 +295,14 @@ jget()  { "$PY" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.a
 jdone() { "$PY" -I -c 'import json,sys,time; p=sys.argv[1]; d=json.load(open(p)); d.update(state="done", exit=0, result="PASS", finished=time.time(), answered=True); json.dump(d,open(p,"w"))' "$1"; }
 mtime() { "$PY" -I -c 'import os,sys; print(os.path.getmtime(sys.argv[1]))' "$1"; }
 pmode() { "$PY" -I -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$1"; }
-# env: a fallback job keeps the submitter's env in every state: once claimed (the test's command, run in-process
-# after the claim, copied the job file to $c/claimed.json) and once done. $1 is the job file; $P is the submitter's PATH.
+# A fallback job keeps env once claimed and empties it once done. The in-process command copies
+# the claimed job to $c/claimed.json. $1 is the job file; $P is the submitter's PATH.
 k1()    {
   jcheck "$c/claimed.json" "$P" <<'CHECKS'
 claimed (running, fallback): env kept :: d["state"] == "running" and d["fallback"] is True and d["env"].get("CODETEAM_SESSION") == "S1" and d["env"].get("PATH") == a[0]
 CHECKS
   jcheck "$1" "$P" <<'CHECKS'
-done: env kept :: d["state"] == "done" and d["env"].get("CODETEAM_SESSION") == "S1" and d["env"].get("PATH") == a[0]
+done: env emptied :: d["state"] == "done" and d["env"] == {}
 CHECKS
 }
 # wait_seconds as zone-tool reads it: the module loaded (not run) under env -i plus ZX, `--wait` text $1.
@@ -525,6 +533,9 @@ case_21() {
 }
 
 case_22() {
+  # The runner must claim the job before the submitter, waiting with a 1 s stale window, runs it itself; on a busy
+  # machine the submitter can win (2026-11-16 suite: "the runner is not alive; running the test here").
+  integration_only "the runner's claim racing the fallback" || return
   mkbq claim
   ZX="CODETEAM_BUILDQ_STALE=1"   # START_WAIT stays the base 10 s: a loaded machine can take seconds to let the runner start the job
   ck "the claiming runner is up" start_runner
@@ -616,13 +627,8 @@ case_29() {
 
 case_30() {
   # this case waits on a real runner process and a FIFO under a 120 s bound, so it is an
-  # integration test. zone-tool test-one drops every CODETEAM_* variable (cmd_test_one), so until the shared test
-  # command has a group parameter it runs only when called directly:
-  #   CODETEAM_TEST_GROUP=integration bash zone/tests/zone-job.sh
-  if [ "${CODETEAM_TEST_GROUP:-unit}" != integration ]; then
-    echo "skip $cn the hung-runner FIFO read: integration group only; run with CODETEAM_TEST_GROUP=integration" >> "$res/$cn"
-    return
-  fi
+  # integration test.
+  integration_only "the hung-runner FIFO read" || return
   mkbq fifo-hang
   ZX="CODETEAM_BUILDQ_START_WAIT=120 CODETEAM_BUILDQ_STALE=30"
   # Export the submitter helper so the foreground watchdog also bounds a blocked FIFO read.

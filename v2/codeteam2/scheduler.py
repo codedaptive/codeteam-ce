@@ -14,7 +14,8 @@ facts instead of guesses:
   has been idle longer than swap_idle_min with nothing waiting is sent /exit to make room, except a
   lane the user put on hold (team/held/<key>), one whose pane shows a subagent's view or whose input
   box holds unsent text, or one whose /exit was cancelled for its background work in the last BG_HOLD_S
-  (it keeps its slot; the next idle lane goes instead);
+  (it keeps its slot; the next idle lane goes instead). A lane that has waited STARVE_ALERT_MIN while a lane holding
+  a slot keeps its exit cancelled for background work is named to the orchestrator once per wait;
 - an agent blocked longer than blocked_alert_min is reported to the orchestrator (and the owner gets a
   herdr notification), once per episode;
 - nothing is typed into a session whose input box holds unsent text (someone is typing), or whose
@@ -31,6 +32,8 @@ facts instead of guesses:
   go with the next prompt that delivers real mail;
 - a session idle idle_exit_h with nothing waiting is ended, except the ones the user talks to, a
   session the user put on hold, and one whose pane shows a subagent's view or whose input box holds unsent text;
+  a lane ended so has its standing tree's build output dropped once it is seen gone (a detached zone-clean; the
+  CodeGraph index is kept), unless mail waits for it then; an exit cancelled for background work cleans nothing;
 - v1's patrol checks run every patrol_min; a turn that ends on an API error is reported once.
 `plan()` holds the scheduling rules as a pure function, so they are tested without herdr.
 """
@@ -44,7 +47,10 @@ import traceback
 
 from . import patrol as patrol_mod
 from . import screen as screen_mod
+from .clean_idle_lane import clean_idle_lane
+from .exited_idle_lanes import exited_idle_lanes
 from .herdr import Herdr, HerdrError
+from .starving_lane import starving_lane
 from .store import FLAG_NO_TURN_NOTED, RUNTIME, Store
 from .team import CODETEAM2, Session, Team
 from .transport import PromptTransport, Refused
@@ -353,7 +359,8 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
     working whose own turn has ended (a background lead keeps herdr's status at working): they take mail like a
     ready session, and nothing else (no idle exit, no swap). Returns actions:
     ("start", key), ("deliver", key, (mid, ...)), ("redeliver", key, (mid, ...)),
-    ("stop", key, "swap" | "idle"), ("confirm_exit", key), ("alert", key, minutes)."""
+    ("stop", key, "swap" | "idle"), ("confirm_exit", key), ("alert", key, minutes),
+    ("starve", key, minutes, holders)."""
     acts = []
     kinds = dict(sessions)
     g = lambda k, f, d=None: st.get(k, {}).get(f, d)
@@ -376,11 +383,12 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
     grace = lambda k: COMPACT_GRACE_S if g(k, "compacting") else TURN_GRACE_S
     st = {k: (v if k not in held else {**v, "wake_requested": None}) for k, v in st.items()}
     starting = {k for k in kinds if status.get(k) == "absent" and now - (g(k, "starting_at") or 0) < START_GRACE_S}
-    # Sent /exit recently and still there: leaving. Not counted against the cap, never stopped twice;
-    # if Claude asks whether to stop its background work, the answer is yes (confirm_exit).
+    # Sent /exit recently and still there: leaving. Not counted against the cap, never stopped twice.
     leaving = {k for k in kinds if status.get(k, "absent") != "absent" and now - (g(k, "stopping_at") or 0) < STOP_GRACE_S}
-    for k in leaving:
-        if status.get(k) == "blocked" and not g(k, "exit_confirmed"):
+    # Claude's question whether to stop its background work is answered on the tick that sees it, however long
+    # after the /exit; the answer depends on stop_reason (confirm_exit).
+    for k in kinds:
+        if status.get(k) == "blocked" and g(k, "stopping_at") and not g(k, "exit_confirmed"):
             acts.append(("confirm_exit", k))
 
     # Staff with mail and not running: start (no cap).
@@ -410,6 +418,8 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
             if victims:
                 acts.append(("stop", victims[0][1], "swap"))
                 stopped = True
+    # No swap could be made: name the wait once it is long and a lane keeps its slot for background work.
+    acts += starving_lane(waiting, acts, awake, st, now, swapping=stopped)
 
     # Over the cap (a lane started with launch --now, or the cap lowered): idle lanes go, oldest idle first.
     running = [k for k in awake if k not in starting]
@@ -421,8 +431,10 @@ def plan(sessions, status, pending, st, now, cap, swap_idle_min, blocked_alert_m
         for _, v in idle[:excess]:
             acts.append(("stop", v, "swap"))
 
-    # Idle a long time with nothing waiting: end it (v1's tick did this at 6 h). Its cache is cold by
-    # then, so this costs no tokens; it frees the process. Never the sessions the user talks to.
+    # Idle a long time with nothing waiting: end it. Its cache is cold by then, so this costs no tokens; it
+    # frees the process, and once the lane is seen gone tick drops its build output (a detached zone-clean in its
+    # standing tree, the CodeGraph index kept; not when mail waits for it then; an exit cancelled for background
+    # work cleans nothing). Never the sessions the user talks to.
     if idle_exit_min:
         stopping = {a[1] for a in acts if a[0] == "stop"}
         for k in kinds:
@@ -658,7 +670,10 @@ class Runtime:
                 s, resume_sid=st.get(s.key, {}).get("sid") if resume else None,
                 mail=self.message_text(s, mail) if mail else None)
             rec = {"sid": sid, "starting_at": starting_at, "awaiting_turn": False, "alerted": False,
-                   "wake_requested": None, "first_turn_seen": False, "last_mid": None, "last_mids": [],
+                   "starve_alerted": False, "wake_requested": None, "first_turn_seen": False, "last_mid": None,
+                   "last_mids": [],
+                   # A stop from before this start that no tick saw end must not answer a later exit dialog.
+                   "stopping_at": None, "stop_reason": None,
                    "startup_mids": [m["id"] for m in mail],
                    # Completed turns are counted per terminal; a larger count proves the first turn ran.
                    "start_completion": st.get(s.key, {}).get("completion_seq") or 0,
@@ -752,8 +767,8 @@ class Runtime:
         """/exit, unless someone is typing into it or its pane shows a subagent's view (where /exit would reach
         that agent, not the session): then False. plan passes over a lane recorded in a subagent's view or with a
         draft until the tick clears the record (its screen read, or the session no longer running).
-        reason: "asked" (sleep, down) stops background work too; "idle" and "swap" leave a session that has
-        background work running (see confirm_exit)."""
+        reason: "asked" (sleep --force, down, halt) stops background work too; "sleep", "idle" and "swap" leave a
+        session whose background work runs (see confirm_exit)."""
         if self.screen_hold(s, st, esc_ok=True):
             return False
         try:
@@ -767,7 +782,9 @@ class Runtime:
 
     def confirm_exit(self, s: Session, st):
         """Claude asks before /exit when background work runs (a lane's mail watcher): the first
-        choice is "Exit and stop tasks". Answer it only when that is the dialog on screen."""
+        choice is "Exit and stop tasks". Answer it only when that is the dialog on screen. A stop_reason of
+        "asked" answers it (the work stops with the session); "sleep", "idle" and "swap" cancel the exit and leave
+        the session alone for BG_HOLD_S."""
         st.setdefault(s.key, {})["exit_confirmed"] = True
         try:
             screen = self.herdr.agent_read(s.agent, lines=20)
@@ -776,11 +793,11 @@ class Runtime:
             return
         if "Background work is running" in screen and "Exit and stop tasks" in screen:
             rec = st.setdefault(s.key, {})
-            if rec.get("stop_reason") in ("idle", "swap"):
-                # Ended only for idleness: its background work (a run, a build, its own land) matters more.
+            if rec.get("stop_reason") in ("sleep", "idle", "swap"):
+                # Not a forced end: its background work (a run, a build, its own land) matters more.
                 # Cancel the exit and leave it for BG_HOLD_S.
                 self.herdr.agent_send_keys(s.agent, "esc")
-                rec.update({"stopping_at": None, "bg_until": ts() + BG_HOLD_S})
+                rec.update({"stopping_at": None, "bg_until": ts() + BG_HOLD_S, "clean_on_exit": None})
                 self.log(f"exit {s.display} cancelled: background work is running; left alone for "
                          f"{BG_HOLD_S // 60} min")
                 return
@@ -808,26 +825,39 @@ class Runtime:
         """True when the transcript's last relevant record says the session's own turn has ended.
         Records with no _record_state verdict are skipped, including compaction summaries. A background agent
         can keep herdr at working after the session's turn has ended, so transcript state can permit delivery.
-        When awaiting_turn, the last [codeteam] prompt, last enqueue or last typed prompt (last_typed: a runtime
-        command such as /compact or the resume line) with a nonzero epoch at least delivered_at minus two seconds
-        clears the flag; this tolerance allows for delivery timing differences.
+        When awaiting_turn, prompt_ran clears the flag if the transcript shows a prompt was taken in since the
+        delivery (the delivered one, or another typed into the pane).
         The return value depends only on transcript state. plan applies the awaiting_turn hold to deliveries.
         """
         p = self.transcript(rec)
         if not p:
             return False
-        state, last_prompt = transcript_state(p)
-        if rec.get("awaiting_turn") and last_prompt and last_prompt >= (rec.get("delivered_at") or 0) - 2:
+        state, _ = transcript_state(p)
+        self.prompt_ran(rec, p)
+        return state == "ended"
+
+    def prompt_ran(self, rec, p=None):
+        """Clear awaiting_turn when the transcript shows a prompt was taken in since the delivery: the last
+        [codeteam] prompt, last enqueue or last typed prompt (last_typed: a runtime command such as /compact, /mcp
+        or the resume line, or anything else typed into the pane) with a nonzero epoch at least delivered_at minus
+        two seconds. tick reads it for a session herdr shows ready too: a slash command starts no turn, so herdr's
+        status and state_change_seq stay as they were and the transcript is the only sign it ran (once
+        /mcp reconnect was typed three times into each idle session and held its mail)."""
+        p = p or self.transcript(rec)
+        if not p or not rec.get("awaiting_turn"):
+            return
+        since = (rec.get("delivered_at") or 0) - 2
+        last_prompt = transcript_state(p)[1]
+        if last_prompt and last_prompt >= since:
             rec["awaiting_turn"] = False         # a recent [codeteam] prompt appears in the transcript
         if rec.get("awaiting_turn"):
             enq = last_enqueue(p)
-            if enq and enq >= (rec.get("delivered_at") or 0) - 2:
+            if enq and enq >= since:
                 rec["awaiting_turn"] = False     # a recent enqueue indicates a prompt joined Claude Code's queue
         if rec.get("awaiting_turn"):
             typed = last_typed(p)
-            if typed and typed >= (rec.get("delivered_at") or 0) - 2:
+            if typed and typed >= since:
                 rec["awaiting_turn"] = False     # a runtime command ran: /compact once its compaction has ended
-        return state == "ended"
 
     def refresh_idle(self, status, pending, st, now, held, sessions):
         """An idle session with a big context is refreshed while its 1-hour cache is still warm (2026-11-09):
@@ -952,6 +982,18 @@ class Runtime:
         self.herdr.notify(f"codeteam {self.team.product}: {s.display} takes no turn",
                           f"{s.display}: {what} Held: {', '.join(named)}.")
 
+    def starve(self, s: Session, mins, holders, st):
+        """Tell the orchestrator, once per wait, that s waits behind lanes whose exits are cancelled for background
+        work."""
+        st.setdefault(s.key, {})["starve_alerted"] = True
+        names = ", ".join(self.team.session(k).display for k in holders)
+        text = (f"{s.display} has waited {mins} min for one of the {self.team.cap} lane slots. The swap could not free "
+                f"one: each /exit of {names} was cancelled for background work still running in its session. If that "
+                f"work is stale (a stuck command, a finished lead's shell), have the lane stop it; {s.display} then "
+                f"takes the next slot the swap frees.")
+        self.store.add("general", "codeteam", "NOTE", self.team.t.orc_name(), "orc", text)
+        self.log(f"starve: {text}")
+
     def alert(self, s: Session, mins, st):
         st.setdefault(s.key, {})["alerted"] = True
         text = f"{s.display} has been blocked for {mins} min (a question or permission dialog in its pane)."
@@ -1058,8 +1100,8 @@ class Runtime:
             # prompt in its transcript later than the recorded one, or a turn ending in its transcript after the
             # episode began (both read only for an open episode; a background lead keeps herdr at working, so its
             # count of completed turns does not move). If that
-            # prompt ends the episode, held mail its headers name is delivered; the rest goes back in the queue
-            #. Every other ending releases all held mail, and delivery resumes.
+            # prompt ends the episode, held mail its headers name is delivered; the rest goes back in the queue.
+            # Every other ending releases all held mail, and delivery resumes.
             # A session counts as seen only once settlement and release have returned: a release that raises
             # (sqlite "database is locked"; run() logs the tick error and carries on) is retried on the next tick,
             # so held mail for a lane whose status never changes is not stranded, and the episode is cleared
@@ -1094,6 +1136,8 @@ class Runtime:
                     rec.pop("no_turn", None)
                     self.log(f"{k}: no-turn episode over: {why}")
             self.seen.add(k)
+            if s == "working" or turned:
+                rec["worked_at"] = now          # the team's last work, for patrol's TEAM IDLE WITH WORK
             if was != s:
                 rec.update({"status": s, "state_since": now})
                 if s in ("working", "blocked"):
@@ -1113,8 +1157,7 @@ class Runtime:
             if s == "absent":
                 # A session not running holds nothing: its view and draft records clear on every tick it is
                 # absent, not only on the change, so a state file saved already absent (an earlier loop) is
-                # cleared too. show_in_herdr runs later in this tick, so the sidebar's hold token goes too
-                #.
+                # cleared too. show_in_herdr runs later in this tick, so the sidebar's hold token goes too.
                 rec.update({"view": None, "view_since": None, "view_alerted": False,
                             "draft_since": None, "draft_alerted": False})
             if rec.get("close_pane_at") and now >= rec["close_pane_at"] and not self._waits():
@@ -1139,6 +1182,13 @@ class Runtime:
             t = dt.datetime.fromisoformat(m["ts"]).timestamp()
             pending.setdefault(m["target"], []).append((m["id"], t, m["kind"], m["ride"]))
         sessions = {s.key: s for s in self.team.sessions()}
+        # A lane an idle stop marked is cleaned once it is seen gone; an exit confirm_exit cancelled cleared the
+        # mark, so a lane still working in its tree is never cleaned. One with any mail waiting, held too,
+        # has its mark cleared and is not cleaned: the mail starts it again, and its first build needs that output.
+        for k, clean in exited_idle_lanes(status, st, set(waiting_n)):
+            st[k]["clean_on_exit"] = None
+            if clean and k in sessions:
+                clean_idle_lane(self.team, sessions[k], self.log)
         held = {k for k in sessions if getattr(self.team, "held", lambda _k: False)(k)}
         # plan skips a session recorded in a subagent's view or with a draft when it picks one to stop, and
         # without queued mail it gets no delivery, so nothing else reads its screen: read it here, before plan,
@@ -1159,6 +1209,13 @@ class Runtime:
                 if status.get(k) == "working" and k not in held and (pending.get(k) or rec.get("awaiting_turn")):
                     if self.between_turns(k, rec, now):
                         between.add(k)
+        # A ready session still awaiting its turn may have run a slash command, which starts none: its transcript
+        # says so before plan puts the prompt back. Not gated by deliver_between_turns, which is
+        # about prompting working sessions; this only confirms a delivery already made.
+        for k in sessions:
+            rec = st.get(k, {})
+            if status.get(k) in READY and rec.get("awaiting_turn"):
+                self.prompt_ran(rec)
         acts = plan([(k, s.kind) for k, s in sessions.items()], status, pending, st, now,
                     self.team.cap, self.team.swap_idle_min, self.team.blocked_alert_min,
                     gather_s=getattr(self.team, "gather_s", GATHER_S), warm_s=getattr(self.team, "warm_s", WARM_S),
@@ -1171,7 +1228,7 @@ class Runtime:
             acts = [a for a in acts if a[0] in ("confirm_exit", "alert")]
         waited = 0
         for a in acts:
-            if a[0] != "alert" and self._waits():
+            if a[0] not in ("alert", "starve") and self._waits():
                 waited += 1
                 continue
             s = sessions[a[1]]
@@ -1181,9 +1238,13 @@ class Runtime:
                 elif a[0] == "deliver":
                     self.deliver(s, a[2], st)
                 elif a[0] == "stop":
-                    self.stop(s, st, a[2] if len(a) > 2 else "asked")
+                    reason = a[2] if len(a) > 2 else "asked"
+                    if self.stop(s, st, reason) and reason == "idle" and s.kind == "lane":
+                        st[s.key]["clean_on_exit"] = True    # cleaned on the tick that sees it gone
                 elif a[0] == "alert":
                     self.alert(s, a[2], st)
+                elif a[0] == "starve":
+                    self.starve(s, a[2], a[3], st)
                 elif a[0] == "confirm_exit":
                     self.confirm_exit(s, st)
                 elif a[0] == "redeliver":
@@ -1264,36 +1325,46 @@ class Runtime:
     # set), whatever the push answered. $0 is a label; the refspecs are the arguments; CT_REPO, CT_V1 and CT_MANIFEST
     # come in the environment. A branch gone since the list was made (a landing deleted it) is dropped first: one
     # missing source refspec fails the whole push (2026-11-14: one team's docs-stamp branch, and none of 98 went).
+    # When the push of two or more branches fails, each is pushed on its own, so a branch the repo's pre-push hook
+    # refuses holds back only itself (2026-11-16 09:05-13:05: a hook refused one branch, and five hourly
+    # pushes of about 99 went nowhere). Each refused one is named in backup.log.
     PUSH_THEN_SWEEP = ('n=$#; while [ "$n" -gt 0 ]; do r=$1; shift; n=$((n - 1)); '
                        'if git -C "$CT_REPO" rev-parse -q --verify "${r%%:*}" >/dev/null; then set -- "$@" "$r"; fi; '
                        'done; '
-                       'if [ "$#" -gt 0 ]; then git -C "$CT_REPO" push --force origin "$@"; fi; '
+                       'if [ "$#" -gt 0 ] && ! git -C "$CT_REPO" push --force origin "$@" && [ "$#" -gt 1 ]; then '
+                       'echo "backup: the push of $# branches failed; pushing each on its own"; '
+                       'for r in "$@"; do git -C "$CT_REPO" push --force origin "$r" '
+                       '|| echo "backup: not pushed: ${r%%:*}"; done; fi; '
                        'if [ -n "$CT_MANIFEST" ]; then exec "$CT_V1" sweep-branches "$CT_MANIFEST"; fi')
 
     def backup(self, st, now):
         """Every backup_min (60), push the team's branches to GitHub in one background push, so each
         coordinator's commits are off the machine within the hour even when no codeteam command moved them
-        (2026-10-27: 12 of one team's lane branches were 2 to 167 commits ahead of GitHub). v1's rules apply:
-        nothing when backup is off or there is no origin, force (the machine is the source of truth).
+        (2026-10-27: 12 of one team's lane branches were 2 to 167 commits ahead of GitHub). v1's rules apply to the push:
+        none when backup is off, backup_min is 0 or there is no origin; force (the machine is the source of truth).
         After the push, the same job runs v1's `sweep-branches`, which deletes landed branches here and on GitHub.
-        The loop can reach GitHub and cron cannot, so for a v2 team cron's `sweep` leaves branches to this job.
-        Only for a manifest in this checkout's teams/, the teams cron's sweep covered: a team whose manifest
-        is elsewhere runs its own repo's tools, and this checkout's sweep never deletes its branches."""
+        The loop can reach GitHub and cron cannot, so for a v2 team cron's `sweep` leaves branches to this job,
+        and the job sweeps whether or not it pushes, hourly when the push is off: a team with backup = false
+        would otherwise have had no sweep, since cron's skipped it and this job returned before its sweep. Only for
+        a manifest in this checkout's teams/, the teams cron's sweep covered: a team whose manifest is elsewhere runs its
+        own repo's tools, and this checkout's sweep never deletes its branches."""
         every = getattr(self.team, "backup_min", 0)
         t = getattr(self.team, "t", None)
-        if not every or not t or not getattr(t, "backup", False):
-            return
-        meta = st.setdefault("_backup", {})
-        if now - (meta.get("at") or 0) < every * 60:
-            return
-        meta["at"] = now
         try:
             from pathlib import Path
             from .team import v1, CT_HOME
-            if v1.git(str(t.repo), "remote", "get-url", "origin", check=False).returncode:
+            manifest = getattr(self.team, "manifest", None)
+            sweep = bool(t and manifest) and Path(manifest).parent == CT_HOME / "teams"
+            push = bool(t and every and getattr(t, "backup", False))
+            if not sweep and not push:
                 return
-            branches = self.backup_branches()
-            sweep = Path(self.team.manifest).parent == CT_HOME / "teams"
+            meta = st.setdefault("_backup", {})
+            if now - (meta.get("at") or 0) < (every or 60) * 60:
+                return
+            meta["at"] = now
+            if push and v1.git(str(t.repo), "remote", "get-url", "origin", check=False).returncode:
+                push = False
+            branches = self.backup_branches() if push else []
             if not branches and not sweep:
                 return
             import subprocess
@@ -1313,8 +1384,9 @@ class Runtime:
 
     def patrol(self, status, st, now):
         """v1's patrol checks (idle or asleep lanes with queued requests, dead leads, serial leads,
-        branches outside the rule), every patrol_min. New findings ride along with the orchestrator's
-        next prompt and show on the board at once; they never wake it."""
+        branches outside the rule) and v5's (stalled work orders, waiting reviews, a team idle with open work), every
+        patrol_min. New findings of stopped work wake the orchestrator; the rest ride along with its next prompt.
+        A dead lead and a team idle with open work tell the owner as well."""
         every = getattr(self.team, "patrol_min", 0)
         if not every:
             return
@@ -1347,6 +1419,10 @@ class Runtime:
         dead = [x for x in new if "DEAD LEAD" in x]
         if dead:
             self.herdr.notify(f"codeteam {self.team.product}: a request lead died", "; ".join(dead)[:300])
+        # The orchestrator may be the stuck session, so the owner hears of a whole team stopped too.
+        idle = [x for x in new if x.startswith("TEAM IDLE WITH WORK")]
+        if idle:
+            self.herdr.notify(f"codeteam {self.team.product}: the team is idle with open work", idle[0][:300])
 
     def disk_watch(self, st, now):
         """Every disk_check_s (60 s), whatever patrol_min says: a disk can fill in minutes. A low disk wakes the

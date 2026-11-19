@@ -1,5 +1,5 @@
-// The focus box's lower lines (render._cache, _tools, _turns, _mail, _detail): cache, tool trace, per-turn output,
-// mail, and the expanded detail. Returns the rows' markup.
+// The focus box's lower lines (render._cache, _tools, _turns, _mail): cache, tool trace, per-turn output and mail.
+// Returns the four rows' markup, one string per row.
 import { fmt } from "./fmt.js";
 import { h } from "./h.js";
 import { spark } from "./spark.js";
@@ -48,16 +48,6 @@ function mail(s) {
   return h.span("mail", "dim") + " " + parts.join(h.dot());
 }
 
-function detail(s) {
-  const recent = s.recent || {};
-  const rows = fmt.dicts(recent.tools).slice(0, 5).map((t) => h.cut(`tool ${t.name || "?"} ${t.summary || ""}`, "dim"));
-  for (const m of fmt.dicts(recent.messages).slice(0, 5)) {
-    rows.push(h.cut(`msg ${m.dir === "in" ? "←" : "→"} ${fmt.clock(m.ts)} ${m.peer || "?"} ${m.kind || "?"} ${m.text || ""}`, "dim"));
-  }
-  return (rows.length ? rows : [h.span("nothing recent", "dim")]).map((r) => h.row(r, "detail")).join("");
-}
-
-export function focusLines(s, expanded) {
-  const lines = [cache(s), tools(s), turns(s)].map((r) => h.row(r)).join("") + h.row(mail(s), "wrap");
-  return lines + (expanded ? detail(s) : "");
+export function focusLines(s) {
+  return [cache(s), tools(s), turns(s)].map((r) => h.row(r)).concat(h.row(mail(s), "wrap"));
 }

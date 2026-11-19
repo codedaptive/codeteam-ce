@@ -7,6 +7,9 @@ supplies `test-one`, which finds the Python and shell tests described below; `DI
 In a repo with its own Makefile, that Makefile's `test-one` decides.
 With zone.mk's `test-one`, run a group with `CODETEAM_TEST_GROUP=integration make zone-test-one DIR=<path>`; the group
 reaches the tests through the build queue and `test-one`. Non-unit groups have separate records; unset and `unit` share one.
+With `CODETEAM_KINDS_BY_NAME=1` (separate records), `test-one` runs only the tests named the group: under a folder
+named `unit`, `integration` or `validation`. An unnamed test runs only in the unit run, unless its own markers keep
+it out of a unit run (pytest) or it reads `$CODETEAM_TEST_GROUP` or `$GROUP` (shell).
 The record key includes `SWIFT_TEST_ARGS`, `CARGO_TEST_ARGS`, `PYTEST_ARGS` and `PYTEST_ADDOPTS`; see
 `INTERFACE.md` for collision limits and which arguments reach the tests.
 
@@ -25,27 +28,36 @@ live `run/queue`. `zone/tests/test_hang_rule.py` checks the hang window, output,
 short-lived workers, settings, CPU-time parsing, tree exclusions and the wait loop with fake processes, clocks and
 CPU readers; it makes no real waits. `zone/tests/test_commit_record.py` checks clean-commit unit proof, dirty tracked
 and untracked files, failed results, per-key newest results, group filtering and cached answers at a new commit;
-these unit cases use scratch git repos and stub test commands, with no real waits.
+these unit cases use scratch git repos and stub test commands, with no real waits (v52-zone Ruling 1).
 `zone/tests/test_buildq_hang.py` checks the run-job backstop's doubled window, busy CPU, log growth, unknown samples,
 fresh watches after restart, slot jobs never being killed and spawn not adding a time limit, using fake CPU samples
 and signals with no real clock waits.
 `zone/tests/test_launchd.py` checks the bootout wait's counts and sleeps, the one bootstrap retry, the combined
 reinstall's order and reasons, the exact launchctl arguments with and without a timeout, and that import starts no
 process, through a fake launchctl and sleep; it runs no launchctl and no real sleep.
+`zone/tests/test_buildq_team_slot.py` is a pytest unit test of the runner's team guarantee (who starts, over the budget
+and ceilings, the holds it obeys, `guarantee: "team"` in the first running write) and the heartbeat's `teams`, with job
+dicts and a stubbed spawn; `zone/tests/test_zone_tool_job_line.py` checks `job status`'s ` guarantee=` suffix. The share
+modules it uses have their own unit tests in `tests/unit/` (`test_codeteam_job_team.py`, `test_codeteam_team_slot.py`,
+`test_codeteam_team_counts.py`, `test_codeteam_startable.py`, `test_codeteam_class_pick.py`,
+`test_codeteam_pool_admits.py`).
+A settled job's empty `env` (D560): `tests/unit/test_codeteam_settled_env.py` (`settled_env`), `tests/unit/test_codeteam_clean_settled_env.py`
+(`clean_settled_env` on a scratch folder), `zone/tests/test_buildq_settled_env.py` (`Runner.settle` and the runner's startup clean) and
+`zone/tests/test_zone_tool_settled_env.py` (`update_job` settles) are pytest unit tests.
 `zone/tests/test_buildq_launch.py` is a pytest unit test of both clients' exact kickstart command,
 the live-queue, other-queue and override branches, and the not-loaded and other-failure messages. Tests that start scratch
 runners set `CODETEAM_BUILDQ_LAUNCH` to `zone/tests/fake-launchctl`, which receives the kickstart arguments and starts
 `$CODETEAM_BUILDQ` in the background (default `<repo>/bin/codeteam-buildq`), or exits 113 with `Could not find service`
 when it is not executable. Nothing on the queue path (the runner, `zone-tool job`, `codeteam-slot`) calls `tmutil`: every test that runs the runner, `zone-tool` or `codeteam-slot` puts a stub `tmutil` first on the
 PATH it gives them, as a guard, so no test can reach the real one.
-`buildq-sched.sh` (order, budget, cost, load, swap, warm lock, the `hold` field, modes, a malformed config or job file,
-`env` kept in every state, a too-big number in queue.toml, a child that leaves no fresh record or answers from a record,
+`buildq-sched.sh` (order, budget, the team guarantee and the heartbeat's `teams`, cost, load, swap, warm lock, the `hold` field, modes, a malformed config or job file,
+`env` kept while queued or running and `{}` once settled (D560), a too-big number in queue.toml, a child that leaves no fresh record or answers from a record,
 fifty finished files), `buildq-restart.sh` (20 checks across nine scenarios: a dead runner, adopted and broken jobs,
-slot liveness, pruning, adopted jobs answered from a record and `env` kept in every state), `buildq-plist.sh` (the launchd
+slot liveness, pruning, adopted jobs answered from a record and `env` kept while queued or running and `{}` once settled), `buildq-plist.sh` (the launchd
 file), `buildq-e2e.sh` (the real runner with `zone-tool job` and `codeteam-slot`), `zone-job.sh` and `zone-job-mk.sh`
 (the verbs and the make targets), `slot-queue.sh` and `slot-record.sh` (`codeteam-slot`), `warm-lock-record.sh` (the warm lock record).
 
-Integration group. The following cases run only with `CODETEAM_TEST_GROUP=integration`, because they wait on a runner, process, clock or detached warm, or depend on a case that does: `buildq-e2e.sh` cases 1-6, `slot-record.sh` cases 1-4, `zone-test-enospc.sh` case 5 (HUNG wins over an out-of-space signature with a silent sleeping child), `slot-queue.sh` cases 1-6, 8-10, 12 and 14-18, `warm-lock-record.sh` checks 1-3, `zone-job.sh` case 30, and all of `zone-test-one.sh`. The unit run prints a `skip` line for each listed case or check, except `zone-test-one.sh`, which prints one for the whole file. Run one file with `CODETEAM_TEST_GROUP=integration make zone-test-one DIR=zone/tests/<file>`.
+Integration group. The following cases run only with `CODETEAM_TEST_GROUP=integration` (D281), because they wait on a runner, process, clock or detached warm, or depend on a case that does: `buildq-e2e.sh` cases 1-6, `slot-record.sh` cases 1-4, `zone-test-enospc.sh` case 5 (HUNG wins over an out-of-space signature with a silent sleeping child), `slot-queue.sh` cases 1-6, 8-10, 12 and 14-18, `warm-lock-record.sh` checks 1-3, `zone-job.sh` case 30, and all of `zone-test-one.sh`. The unit run prints a `skip` line for each listed case or check, except `zone-test-one.sh`, which prints one for the whole file. Run one file with `CODETEAM_TEST_GROUP=integration make zone-test-one DIR=zone/tests/<file>`.
 
 For race reproduction, `BUILDQ_RESTART_PS_DELAY` delays runner `ps` calls in `buildq-restart.sh`; `ZONE_JOB_RUNNER_DELAY` delays fake runner startup in `zone-job.sh`; `WARM_LOCK_HOOK_DELAY` delays the seed-index call after warm launch in `warm-lock-record.sh` (all in seconds). The warm-lock test clears inherited `CODETEAM_*` and other session settings, isolates HOME and Git config, and checks for its per-run names in the live repo.
 
@@ -77,7 +89,9 @@ For race reproduction, `BUILDQ_RESTART_PS_DELAY` delays runner `ps` calls in `bu
 
 - Framework: the `*.sh` files in a `tests/` folder, each a bash script that passes or fails by its exit status (by
   convention it prints `ok`/`PASS` and `FAIL` lines). A file named `run.sh` is never run by zone.mk's `test-one`: it
-  is a manual runner.
+  is a manual runner. With `CODETEAM_KINDS_BY_NAME=1`, a script outside a repo test folder runs only in its folder's
+  kind; one under no `unit`, `integration` or `validation` folder runs only in the unit run unless it reads
+  `$CODETEAM_TEST_GROUP` or `$GROUP`.
 - Location and naming:
 - Fixtures and helpers:
 - Run: `make zone-test-one DIR=<folder>`

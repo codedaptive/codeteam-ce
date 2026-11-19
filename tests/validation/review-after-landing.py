@@ -131,7 +131,7 @@ kn = [line for line in n.splitlines() if "REQUEST Kong Stage 3 review" in line]
 t("Kong gets one Stage 3 request for w1's own changes",
   len(kn) == 1 and "w1" in kn[0] and "--not refs/heads/landing refs/heads/integration" in kn[0] and " show " not in kn[0], kn)
 t("Nagatha's request names the layer check", "layers" in n.split("REQUEST Nagatha", 1)[-1].split("\n")[0])
-t("security review is not requested without security_paths", "REQUEST Perkins Stage 3" not in n)
+t("Perkins gets no Stage 3 request", "REQUEST Perkins Stage 3" not in n)
 
 print("== a tagged feature is reviewed when its last work order lands")
 wo("f1", "A/f1.py", tag=("--feature", "feat-x"))

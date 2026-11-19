@@ -1,18 +1,23 @@
 #!/usr/bin/env -S python3 -u
-"""Unit contracts for the v5.2 landing decisions."""
+"""Unit contracts for the v5.2 landing decisions. A unit test script (rule 11): each check is a pure function with its
+collaborators faked or a fixture file in a temp folder, Team reads manifests there, and codeteam-land's import-time
+launchctl call is faked."""
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 HOME = Path(__file__).resolve().parents[2]
 loader = importlib.machinery.SourceFileLoader("cl", str(HOME / "bin" / "codeteam-land"))
 spec = importlib.util.spec_from_loader("cl", loader)
 cl = importlib.util.module_from_spec(spec)
-loader.exec_module(cl)
+with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=0)):
+    loader.exec_module(cl)
 
 W = Path(tempfile.mkdtemp(prefix="land-v52-stages-"))
 (W / "repo").mkdir()
@@ -90,9 +95,6 @@ case("overlap dot covers all non-doc files", lambda: cl.overlapping(zones, [("do
      ("code", ["else/a.py"])], ["all"], [".md"]), ["code"])
 case("recheck row", lambda: cl.recheck_row("merge123", "wo-2", ("wo-1", "wo-0"), ["z", "a"], "now"),
      {"time": "now", "M": "merge123", "wo": "wo-2", "overlapping": ["wo-1", "wo-0"], "zones": ["a", "z"]})
-case("warm source absent", lambda: cl.warm_source(W / "cold"), None)
-(W / "warm" / "land" / "itest").mkdir(parents=True)
-case("warm source present", lambda: cl.warm_source(W / "warm"), W / "warm" / "land" / "itest")
 
 print(f"{failed} failed" if failed else "all passed")
 sys.exit(1 if failed else 0)

@@ -1,12 +1,12 @@
 #!/bin/bash
-# slow: 23 scenarios run side by side, each with several Python and stub-process starts, short jobs, event-held jobs and a one-second idle exit; allow about 8 s wall for process startup and idle waits
+# slow: 24 scenarios run side by side, each with several Python and stub-process starts, short jobs, event-held jobs and a one-second idle exit; allow about 8 s wall for process startup and idle waits
 # zone/tests/buildq-sched.sh: bin/codeteam-buildq decides which job starts, and in what order
 # (zone/docs/SPEC.md). Each scenario is a folder under a
 # scratch dir with its own queue, load file, worktree and records. The stub marks its start, waits for a duration
 # or a release file, then writes its record and exits. Parallel scenarios snapshot their queues and record failed
 # steps and exit status; the checker names failures, and the EXIT trap prints a summary on stderr when it runs.
-# Nothing here reads the live codeteam checkout: every runner runs under env -i with CODETEAM_QUEUE_DIR set to its scratch queue.
-#  1. A finished run job's file has every job-file field, env included, and its env is the one it was submitted with.
+# Nothing here reads ~/codeteam-work/codeteam: every runner runs under env -i with CODETEAM_QUEUE_DIR set to its scratch queue.
+#  1. A finished run job's file has every job-file field, with its env emptied.
 #  2. A finished run job reads done, exit 0 and result PASS from its record; no record existed at its start.
 #  3. The job's command runs once: one marker line.
 #  4. No temporary job file is left, and every job file parses.
@@ -28,8 +28,9 @@
 # 20. queue.toml's budget beats CODETEAM_BUILD_BUDGET.
 # 21. CODETEAM_BUILD_BUDGET sets the budget when queue.toml has none.
 # 22. The budget is 6 when neither is set.
-# 23. Round-robin: after a team-a start, the next place is team-b's (positions 1, 2, 3).
-# 24. Round-robin: the starts run a1, b1, a2, a3.
+# 23. Round-robin among teams that already run (A1 and B1 held, budget 2, no room): the queued dev jobs' places
+#     are A2 1, B2 2, A3 3 (team-a's last start is older, then team-b's turn), not submission order.
+# 24. Round-robin: at budget 4 the two free units go to A2 and B2; A3 waits for room.
 # 25. Cost is the median of the last 5 cpu/wall ratios: 3.0, not the 4.0 of all seven lines.
 # 26. A cost below 1 clamps up to 1.
 # 27. A cost above the budget clamps down to the budget.
@@ -57,9 +58,9 @@
 # 49. Once the warm-held and swap-held jobs start, hold is null.
 # 50. With `classes = 3`, `budget = "x"` and `load_max = [1]`, jobs start on the default budget of 6;
 #     a job file missing its keys is skipped and left as it was.
-# 51. env kept in every state. A running run job keeps env, the submitter's environment as submitted.
+# 51. a running run job keeps env, the submitter's environment as submitted.
 # 52. a running slot job keeps its env, the {} that codeteam-slot wrote.
-# 53. a run job whose tool cannot start is broken, with a reason and its env kept.
+# 53. A run job whose tool cannot start is broken, with a reason and its env emptied.
 # 54. A running run job with no env is skipped by the runner and left byte-for-byte as it was written.
 # 55. A done run job with no env is skipped and left byte-for-byte: the runner does not prune it.
 # 56. A broken run job with no env is skipped and left byte-for-byte: the runner does not prune it.
@@ -72,6 +73,9 @@
 # 62. A child whose log has the restamp line, and whose record is fresh, is done: answered, PASS, no history line.
 # 63. The runner makes no tmutil call, including the one that creates the queue folder (the stub's log stays empty).
 # 64. Fifty finished job files and two queued dev jobs: one --once starts both queued jobs.
+# 65. Budget 2 filled by team-a's two held dev jobs: team-b's one dev job starts while they still run, over the
+#     budget, and its job file has guarantee "team" (the team guarantee).
+# 66. In the same scenario the heartbeat's teams reads a: 2 running, b: 1 running, none waiting.
 # The stub tmutil (below) records its argv in $tmp/tmutil.log; check 63 reads that log. No check reaches the real Time Machine.
 set -u
 # Stage 2 (v5.2) sets GROUP and CODETEAM_TEST_GROUP: children must not inherit them or their record keys change.
@@ -276,7 +280,7 @@ def c01():
     j = job(S("basic"), "T1")
     missing = [k for k in S16 if k not in j]
     need(not missing, "missing " + ", ".join(missing))
-    need(j["env"] == SUBMITTED_ENV, "env %r" % j["env"])
+    need(j["env"] == {}, "settled env was not empty")
 
 
 def c02():
@@ -407,14 +411,15 @@ def c22():
 
 def c23():
     s = S("rr-1")
-    got = (job(s, "B1")["position"], job(s, "A2")["position"], job(s, "A3")["position"])
-    need(got == (1, 2, 3), "positions B1, A2, A3 are %r" % (got,))
+    need(running(s) == ["A1", "B1"], "running %r" % running(s))
+    got = (job(s, "A2")["position"], job(s, "B2")["position"], job(s, "A3")["position"])
+    need(got == (1, 2, 3), "positions A2, B2, A3 are %r" % (got,))
 
 
 def c24():
     s = S("rr-final")
-    order = sorted(s["jobs"], key=lambda t: job(s, t)["started"])
-    need(order == ["A1", "B1", "A2", "A3"], "start order %r" % order)
+    need(running(s) == ["A1", "A2", "B1", "B2"] and job(s, "A3")["state"] == "queued",
+         "running %r, A3 %r" % (running(s), job(s, "A3")["state"]))
 
 
 def c25():
@@ -581,9 +586,9 @@ def c52():
 
 def c53():
     j = job(S("env"), "B")
-    need(j["state"] == "broken" and j.get("env", "absent") == SUBMITTED_ENV
+    need(j["state"] == "broken" and j.get("env", "absent") == {}
          and isinstance(j.get("reason"), str) and j["reason"],
-         "state %r, env %r, reason %r" % (j["state"], j.get("env", "absent"), j.get("reason")))
+         "broken job must have a reason and empty env")
 
 
 def untouched(t):
@@ -663,8 +668,21 @@ def c64():
     need(running(s) == ["Q1", "Q2"] and len(done) == 50, "running %r, done %d" % (running(s), len(done)))
 
 
+def c65():
+    s = S("team-2")
+    b = job(s, "B1")
+    need(running(s) == ["A1", "A2", "B1"] and b.get("guarantee") == "team",
+         "running %r, B1 guarantee %r" % (running(s), b.get("guarantee")))
+
+
+def c66():
+    hb = S("team-2")["hb"]
+    want = {"a": {"running": 2, "waiting": 0}, "b": {"running": 1, "waiting": 0}}
+    need(isinstance(hb, dict) and hb.get("teams") == want, "heartbeat teams %r" % ((hb or {}).get("teams"),))
+
+
 CHECKS = [
-    (1, "a finished run job has every job-file field, env included, and env as submitted", c01),
+    (1, "a finished run job has every job-file field and empty env", c01),
     (2, "a finished run job reads done, exit 0, result PASS from its record; no record at its start", c02),
     (3, "the job's command runs once: one marker line", c03),
     (4, "no temporary job file is left and every job file parses", c04),
@@ -686,8 +704,8 @@ CHECKS = [
     (20, "queue.toml's budget beats CODETEAM_BUILD_BUDGET", c20),
     (21, "CODETEAM_BUILD_BUDGET is the budget when queue.toml has none", c21),
     (22, "the budget is 6 when neither is set", c22),
-    (23, "round-robin: after a team-a start, the team-b job is next (positions 1, 2, 3)", c23),
-    (24, "round-robin: the starts run a1, b1, a2, a3", c24),
+    (23, "round-robin among running teams: places A2 1, B2 2, A3 3, not submission order", c23),
+    (24, "round-robin among running teams: A2 and B2 take the room, A3 waits", c24),
     (25, "cost is the median of the last 5 cpu/wall ratios (3.0)", c25),
     (26, "cost clamps up to 1 below a ratio of 1", c26),
     (27, "cost clamps down to the budget above it", c27),
@@ -716,7 +734,7 @@ CHECKS = [
     (50, "a wrong-typed queue.toml gives defaults, load_max is ignored, and a job file missing its keys is skipped", c50),
     (51, "a running run job keeps env, as submitted", c51),
     (52, "a running slot job keeps its env ({})", c52),
-    (53, "a run job whose tool cannot start is broken, with a reason and its env kept", c53),
+    (53, "a run job whose tool cannot start is broken, with a reason and empty env", c53),
     (54, "a running run job with no env is skipped and left byte-for-byte", c54),
     (55, "a done run job with no env is skipped and left byte-for-byte", c55),
     (56, "a broken run job with no env is skipped and left byte-for-byte", c56),
@@ -728,6 +746,8 @@ CHECKS = [
     (62, "a child answering with a restamp is done: answered, PASS, no history line", c62),
     (63, "the runner makes no tmutil call, including the one that creates the queue folder", c63),
     (64, "fifty finished job files and two queued dev jobs: one --once starts both", c64),
+    (65, "budget 2 filled by team-a: team-b's job starts over it, with guarantee team", c65),
+    (66, "the heartbeat's teams counts each team's running and waiting jobs", c66),
 ]
 
 
@@ -753,8 +773,8 @@ def check(scenarios):
             print("FAIL %d %s: %s: %s" % (num, label, type(e).__name__, e))
             continue
         print("ok   %d %s" % (num, label))
-    summary = ("buildq-sched: %d of 64 checks failed: %s" % (len(bad), "; ".join(bad + failed_scenarios))
-               if bad or failed_scenarios else "buildq-sched: all 64 checks ok")
+    summary = ("buildq-sched: %d of 66 checks failed: %s" % (len(bad), "; ".join(bad + failed_scenarios))
+               if bad or failed_scenarios else "buildq-sched: all 66 checks ok")
     with open(os.path.join(root, "summary"), "w") as f:
         f.write(summary + "\n")
     return 1 if bad or failed_scenarios else 0
@@ -902,7 +922,9 @@ sc_order() {
   newsc "$sc"
   pyl mkjobs "$sc" '[{"ticket":"D1","team":"team-a","submitted":1000,"sleep":"hold"}]'
   RUNENV="CODETEAM_BUILD_BUDGET=1" once "$sc"
-  pyl mkjobs "$sc" '[{"ticket":"P1","class":"post","team":"team-b","submitted":1001,"sleep":0.2},{"ticket":"D2","team":"team-c","submitted":1002,"sleep":0.2}]'
+  # One team throughout: a team with nothing running would start at once under the team guarantee, and
+  # this scenario is about the class order and the budget.
+  pyl mkjobs "$sc" '[{"ticket":"P1","class":"post","team":"team-a","submitted":1001,"sleep":0.2},{"ticket":"D2","team":"team-a","submitted":1002,"sleep":0.2}]'
   RUNENV="CODETEAM_BUILD_BUDGET=1" once "$sc"
   snap order-2 "$sc"
   touch "$sc/release/D1"
@@ -976,11 +998,16 @@ sc_rr() {
   trap - EXIT
   local sc="$tmp/rr"
   newsc "$sc"
-  pyl mkjobs "$sc" '[{"ticket":"A1","team":"team-a","submitted":1000,"sleep":1},{"ticket":"A2","team":"team-a","submitted":1001,"sleep":0.2},{"ticket":"A3","team":"team-a","submitted":1002,"sleep":0.2},{"ticket":"B1","team":"team-b","submitted":1003,"sleep":0.2}]'
-  RUNENV="CODETEAM_BUILD_BUDGET=1" once "$sc"
+  # Round robin decides only among teams that already run a job: a team with nothing running starts at once under
+  # the team guarantee. A1 and B1 start that way (A1 first, so team-a's last start is the older one).
+  pyl mkjobs "$sc" '[{"ticket":"A1","team":"team-a","submitted":1000,"sleep":"hold"},{"ticket":"B1","team":"team-b","submitted":1001,"sleep":"hold"}]'
+  RUNENV="CODETEAM_BUILD_BUDGET=2" once "$sc"
+  pyl mkjobs "$sc" '[{"ticket":"A2","team":"team-a","submitted":1002,"sleep":"hold"},{"ticket":"A3","team":"team-a","submitted":1003,"sleep":"hold"},{"ticket":"B2","team":"team-b","submitted":1004,"sleep":"hold"}]'
+  RUNENV="CODETEAM_BUILD_BUDGET=2" once "$sc"
   snap rr-1 "$sc"
-  RUNENV="CODETEAM_BUILD_BUDGET=1" loop "$sc"
+  RUNENV="CODETEAM_BUILD_BUDGET=4" once "$sc"
   snap rr-final "$sc"
+  touch "$sc/release/A1" "$sc/release/A2" "$sc/release/A3" "$sc/release/B1" "$sc/release/B2"
 }
 
 sc_cost() {
@@ -1175,6 +1202,18 @@ sc_done50() {
   snap done50 "$sc"
 }
 
+sc_team() {
+  trap - EXIT
+  local sc="$tmp/team"
+  newsc "$sc"
+  pyl mkjobs "$sc" '[{"ticket":"A1","team":"team-a","submitted":1000,"sleep":"hold"},{"ticket":"A2","team":"team-a","submitted":1001,"sleep":"hold"}]'
+  RUNENV="CODETEAM_BUILD_BUDGET=2" once "$sc"
+  pyl mkjobs "$sc" '[{"ticket":"B1","team":"team-b","submitted":1002,"sleep":"hold"}]'
+  RUNENV="CODETEAM_BUILD_BUDGET=2" once "$sc"
+  snap team-2 "$sc"
+  touch "$sc/release/A1" "$sc/release/A2" "$sc/release/B1"
+}
+
 # ERR inheritance keeps a failed intermediate step (including a command substitution) from being masked by
 # a later successful snapshot. Expected failures, such as waiting for a killed child, are explicitly ignored.
 run_scenario() {
@@ -1194,7 +1233,7 @@ run_scenario() {
 
 scenarios=(sc_basic sc_order sc_cfg sc_full sc_six sc_ceiling sc_budget_toml sc_budget_env
            sc_budget_default sc_rr sc_cost sc_est sc_load sc_swap sc_warm sc_one sc_mode sc_env
-           sc_settle sc_noenv sc_bigbudget sc_bigclass sc_done50)
+           sc_settle sc_noenv sc_bigbudget sc_bigclass sc_done50 sc_team)
 pids=()
 mkdir -p "$tmp/status"
 for scenario in "${scenarios[@]}"; do

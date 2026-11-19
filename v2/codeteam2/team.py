@@ -19,6 +19,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .idle_exit import IDLE_EXIT_H
+
 V2_DIR = Path(__file__).resolve().parent.parent
 CT_HOME = V2_DIR.parent
 # Where team folders, bare repos and team links live (CODETEAM_WORKSPACE, default ~/codeteam-work).
@@ -123,9 +125,9 @@ class Team:
         # By default this follows the cache lifetime the team's sessions are launched with.
         self.warm_s = float(self.cfg.get("warm_s", default_warm_s(t.m.get("session_cache_ttl", "1h"))))
         # A session idle this long with nothing waiting is ended, except those the user talks to
-        # (keep_awake) and one whose pane shows a subagent's view or whose input box holds unsent text. v1's
-        # tick did this at 6 h. 0: never.
-        self.idle_exit_min = float(self.cfg.get("idle_exit_h", 6)) * 60
+        # (keep_awake) and one whose pane shows a subagent's view or whose input box holds unsent text. The
+        # default is IDLE_EXIT_H (1 h). 0: never.
+        self.idle_exit_min = float(self.cfg.get("idle_exit_h", IDLE_EXIT_H)) * 60
         # typing_guard: hold a session's mail while its input box holds unsent text. draft_alert_min: tell the owner,
         # once per episode, when unsent text or a subagent's view has held the session this long while real
         # (not ride-along) mail is queued for it.
@@ -460,6 +462,8 @@ Lanes tell their orchestrator, then carry on with the product. Writes to the har
             if r.get("owns"):
                 env["CODETEAM_OWNS"] = ":".join(r["owns"])
             env["CODETEAM_SWT"] = str(v1.lane_wt(t, s.key, r))
+            # zone-tool ledger writes here whatever the cwd: the folder the patrol, sweep and push-up read.
+            env["CODETEAM_LEDGER_ROOT"] = str(v1.lane_ledger_dir(t, s.key, r))
             if not t.lab:
                 env["CODETEAM_EXCHANGE"] = str(t.ex_wt())
         # GNU make reads MAKEFILES before the repo's Makefile, so zone-test-one, zone-check and warm work in every

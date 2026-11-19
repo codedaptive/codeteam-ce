@@ -291,7 +291,6 @@ check "accept squashes and commits with Request and Worktree trailers" "$CT acce
 check "accept twice: nothing to accept" "! $CT accept acme.toml AKit worktree-agent-acc1 -f acc-one -m again >/dev/null 2>&1"
 check "remove-worktree removes a landed worktree and its branch" "$CT remove-worktree acme.toml AKit worktree-agent-acc1 >/dev/null && [ ! -d $AW/.claude/worktrees/agent-acc1 ] && ! git -C $B rev-parse -q --verify worktree-agent-acc1 >/dev/null"
 check "remove-worktree touches only worktree-* branches" "! $CT remove-worktree acme.toml AKit lane/AKit >/dev/null 2>&1"
-check "zone roles name accept and remove-worktree, and both are filled in" "grep -q '{{accept}}' $(dirname "$CT")/../roles/zone.md && grep -q '{{remove_worktree}}' $(dirname "$CT")/../roles/zone.md && grep -q '\"accept\": t.cmd(\"accept\")' $CT && grep -q '\"remove_worktree\": t.cmd(\"remove-worktree\")' $CT"
 git -C $AW reset -q --hard $L0 2>/dev/null; git -C $B update-ref refs/heads/lane/AKit $L0
 
 # --- a session whose last turn ended on an API error is found (and a later prompt clears it)
@@ -348,6 +347,7 @@ touch -t $(date -v-2d +%Y%m%d%H%M) $PLD/orders/old-req.md
 check "patrol: a past-queued row with no worktree and a fresh order is active, not parked" "python3 -c \"$APIF; import time; t=ct.Team('$T/acme.toml'); team=ct.load_team(t); rows,active,dead,parked,queued=ct.lane_work(t,'AKit',team['lanes']['AKit'],time.time()); assert active==['fresh-req'] and dead==[] and parked==2, 'active=%r dead=%r parked=%r queued=%r rows=%r' % (active,dead,parked,queued,rows)\""
 PO=$($CT patrol acme.toml --dry-run)
 check "patrol: only rows whose order is a day old, or missing, are flagged parked" "echo \"\$PO\" | grep -qF 'AKit: 2 ledger row(s) past queued'"
+check "patrol: on a team that does not land, the parked flag names the await form" "echo \"\$PO\" | grep -qF 'await its feature and stage it \"waiting <feature>\"'"
 rm -f $PLW/.ledger.md $PLD/orders/fresh-req.md $PLD/orders/old-req.md
 rmdir $PLD/orders
 

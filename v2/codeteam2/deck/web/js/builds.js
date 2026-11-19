@@ -1,11 +1,19 @@
 // BUILDS · queue (render._build_box): the job strip (running green, queued grey), the counts, the runner's budget
-// and swap, class chips, the jobs, the 24 h waits and the warms. Empty when the queue has nothing to show.
+// and swap, each team's running and waiting jobs (a live runner with teams only), class chips, the jobs, the 24 h
+// waits and the warms. Empty when the queue has nothing to show. In a middle column at least WIDE px wide with jobs
+// queued, the body is two columns: everything but the queued jobs on the left, the queued jobs #1..#n on the right.
+// Narrower (or no width given, or nothing queued), one column with the queued jobs after the running ones.
 import { buildJobs } from "./buildJobs.js";
 import { fmt } from "./fmt.js";
 import { h } from "./h.js";
+import { rowsOf } from "./rowsOf.js";
+import { teamsRow } from "./teamsRow.js";
 
 // Worktree tails in the warm rows are capped as render.PATH_CAP.
 const PATH_CAP = 14;
+// Two columns from a middle column this wide: panels.css's 390px left track, its 16px gap and a right track of at
+// least 390px (796px) fit in an 820px column less the box's 18px of border and padding.
+const WIDE = 820;
 
 function runnerLine(runner) {
   if (runner.state !== "live") {
@@ -32,7 +40,13 @@ function waits(c) {
     + `med ${fmt.dur(w.median_s)} · max ${fmt.dur(w.max_s)}`, "dim")) : "";
 }
 
-export function builds(snapBuilds, motion) {
+// The two columns side by side; data-rows is the taller column's rows, which rowsOf counts for the split.
+function split(left, right) {
+  return `<div class="split" data-rows="${Math.max(rowsOf(left), rowsOf(right))}">`
+    + `<div class="split-l">${left}</div><div class="split-r">${right}</div></div>`;
+}
+
+export function builds(snapBuilds, motion, width) {
   const b = fmt.mapping(snapBuilds);
   const queue = fmt.mapping(b.queue);
   const runner = fmt.mapping(queue.runner);
@@ -44,12 +58,15 @@ export function builds(snapBuilds, motion) {
   if (!(running.length || queued.length || active || runner.state === "live" || warms.length)) return "";
   const sweep = motion && running.length ? " sweep" : "";
   const strip = running.map(() => `<i class="bg-green${sweep}"></i>`).join("") + queued.map(() => '<i class="bg-faint"></i>').join("");
-  const body = h.row(`<span class="strip">${strip}</span>`)
+  const head = h.row(`<span class="strip">${strip}</span>`)
     + h.row(h.span("■", "green") + " " + h.span(`${running.length} running`, "green") + "   "
       + h.span("■", "dim") + " " + h.span(`${queued.length} queued`, "dim"))
-    + h.row(runnerLine(runner)) + h.row(classes.map(chip).join(""), "chips")
-    + buildJobs(running, queued) + classes.map(waits).join("")
+    + h.row(runnerLine(runner)) + teamsRow(runner) + h.row(classes.map(chip).join(""), "chips");
+  const tail = classes.map(waits).join("")
     + warms.map((w) => h.row(h.span(`warm ${w.state || "?"} ${fmt.dur(w.elapsed_s)} ${fmt.tail(w.worktree, PATH_CAP)}`, "dim"))).join("");
+  const body = width >= WIDE && queued.length
+    ? split(head + buildJobs(running, []) + tail, buildJobs([], queued))
+    : head + buildJobs(running, queued) + tail;
   const right = h.span(`${running.length + queued.length} jobs`, "dim") + (queue.state === "?" ? h.span(" · queue ?", "amber") : "");
   return h.box(h.span("BUILDS · queue", "green bold"), right, body, "green", "builds");
 }

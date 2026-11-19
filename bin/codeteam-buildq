@@ -6,8 +6,10 @@ One runner per queue folder (Q, default <codeteam>/run/queue). It decides which 
 waiting process execs its tool, and settles every job from the files alone, so it can die and come back at any
 time. Every read-modify-write of a job file holds flock(Q/.lock) and replaces the file atomically; the deck and the
 clients read only Q/*.json, so everything else in Q is a dot-file. A run job carries the submitter's environment
-(`env`) for its whole life, and the runner hands it to the child it starts. The runner's heartbeat is
-Q/../queue-runner.json. A decision lists and reads Q once.
+(`env`) while it is queued or running, and the runner hands it to the child it starts; the env is emptied when the
+job settles, and the runner empties settled records' env when it starts. The runner's heartbeat is
+Q/../queue-runner.json: budget, use, swap, and each team's running and waiting jobs. A decision lists and reads Q
+once.
 
   codeteam-buildq [--once | --standby]
     --once     one decision, then exit.
@@ -22,7 +24,7 @@ import os
 import re
 import sys
 import time
-from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,10 +45,17 @@ if sys.version_info < (3, 11):
 import tomllib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "share"))
+import codeteam_class_pick
+import codeteam_clean_settled_env
 import codeteam_hang
+import codeteam_settled_env
+import codeteam_startable
+import codeteam_team_counts
+import codeteam_team_slot
 
 # "land": the landing gate's tests (codeteam-land, spec v5 §4): offered a start before every other class, with a
-# guaranteed share; leads' own runs wait behind it.
+# guaranteed share; leads' own runs wait behind it (2026-11-06). Ahead of every class comes the team guarantee
+# (2026-11-17): a team with a job waiting and nothing running starts its job first (Runner.next_job).
 CLASSES = ("land", "full", "post", "pre", "dev")  # start order: a class earlier here is offered a start first
 SHARES = {"land": (2, 0), "full": (1, 1), "post": (1, 2), "pre": (1, 2), "dev": (1, 0)}   # (guaranteed, ceiling); 0 = none
 DEFAULT_BUDGET = 6
@@ -314,7 +323,8 @@ REQUIRED = ("ticket", "kind", "class", "state", "key", "command", "submitted")
 
 def well_formed(job, name: str) -> bool:
     """Whether a job file has what the runner reads with an index: the common keys, and the ones a start needs. A
-    run job needs `env` (the submitter's environment), `tool` and `record` in every state: its file keeps all three."""
+    run job needs `env`, `tool` and `record` in every state: its file keeps all three keys. `env` holds the
+    submitter's environment while the job is queued or running and is `{}` once it settles."""
     if not isinstance(job, dict) or any(k not in job for k in REQUIRED):
         return False
     needs = ("tool", "env", "record") if job["kind"] == "run" else ("tool",)
@@ -339,7 +349,7 @@ class Queue:
 
     def update(self, ticket: str, change: dict, expect: str | None = None) -> dict | None:
         """Read the job fresh, apply change, write it, all under Q/.lock; None when the job is gone or no longer in
-        state `expect`."""
+        state `expect`. A job the change leaves settled is written and returned with env `{}`."""
         fd = os.open(self.q / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -347,6 +357,7 @@ class Queue:
             if job is None or (expect and job.get("state") != expect):
                 return None
             job.update(change)
+            job = codeteam_settled_env.settled_env(job)
             atomic_write(self.q / f"{ticket}.json", job, 0o600)
             return job
         finally:
@@ -441,7 +452,7 @@ class Runner:
                 del self.jobs[job["ticket"]]
 
     def settle(self, job: dict, state: str, **fields) -> None:
-        """Moves a job out of queued or running; its job file keeps its env."""
+        """Moves a job out of queued or running; its job file's env is emptied."""
         self.write(job["ticket"], {"state": state, "finished": time.time(), "position": None, "hold": None, **fields})
         self.watches.pop(job["ticket"], None)
         self.log_sizes.pop(job["ticket"], None)
@@ -559,49 +570,37 @@ class Runner:
                 last[j.get("team")] = max(last.get(j.get("team"), 0), j["started"])
         return round_robin([j for j in jobs if j.get("class") == cls and j.get("state") == "queued"], last)
 
-    def head(self, cls: str, jobs: list[dict], guard: Guard) -> dict | None:
-        """The class's next job: first in order that has a cost (a job submitted since this decision priced the queue
-        waits for the next one) and whose worktree is not still being warmed."""
-        if guard.hold(cls):
-            return None
-        order = self.class_order(cls, jobs)
-        # One build at a time per worktree and port (2026-11-04: one product submitted 16 Swift groups at once,
-        # they started together in one worktree, and xcodebuild failed on its locked build database). A queued job
-        # waits while a job for the same worktree and port runs; jobs in other worktrees or the other port go ahead.
-        busy = {(j.get("worktree"), job_port(j)) for j in jobs
-                if j.get("state") == "running" and job_port(j)}
-        return next((j for j in order if j.get("cost") is not None and not warm_held(j.get("warm_lock"))
-                     and (not job_port(j) or (j.get("worktree"), job_port(j)) not in busy)), None)
+    def head(self, cls: str, jobs: list[dict], startable: Callable[[dict], bool]) -> dict | None:
+        """The class's next job: the first in its start order that is startable."""
+        return next(filter(startable, self.class_order(cls, jobs)), None)
 
-    def next_job(self, cfg: Config, guard: Guard) -> dict | None:
+    def next_job(self, cfg: Config, guard: Guard) -> tuple[dict, str | None] | None:
+        """The job to start next and the guarantee it starts under. The team guarantee comes first, ahead of the
+        shared pool (2026-11-17): a team with a startable job waiting and nothing running starts its job
+        ("team"), over the budget, the ceilings and the reservation if need be. Otherwise the shared pool picks among
+        the class heads (None). Both obey the same holds (share/codeteam_startable.py)."""
         jobs = list(self.jobs.values())
         running = [j for j in jobs if j.get("state") == "running"]
-        used = sum(j.get("cost") or 0 for j in running)
-        count = Counter(j.get("class") for j in running)
-        heads = {cls: self.head(cls, jobs, guard) for cls in CLASSES}
-        for cls in CLASSES:
-            job = heads[cls]
-            if job is None:
-                continue
-            guaranteed, ceiling = cfg.shares[cls]
-            if count[cls] < guaranteed:
-                return job
-            # A class under its guaranteed share that has a startable job waiting keeps the room its next job needs.
-            reserved = sum(h["cost"] for o, h in heads.items() if o != cls and h and count[o] < cfg.shares[o][0])
-            if (used + job["cost"] + reserved <= cfg.budget
-                    and (ceiling == 0 or count[cls] < ceiling)):
-                return job
-        return None
+        busy = {(j.get("worktree"), job_port(j)) for j in running if job_port(j)}
+        ok = lambda j: codeteam_startable.startable(j, busy, guard.hold, warm_held, job_port)  # noqa: E731
+        if (job := codeteam_team_slot.team_slot(jobs, CLASSES, ok)) is not None:
+            return job, "team"
+        job = codeteam_class_pick.class_pick({cls: self.head(cls, jobs, ok) for cls in CLASSES}, running, cfg)
+        return None if job is None else (job, None)
 
     def start_jobs(self, cfg: Config, guard: Guard) -> None:
-        while (job := self.next_job(cfg, guard)) is not None:
-            self.start(job)
+        while (picked := self.next_job(cfg, guard)) is not None:
+            self.start(*picked)
 
-    def start(self, job: dict) -> None:
-        """Marks a queued job running (its job file keeps its env), and for a run job starts `zone-tool test` with
-        that env."""
+    def start(self, job: dict, guarantee: str | None = None) -> None:
+        """Marks a queued job running (its job file keeps its env while it runs), and for a run job starts
+        `zone-tool test` with that env. A job started by a guarantee that is not its class's ("team") carries it as
+        `guarantee`, written with the mark, so a reader of the file can tell why it started; other starts write no such
+        key."""
         ticket, now = job["ticket"], time.time()
         marked = {"state": "running", "started": now, "position": None, "hold": None}
+        if guarantee:
+            marked["guarantee"] = guarantee
         if job.get("kind") == "slot":
             self.write(ticket, marked, expect="queued")               # the waiting codeteam-slot execs its tool
             return
@@ -674,16 +673,18 @@ class Runner:
     def write_heartbeat(self, cfg: Config, guard: Guard, jobs: list[dict]) -> None:
         used = sum(j.get("cost") or 0 for j in jobs if j.get("state") == "running")
         beat = {"pid": os.getpid(), "beat": time.time(), "budget": cfg.budget, "used": used,
-                "swap": guard.swap, "swap_max": guard.swap_max, "swap_hold": guard.swap_hold}
+                "swap": guard.swap, "swap_max": guard.swap_max, "swap_hold": guard.swap_hold,
+                "teams": codeteam_team_counts.team_counts(jobs)}
         atomic_write(self.q.parent / "queue-runner.json", beat, 0o644)
 
 
 def take_runner_lock(q: Path, wait: bool) -> int | None:
-    """The fd holding flock on Q/.runner.lock for the runner's whole life, or None when another runner has it."""
+    """The fd holding flock on Q/.runner.lock, or None when another runner has it. A runner holds it while it serves
+    Q; at an idle exit it releases it, rechecks Q once, and exits or retakes it (release_when_idle)."""
     fd = os.open(q / ".runner.lock", os.O_RDWR | os.O_CREAT, 0o600)
     # Clients (zone-tool, codeteam-slot) probe this lock with a brief LOCK_NB to see whether a runner is alive. A
-    # runner starting during such a probe would see the lock held and exit, leaving none; a real runner holds it for
-    # its whole life, so retrying for half a second tells the two apart.
+    # runner starting during such a probe would see the lock held and exit, leaving none; a real runner holds it
+    # while it serves Q, so retrying for half a second tells the two apart.
     deadline = time.monotonic() + 0.5
     while True:
         try:
@@ -696,11 +697,24 @@ def take_runner_lock(q: Path, wait: bool) -> int | None:
             time.sleep(0.02)
 
 
+def release_when_idle(q: Path, lock: int, queue: Queue) -> int | None:
+    """The runner's step at its idle limit: release Q/.runner.lock first, then list Q once more. A client
+    writes its job before it probes the lock, so a job whose client saw the lock held is in this listing, and a job
+    written after the release finds the lock free and its client starts a runner. Returns the lock taken again when
+    a job is queued or running, else None: the runner exits (also when another runner took the lock first)."""
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    os.close(lock)
+    if not any(job.get("state") in ("queued", "running") for job in queue.all()):
+        return None
+    return take_runner_lock(q, False)
+
+
 def main(argv: list[str]) -> int:
     once, standby = "--once" in argv, "--standby" in argv
     q = Path(os.environ.get("CODETEAM_QUEUE_DIR") or Path(__file__).resolve().parent.parent / "run" / "queue").absolute()
     conf = Path(os.environ.get("CODETEAM_QUEUE_CONF") or q.parent / "queue.toml").absolute()
-    # A run job file holds the submitter's whole environment for its whole life, so no one else may read the folder.
+    # A queued or running run job's file holds the submitter's whole environment, so no one else may read the folder.
+    # Settled records' env is emptied here, once the lock is taken, and again whenever a job settles.
     q.mkdir(mode=0o700, parents=True, exist_ok=True)
     q.chmod(0o700)
     lock = take_runner_lock(q, standby)
@@ -708,6 +722,12 @@ def main(argv: list[str]) -> int:
         return 0
     os.chdir("/")
     runner = Runner(q, conf)
+    codeteam_clean_settled_env.clean_settled_env(runner.queue)
+    return serve(runner, q, lock, once)
+
+
+def serve(runner: Runner, q: Path, lock: int, once: bool) -> int:
+    """The runner's loop: a decision each tick until --once is done or an idle runner gives up its lock."""
     tick = num(os.environ.get("CODETEAM_BUILDQ_TICK"), 1.0)
     idle_exit = num(os.environ.get("CODETEAM_BUILDQ_IDLE_EXIT"), 0)
     busy_at, last_error = time.monotonic(), ""
@@ -726,7 +746,9 @@ def main(argv: list[str]) -> int:
             return 0
         busy_at = time.monotonic() if busy else busy_at
         if idle_exit and time.monotonic() - busy_at >= idle_exit:
-            return 0
+            if (lock := release_when_idle(q, lock, runner.queue)) is None:
+                return 0
+            busy_at = time.monotonic()
         time.sleep(tick)
 
 

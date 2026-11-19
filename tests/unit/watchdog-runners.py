@@ -109,11 +109,76 @@ class RunnerProblemsTests(unittest.TestCase):
                                                                                              stdout="state = running")),
                   patch.object(self.watchdog, "notify") as notify, patch.object(self.watchdog, "sweep_queue"),
                   patch.object(self.watchdog, "disk_emergency"), patch.object(self.watchdog, "sweep_disk"),
+                  patch.object(self.watchdog, "sweep_stale_targets", create=True),
+                  patch.object(self.watchdog, "prune_reused_trees", create=True),
+                  patch.object(self.watchdog, "manifests", return_value=[teams / "demo.toml"]),
+                  patch.object(self.watchdog, "runs_from", return_value=None),
+                  patch.object(self.watchdog, "free_gb", return_value=200),
+                  patch.object(self.watchdog, "tell_orchestrator") as tell,
+                  patch.dict(os.environ, {"CODETEAM_QUEUE_DIR": str(root / "queue")}),
                   contextlib.redirect_stdout(io.StringIO())):
                 self.watchdog.check()
             self.assertEqual([call.args[1] for call in notify.call_args_list], problems)
-            self.assertEqual(set(json.loads(state.read_text())),
-                             {"demo: landing queue", "demo: recheck runner", "demo: validation runner"})
+            self.assertEqual([call.args[4] for call in tell.call_args_list], problems)
+            episodes = {"demo: landing queue", "demo: recheck runner", "demo: validation runner"}
+            self.assertEqual(set(json.loads(state.read_text())), episodes | {"told"})
+            self.assertEqual(set(json.loads(state.read_text())["told"]), episodes)
+
+
+class TellOrchestratorTests(unittest.TestCase):
+    """A runner that exits at start was told to the owner alone; the team's orchestrator is told
+    too, at most once per runner in TELL_ORC_S, though a restarting runner opens a new episode in many passes."""
+
+    def setUp(self):
+        self.watchdog, _ = load_watchdog()
+
+    def passes(self, problem_lists, times):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            team = root / "scratch-team"
+            v2 = team / "team" / "v2"
+            v2.mkdir(parents=True)
+            (v2 / "up").touch()
+            (v2 / "heartbeat").touch()
+            manifest = root / "demo.toml"
+            manifest.write_text(f'worktree_root = "{team}"\n[land]\nenabled = true\n')
+            told = []
+            for problems, at in zip(problem_lists, times):
+                os.utime(v2 / "heartbeat", (at, at))
+                with (patch.object(self.watchdog, "STATE", root / "state.json"),
+                      patch.object(self.watchdog, "manifests", return_value=[manifest]),
+                      patch.object(self.watchdog, "runs_from", return_value=None),
+                      patch.object(self.watchdog, "runner_problems", return_value=problems),
+                      patch.object(self.watchdog.time, "time", return_value=at),
+                      patch.object(self.watchdog, "notify"),
+                      patch.object(self.watchdog, "tell_orchestrator",
+                                   side_effect=lambda *a: told.append((at, a[4]))),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.watchdog.check_teams()
+            return told
+
+    def test_a_runner_that_flaps_is_told_to_the_orchestrator_once_in_six_hours(self):
+        down = ["landing queue runner not running"]
+        told = self.passes([down, [], down, [], down], [1000, 1300, 1600, 1900, 1000 + 6 * 3600 + 1])
+        self.assertEqual(told, [(1000, down[0]), (1000 + 6 * 3600 + 1, down[0])])
+
+    def test_the_loop_heartbeat_is_not_told_to_the_orchestrator(self):
+        with patch.object(self.watchdog.subprocess, "run"):
+            told = self.passes([["loop heartbeat missing"]], [1000])
+        self.assertEqual(told, [])
+
+    def test_the_note_goes_through_the_teams_own_codeteam2_to_its_orchestrator(self):
+        printed = "com.codeteam.codeteam-land.demo = {\n\tstate = spawn scheduled\n\tlast exit code = 1\n}\n"
+        run = lambda argv, **kw: SimpleNamespace(returncode=0, stdout=printed)
+        started = []
+        self.watchdog.tell_orchestrator(Path("/x/jj"), Path("/x/jj/teams/demo.toml"), Path("/x/team-demo"), "demo",
+                                        "landing queue runner not running", run=run,
+                                        popen=lambda argv, **kw: started.append(argv))
+        argv = started[0]
+        self.assertEqual(argv[:8], ["/x/jj/v2/bin/codeteam2", "say", "/x/jj/teams/demo.toml", "general", "codeteam",
+                                    "NOTE", "orc", argv[7]])
+        self.assertIn("spawn scheduled", argv[7])
+        self.assertIn("last exit code 1", argv[7])
 
 
 class FullDiskTests(unittest.TestCase):
@@ -141,10 +206,31 @@ class FullDiskTests(unittest.TestCase):
                   patch.object(watchdog, "sweep_queue", side_effect=lambda: ran.append("queue")),
                   patch.object(watchdog, "disk_emergency", side_effect=lambda: ran.append("emergency")),
                   patch.object(watchdog, "sweep_disk", side_effect=lambda: ran.append("disk")),
+                  patch.object(watchdog, "sweep_stale_targets", side_effect=lambda *a, **k: ran.append("stale")),
+                  patch.object(watchdog, "prune_reused_trees", side_effect=lambda *a, **k: ran.append("prune"), create=True),
+                  patch.object(watchdog, "manifests", return_value=[]),
+                  patch.object(watchdog, "free_gb", return_value=200),
+                  patch.dict(os.environ, {"CODETEAM_QUEUE_DIR": str(Path(tmp) / "queue")}),
                   contextlib.redirect_stdout(out)):
                 watchdog.check()
-        self.assertEqual(ran, ["queue", "emergency", "disk"])
+        self.assertEqual(ran, ["queue", "emergency", "disk", "stale", "prune"])
         self.assertIn("failed: OSError: [Errno 28] No space left on device", out.getvalue())
+
+    def test_stale_sweep_runs_after_disk_and_before_team_checks(self):
+        watchdog, _ = load_watchdog()
+        ran = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with (patch.object(watchdog, "sweep_queue", side_effect=lambda: ran.append("queue")),
+                  patch.object(watchdog, "disk_emergency", side_effect=lambda: ran.append("emergency")),
+                  patch.object(watchdog, "sweep_disk", side_effect=lambda: ran.append("disk")),
+                  patch.object(watchdog, "sweep_stale_targets", side_effect=lambda *a, **k: ran.append("stale")),
+                  patch.object(watchdog, "prune_reused_trees", side_effect=lambda *a, **k: ran.append("prune"), create=True),
+                  patch.object(watchdog, "manifests", return_value=[]),
+                  patch.object(watchdog, "free_gb", return_value=200),
+                  patch.dict(os.environ, {"CODETEAM_QUEUE_DIR": str(Path(tmp) / "queue")}),
+                  patch.object(watchdog, "check_teams", side_effect=lambda: ran.append("teams"))):
+                watchdog.check()
+        self.assertEqual(ran, ["queue", "emergency", "disk", "stale", "prune", "teams"])
 
     def test_a_failing_floor_does_not_stop_the_team_checks(self):
         watchdog, _ = load_watchdog()
@@ -155,6 +241,11 @@ class FullDiskTests(unittest.TestCase):
                   patch.object(watchdog, "WORKSPACE", Path(tmp)),
                   patch.object(watchdog, "sweep_queue"), patch.object(watchdog, "disk_emergency"),
                   patch.object(watchdog, "sweep_disk", side_effect=OSError(28, "No space left on device")),
+                  patch.object(watchdog, "sweep_stale_targets", create=True),
+                  patch.object(watchdog, "prune_reused_trees", create=True),
+                  patch.object(watchdog, "manifests", return_value=[]),
+                  patch.object(watchdog, "free_gb", return_value=200),
+                  patch.dict(os.environ, {"CODETEAM_QUEUE_DIR": str(Path(tmp) / "queue")}),
                   contextlib.redirect_stdout(out)):
                 watchdog.check()
             self.assertEqual(json.loads(state.read_text()), {})

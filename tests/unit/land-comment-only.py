@@ -1,7 +1,8 @@
 #!/usr/bin/env -S python3 -u
 """Comment-only work orders: code_text takes the comments out of a file by its
-language, and two versions with the same result differ only in comments. What a tool reads stays code: Rust and Swift
-doc comments that hold a code block, Python docstrings and directive comments. Pure functions, no git."""
+language, and two versions with the same result differ only in comments. What a tool reads stays code: Rust doc
+comments that hold a code block, Swift doc comments with a compiled snippet, Python docstrings and directive
+comments. Pure functions, no git."""
 import importlib.machinery
 import importlib.util
 import json
@@ -104,13 +105,28 @@ class Swift(Same):
     def test_line_and_nested_block_comment_change_is_comment_only(self):
         self.comment("a.swift", "func f() {} // a\n/* x /* y */ z */\n", "func f() {} // b\n/* p /* q */ r */\n")
 
-    def test_doc_comment_with_a_code_block_is_code(self):
+    def test_a_doc_comment_change_is_comment_only_code_block_or_not(self):
+        # Swift compiles no block in a doc comment, only a snippet file named by @Snippet (the rule:
+        # "Swift /// doc comments with compiled snippets").
         base = "/// Opens.\n///\n/// ```swift\n/// open()\n/// ```\npublic func open() {}\n"
-        self.code("a.swift", base, base.replace("open()\n///", "open(1)\n///"))
+        self.comment("a.swift", base, base.replace("open()\n///", "open(1)\n///"))
+        self.comment("a.swift", base, base.replace("Opens.", "Opens the store."))
         self.comment("a.swift", "/// Opens.\npublic func open() {}\n", "/// Opens it.\npublic func open() {}\n")
+        self.code("a.swift", base, base.replace("open() {}", "open(_ x: Int) {}"))
+
+    def test_prose_around_a_fenced_table_is_comment_only(self):
+        # LocusKit's AssociationOperational.swift, a bit-layout table fenced in its type's doc comment
+        # and the prose below it reworded.
+        base = ("/// Three axes pack into the low 20 bits:\n///\n/// ```\n/// bits 0-11   signal_sources_seen\n"
+                "/// bits 12-17  decay_class\n/// ```\n///\n/// more than one source can be set at once (an\n"
+                "/// association seen by both carries both bits).\npublic struct S {}\n")
+        self.comment("a.swift", base, base.replace("(an\n/// association seen by both carries both bits)",
+                                                     "(a value with both\n/// bits set holds both)"))
 
     def test_snippet_directive_is_code(self):
         self.code("a.swift", "/// @Snippet(path: \"a\")\nfunc f() {}\n", "/// @Snippet(path: \"b\")\nfunc f() {}\n")
+        snippet = "/// Opens.\n///\n/// @Snippet(path: \"a\")\npublic func open() {}\n"
+        self.code("a.swift", snippet, snippet.replace("Opens.", "Opens the store."))
 
     def test_interpolation_holding_slashes_then_a_code_change_is_code(self):
         a = 'let s = "\\(f("//"))"\nlet x = 1\n'
@@ -178,6 +194,14 @@ class NoRule(Same):
 class Kind(unittest.TestCase):
     """no_build_kind: documents alone are docs-only; otherwise comment_only decides, measured from the tree's own base."""
 
+    def setUp(self):
+        self.moves_patch = patch.object(cl, "diff_test_moves", return_value=None, create=True)
+        self.moves = self.moves_patch.start()
+        self.addCleanup(self.moves_patch.stop)
+        self.diff_patch = patch.object(cl, "diff_code_files", return_value=(["a.rs"], ["a.rs"]))
+        self.diff_patch.start()
+        self.addCleanup(self.diff_patch.stop)
+
     def team(self):
         team = Mock()
         team.c.side_effect = lambda key, default: default
@@ -195,6 +219,34 @@ class Kind(unittest.TestCase):
             self.assertEqual(cl.no_build_kind(self.team(), {"tree": "/t"}, ["a.rs", "a.md"]), "comment-only")
         base.assert_called_once()
         asked.assert_called_once_with("/t", "B", (".md",))
+        with patch.object(cl, "own_base", return_value="B"), patch.object(cl, "comment_only", return_value=False):
+            self.assertIsNone(cl.no_build_kind(self.team(), {"tree": "/t"}, ["a.rs"]))
+
+    def test_integration_move_skips_build_and_records_moves(self):
+        move = {"path": "tests/integration/test_x.py", "from": "tests/unit/test_x.py",
+                "to": "tests/integration/test_x.py", "group": "integration"}
+        self.moves.return_value = ([move], [])
+        rec = {"tree": "/t"}
+        with patch.object(cl, "own_base", return_value="B"), patch.object(cl, "comment_only", return_value=False):
+            self.assertEqual(cl.no_build_kind(self.team(), rec, [move["path"]]), "test-move")
+        self.assertEqual(rec["moved_tests"], [move])
+
+    def test_unit_move_with_code_left_builds(self):
+        move = {"path": "tests/unit/test_x.py", "from": "tests/integration/test_x.py",
+                "to": "tests/unit/test_x.py", "group": "unit"}
+        self.moves.return_value = ([move], [move["path"]])
+        with patch.object(cl, "own_base", return_value="B"), patch.object(cl, "comment_only", return_value=False):
+            self.assertIsNone(cl.no_build_kind(self.team(), {"tree": "/t"}, [move["path"]]))
+
+    def test_validation_move_skips_build(self):
+        move = {"path": "tests/validation/test_x.py", "from": "tests/unit/test_x.py",
+                "to": "tests/validation/test_x.py", "group": "validation"}
+        self.moves.return_value = ([move], [])
+        with patch.object(cl, "own_base", return_value="B"), patch.object(cl, "comment_only", return_value=False):
+            self.assertEqual(cl.no_build_kind(self.team(), {"tree": "/t"}, [move["path"]]), "test-move")
+
+    def test_failed_move_diff_builds(self):
+        self.moves.return_value = None
         with patch.object(cl, "own_base", return_value="B"), patch.object(cl, "comment_only", return_value=False):
             self.assertIsNone(cl.no_build_kind(self.team(), {"tree": "/t"}, ["a.rs"]))
 

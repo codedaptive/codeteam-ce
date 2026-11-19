@@ -150,6 +150,7 @@ CLAUDE_BIN = (os.environ.get("CODETEAM_CLAUDE_BIN")
 # on codeteam's own tmux server, so the user's own tmux sessions are never touched.
 TMUX = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
 TMUX_SOCKET = os.environ.get("CODETEAM_TMUX_SOCKET", "codeteam-ui")
+TMUX_START_WAIT_S = 60   # how long tmux_add waits for a server Terminal starts (10 s missed at load 54.6)
 CLAUDE_ENTRIES = ("agents", "skills", "rules", "hooks", "commands", "settings.json")
 MESSAGE_TYPES = ("REQUEST", "ANSWER", "NOTE", "STATUS", "BUG", "PUSHED", "DONE", "RULING", "READY")
 
@@ -1209,7 +1210,7 @@ def common_values(t):
             f"`{t.base}`, Kong reviews each work order before it lands (Stage 3) and sends findings back to its "
             f"zone's coordinator, and Stage 4 merges it onto `{t.base}`. There is no `integration` or `landing` "
             f"branch. Only the landing tool moves `{t.base}`; nobody commits on it directly."
-            if landing(t) and t.lab else
+            if lab_lands(t) else
             "\n\nOn a team that lands with codeteam-land (branch flow v5.4, `docs/SPEC-branch-flow-v5.4.md` in the codeteam checkout): "
             f"`{t.base}` holds proven code and moves only at Stage 7, by fast-forward; "
             f"`{t.integration}` is a copy of `{t.base}`, fast-forwarded right after it moves, and every work order "
@@ -1230,6 +1231,7 @@ def common_values(t):
         "backup_note": ("Every branch codeteam moves is pushed to origin as a backup; "
                         f"`{t.base}` is pushed by whoever ships it." if t.backup else
                         "This team keeps its branches local."),
+        **land_role_values(t),
     }
 
 
@@ -1290,7 +1292,7 @@ def base_recipients(t):
 
 
 def branch_rows(t, lane_branch="Lane branches"):
-    if landing(t) and t.lab:
+    if lab_lands(t):
         # A lab lands on its base itself: codeteam-land's integration and landing are the base (2026-11-14:
         # a lab's seat text named three branches it does not have).
         return (f"| `{t.base}` | The lab's one branch: work lands on it directly, one work order at a time (Stage 4); "
@@ -1322,49 +1324,189 @@ def landing_branch(t: Team) -> str:
     return (t.m.get("land") or {}).get("landing", "landing")
 
 
+def lab_lands(t) -> bool:
+    """A lab that lands with codeteam-land: its integration and landing are its base, and Stage 7 moves nothing."""
+    return landing(t) and t.lab
+
+
+def land_role_values(t) -> dict[str, str]:
+    """The lane, Kong and Nagatha landing roles' branch and promotion text. A landing lab has one branch and no
+    promotion, so its text names only the base."""
+    B, L = t.base, f"{TOOL_DIR / 'bin' / 'codeteam-land'} {t.manifest}"
+    if lab_lands(t):
+        return {
+            "zone_trees": (f"each in its own work order tree cut from `{B}`, the lab's one branch. Nothing reaches "
+                           f"`{B}` except through the landing tool,"),
+            "land_from": B, "stage2_merge": f"`{B}`", "review_move_over": "", "land_branches": f"`{B}`",
+            "stage4_step": (
+                "**Stage 4: Landing.** The landing runner merges one reviewed entry at a time onto "
+                f"`{B}`, and moves `{B}` only if it has not moved meanwhile. A conflict comes back to the lead with "
+                f"the files and the landed work orders it conflicts with. Those are already on `{B}`: the lead "
+                f"merges `{B}` (`{L} wo-pull <wo>` or land's Stage 2), resolves the conflict and runs land again. "
+                "Once landed, the work order is never sent back; overlapping changes to tested zones go to a "
+                "recheck line (Stage 5)."),
+            "after_landing_step": (
+                "**After landing.** Stage 5 rechecks overlapping landings and Stage 6 validates the newest "
+                f"`{B}` commit whose rechecks are all finished; a failure in either opens a fix work order for the "
+                "zone that owns the test. A lab has no promotion: landed work is on "
+                f"`{B}` at once, and the landing tool sends no message to a zone when `{B}` moves. Take it into an "
+                f"open work order at its next stopping point with `{L} wo-pull <wo>` (`land` also does it in "
+                "Stage 2)."),
+            "other_zone_change": (f"It reaches `{B}` when it lands (Stage 4), and your open work order takes it "
+                                  f"with `{L} wo-pull <wo>`; the landing tool sends no notice."),
+            "pull_row": f"Take what has landed on `{B}` into an open work order",
+            "kong_move_over": "", "land_onto": B,
+            "rounds_hold": ("hold nothing; your integration tests stop a landing at Stage 2 and run again in "
+                            "Stage 5's recheck"),
+            "promotion_bullet": f"- A lab has no promotion: Stage 4 lands work on `{B}` itself.",
+            "changelogs": ("A lab has no promotion, so no document stamp runs and nothing writes the "
+                           "`<STEM>_CHANGELOG.md` entries; you write none and land no changelog work order."),
+            "kong_changelog_step": ("A lab has no promotion, so no document stamp places a changelog entry: write "
+                                    "none."),
+        }
+    Ib = t.integration
+    return {
+        "zone_trees": (f"each in its own work order tree cut from `{Ib}`, a copy of the proven `{B}`. Nothing "
+                       "reaches `landing` except through the landing tool,"),
+        "land_from": Ib, "stage2_merge": f"`{Ib}` (proven code only)",
+        "review_move_over": "; for a work order open at the move-over, only its commits not already on `landing`",
+        "land_branches": f"`landing` or `{Ib}`",
+        "stage4_step": (
+            "**Stage 4: Landing.** The landing runner merges one reviewed entry at a time into current `landing`, "
+            "and moves `landing` only if it has not moved meanwhile. A conflict comes back to the lead with the "
+            "files and the landed work orders it conflicts with. The lead never merges `landing`: the work order "
+            f"waits until that work is promoted (you are told, step 7), then merges `{Ib}` (`{L} wo-pull <wo>` or "
+            "land's Stage 2), resolves the conflict and runs land again. Once landed, the work order is never sent "
+            "back; overlapping changes to tested zones go to a recheck line (Stage 5)."),
+        "after_landing_step": (
+            "**After landing.** Stage 5 rechecks overlapping landings and Stage 6 validates on the build box; a "
+            "failure in either opens a fix work order for the zone that owns the test. Stage 7 promotes to "
+            f"`{B}` the newest `landing` commit where Stage 6 passed and every recheck or validation failure at or "
+            f"before it was fixed at or before it, on test results only, then fast-forwards `{Ib}` to it. If the "
+            "promote changes the zone of one of your open work orders, or a direct dependency of it, you are told "
+            f"what was promoted: merge `{Ib}` into that work order at its next stopping point (`{L} wo-pull <wo>`; "
+            "`land` also does it in Stage 2). No one else is told."),
+        "other_zone_change": (f"It reaches `{Ib}` when Stage 7 promotes it; you are told then, and your open work "
+                              f"order takes it with `{L} wo-pull <wo>`."),
+        "pull_row": f"Take what has been promoted (`{Ib}`) into an open work order",
+        "kong_move_over": (
+            f" At a team's move-over, review each zone's whole diff between `{B}` and `landing` once. Record "
+            f"findings with `{L} finding v54-backlog-<zone> --zone <zone> --where <file:line> --severity 1|2|3 "
+            f"--kind <kind> --what <text>`, then run `{L} reviewed backlog-<zone>`."),
+        "land_onto": "landing",
+        "kong_changelog_step": ("When done with a work order, write its changelog entry to "
+                                f"`{t.ledger(t.guard) if t.guard else ''}/changelog/<wo>.md`: "
+                                "`- <YYYY-MM-DD> — <wo> (<K and R ids>): <what changed>`."),
+        "rounds_hold": ("never block promotion; your integration tests stop a landing at Stage 2 and hold promotion "
+                        "through Stage 5's recheck"),
+        "promotion_bullet": (
+            f"- Promotion is Stage 7 and the tool's: the validation runner (`{L} validate-run`) promotes on test "
+            "results only, taking the newest `landing` commit where Stage 6 passed and every recheck or validation "
+            "failure at or before it was fixed at or before it. An open fix or finding does not by itself stop it; "
+            f"the test-failure ancestry condition still applies. When {t.orc_name()} asks for a promotion sooner, "
+            f"`{L} promote [HASH]` runs Stage 7 now, refusing with its reason and with no override."),
+        "changelogs": (
+            "The promotion's document stamp writes them: each work order's entry goes into the "
+            "`<STEM>_CHANGELOG.md` beside each document the promotion stamps for that work order, taken from "
+            f"`{t.ledger(t.guard) if t.guard else ''}/changelog/<wo>.md` when {t.guard or t.orc_name()} has "
+            "written it, else the work order's first commit subject. You write no changelog entries and land no "
+            "changelog work order; a promotion never waits for them."),
+    }
+
+
 LAND_ORC_BULLETS = (
     "- Work lands one work order at a time through `{land} queue-run` (v5.4): before it lands, the tool checks it "
-    "(Stage 2: the whole-repo type check, every zone the change reaches, the repo's gates) and Kong reviews the "
-    "work order's own commits (Stage 3; a work order the tool makes itself skips review, by the tool's record). "
+    "(Stage 2: at `{land} land`, in its own tree, the whole-repo type check, the unit tests and the repo's "
+    "gates; at `{land} queue-run`, the integration tests of every zone the change reaches, run once per batch on "
+    "integration's tip with the queue's other ready work orders; on a failure, those "
+    "whose diff holds code on the failing test's path go back and the rest land, or with none matching all "
+    "land and the failure is a fix finding for its zone) and Kong reviews the work order's own commits (Stage 3; "
+    "a work order the tool makes "
+    "itself skips review, by the tool's record). "
     "Findings go back to the zone's coordinator and nothing lands; reviewed "
     "work orders are merged onto the landing branch (Stage 4). You do not sequence or hold landings unless you "
     "choose to (`land-next`, `land-hold`).\n"
     "- A zone that needs another zone's change asks you; you send it to the owning zone as a work order. When "
     "Stage 7 promotes it, the waiting zone is told and pulls it. No zone ever takes another's unfinished work.")
 
+# A landing lab's orchestrator bullets: work lands on the base itself and nothing is promoted or announced.
+LAB_LAND_ORC_BULLETS = (
+    "- Work lands one work order at a time through `{land} queue-run` (v5.4): before it lands, the tool checks it "
+    "(Stage 2: at `{land} land`, in its own tree, the whole-repo type check, the unit tests and the repo's "
+    "gates; at `{land} queue-run`, the integration tests of every zone the change reaches, run once per batch on "
+    "`{base}`'s tip with the queue's other ready work orders; on a failure, those "
+    "whose diff holds code on the failing test's path go back and the rest land, or with none matching all "
+    "land and the failure is a fix finding for its zone) and Kong reviews the work order's own commits (Stage 3; "
+    "a work order the tool makes "
+    "itself skips review, by the tool's record). "
+    "Findings go back to the zone's coordinator and nothing lands; reviewed "
+    "work orders are merged onto `{base}` (Stage 4). You do not sequence or hold landings unless you "
+    "choose to (`land-next`, `land-hold`).\n"
+    "- A zone that needs another zone's change asks you; you send it to the owning zone as a work order. Once it "
+    "lands (Stage 4) it is on `{base}`, and the waiting zone takes it with `{land} wo-pull <wo>`; the landing tool "
+    "sends no notice. No zone ever takes another's unfinished work.")
+
+
+def land_orc_bullets(t) -> str:
+    """The orchestrator's landing bullets for a landing team: the lab's when it is a landing lab, else the standard."""
+    return (LAB_LAND_ORC_BULLETS if lab_lands(t) else LAND_ORC_BULLETS).format(
+        land=f"codeteam-land {t.manifest}", base=t.base)
+
 
 def landing_promotion(t):
     L = f"codeteam-land {t.manifest}"
-    return (f"Every change reaches `{landing_branch(t)}` only through the landing tool, and `{t.base}` only by "
-            f"promotion (spec v5.4). `{t.integration}` is a copy of `{t.base}` that work order trees are cut from.\n\n"
-            f"1. Queue and order: `{L} queue`, `{L} land-next <wo>`, `{L} land-hold <wo>`.\n"
-            f"2. A work order that bounces with call sites in other zones (an interface change): open a work order in "
-            f"each affected zone for its part, and have the set queued together: `{L} land <wo> --with <wo2> ...`.\n"
-            "3. Before landing: Stage 2 checks the work order in its own tree; Kong reviews the work order's own "
-            "commits (Stage 3). On teams with Perkins, Perkins reviews it too if it changes files matching the globs "
-            "in `[land].security_paths`; with no list, Perkins reviews nothing before landing. Work orders the "
-            "landing tool makes itself skip review, identified by the tool's own record and commit trailer, not "
-            "their name. Findings go back to the zone's coordinator, the tree is kept and nothing lands. Stage 4 "
-            f"merges reviewed work orders onto `{landing_branch(t)}` one at a time.\n"
-            f"4. After landing: overlapping landings are rechecked (Stage 5), and `{L} validate-run` validates the "
+    lab = lab_lands(t)
+    onto = t.base if lab else landing_branch(t)
+    steps = [
+        f"Queue and order: `{L} queue`, `{L} land-next <wo>`, `{L} land-hold <wo>`.",
+        f"A work order that bounces with call sites in other zones (an interface change): open a work order in "
+        f"each affected zone for its part, and have the set queued together: `{L} land <wo> --with <wo2> ...`.",
+        f"Before landing: Stage 2 checks the work order in its own tree at `{L} land` (the merge of integration, the "
+        "type check and compile steps, the unit tests, the gates); its integration tests run once per batch at "
+        f"`{L} queue-run`, on `{t.base if lab else t.integration}`'s tip with the queue's other ready work orders, "
+        "and on a failure the work orders whose diff holds code on the failing test's path (the run's record: its "
+        "frames and the test's CodeGraph callees) go back to their zones' coordinators, the rest landing; with none "
+        "matching, all land and the failure is a fix finding for the failing test's zone. Kong reviews the "
+        "work order's own commits (Stage 3). Kong alone reviews before landing. On teams with Perkins, Perkins "
+        "reviews landed work when you ask him, and records findings with `finding`. Work "
+        "orders the landing tool makes itself skip review, identified by the tool's own record and commit trailer, "
+        "not their name. Findings go back to the zone's coordinator, the tree is kept and nothing lands. A security "
+        "finding holds nothing: it reaches you at once as a fix-forward for the owning zone, and the work "
+        f"order lands. Stage 4 merges reviewed work orders onto `{onto}` one at a time."]
+    own = (f"Your own edits and the designer's (docs, rulings, specs) land like any change: `{L} wo-cut orc <name>`, "
+           f"edit and commit in that tree, `{L} land <name>`. Nobody commits on "
+           + (f"`{t.base}`" if t.lab else f"`{t.base}`, `{t.integration}` or `{landing_branch(t)}`")
+           + " directly; the guard refuses it.")
+    if lab:
+        lead = (f"Every change reaches `{t.base}` only through the landing tool, one work order at a time (spec v5.4, "
+                f"for a lab). Work order trees are cut from `{t.base}`; a lab has no promotion.")
+        steps += [
+            f"After landing: overlapping landings are rechecked (Stage 5), and `{L} validate-run` validates the "
+            f"newest `{t.base}` commit whose rechecks are all finished (Stage 6). A recheck failure or a newly "
+            "failing validation test opens a fix work order for its zone; nothing is reverted for it. Nagatha's "
+            "rounds after landing write tests; their findings open work orders and hold nothing.",
+            own]
+    else:
+        lead = (f"Every change reaches `{landing_branch(t)}` only through the landing tool, and `{t.base}` only by "
+                f"promotion (spec v5.4). `{t.integration}` is a copy of `{t.base}` that work order trees are cut from.")
+        steps += [
+            f"After landing: overlapping landings are rechecked (Stage 5), and `{L} validate-run` validates the "
             f"newest `{landing_branch(t)}` commit whose rechecks are all finished, on the build box (Stage 6). A "
             "recheck failure or a newly failing validation test opens a fix work order for its zone; nothing is "
             "reverted for it. Nagatha's rounds after landing write tests; their findings open work orders and never "
-            "hold promotion.\n"
-            f"5. Promote: Stage 7 fast-forwards `{t.base}` to the newest `{landing_branch(t)}` commit C where Stage 6 "
+            "hold promotion.",
+            f"Promote: Stage 7 fast-forwards `{t.base}` to the newest `{landing_branch(t)}` commit C where Stage 6 "
             "passed and every recheck or validation failure at or before C was fixed at or before C (by ancestry). "
             f"Test results only, no findings list. Then it fast-forwards `{t.integration}` to `{t.base}`, tells only "
             "the coordinators of open work orders whose zone, or a direct dependency of it, changed between the old "
             f"and new `{t.integration}`, and restarts what the promote changed. `{L} promote [HASH]` runs Stage 7 "
-            "now under the same conditions; it refuses with its reason and has no override.\n"
-            f"6. Your own edits and the designer's (docs, rulings, specs) land like any change: `{L} wo-cut orc <name>`, "
-            f"edit and commit in that tree, `{L} land <name>`. Nobody commits on "
-            + (f"`{t.base}`" if t.lab else f"`{t.base}`, `{t.integration}` or `{landing_branch(t)}`")
-            + " directly; the guard refuses it.\n"
-            f"7. Move-over, once per team (not lab teams): `{L} migrate-v54` renames the old `{t.integration}` "
+            "now under the same conditions; it refuses with its reason and has no override.",
+            own,
+            f"Move-over, once per team (not lab teams): `{L} migrate-v54` renames the old `{t.integration}` "
             f"branch to `{landing_branch(t)}` by pointer, installs the hook, sets `{t.integration}` to `{t.base}`, "
             f"queues one recheck of every zone at `{landing_branch(t)}`'s tip and asks Kong for one backlog review per "
-            f"zone that changed between `{t.base}` and that tip. From then on, Stages 6 and 7 take only that tip or commits after it.")
+            f"zone that changed between `{t.base}` and that tip. From then on, Stages 6 and 7 take only that tip or commits after it."]
+    return lead + "\n\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
 
 
 def promotion_text(t):
@@ -1411,7 +1553,8 @@ def folders_section(t, team, name):
             rows.append((t.root / "workcrews", "Every lane and worker checkout; yours to work in when needed"))
     elif landing(t) and not team["lanes"][name].get("ref"):
         rows.append((t.root / "wo" / name, "Your work order trees, one per work order, cut from "
-                                            f"`{t.integration}` by codeteam when a lead starts; deleted when it lands."))
+                                            f"`{t.base if lab_lands(t) else t.integration}` by codeteam when a lead "
+                                            "starts; deleted when it lands."))
     else:
         r = team["lanes"][name]
         rows.append((lane_wt(t, name, r), f"Your lane worktree on `{lane_branch(t, name, r)}`. "
@@ -1433,7 +1576,7 @@ def folders_section(t, team, name):
                      f"`{t.cmd('retire')} {name} <feature>`.")
     steps += [f"Empty `{sp}`.",
               "Move finished items in `todo.md` and `issues.md` under `## Closed`, with the date.",
-              f"Move reports for promoted work into `{led / 'reports' / 'archive'}`."]
+              f"Move reports for {'landed' if lab_lands(t) else 'promoted'} work into `{led / 'reports' / 'archive'}`."]
     steps_txt = "\n".join(f"{i}. {x}" for i, x in enumerate(steps, 1))
     return ("\n## Your folders\n\nWork only in these folders.\n\n| Folder | Use |\n|---|---|\n"
             f"{table}\n\n## Housekeeping\n\nAfter each {'landing' if landing(t) else 'push-up'} or finished job, "
@@ -1510,7 +1653,7 @@ def render_roles(t, team):
             if t.batch else "4. Wait for each lane's DONE on its first task, and report the set to the user.")})
     if landing(t):
         orc = re.sub(r"- `push-up` runs the gate.*?\n- A lane that needs another lane's push runs `await`; codeteam wakes it\. You do not relay pushes\.",
-                     LAND_ORC_BULLETS.format(land=f"codeteam-land {t.manifest}").replace("\\", "\\\\"), orc, flags=re.S)
+                     land_orc_bullets(t).replace("\\", "\\\\"), orc, flags=re.S)
         orc = orc.replace(f"- When every push of a feature is on `{t.exchange}`, one REQUEST to {t.guard or t.orc_name()} naming "
                           "the feature and its lanes.\n", "")
     (outd / "orc.md").write_text(orc)
@@ -1552,8 +1695,11 @@ def render_roles(t, team):
                 walls += (" Never edit what other lanes own: " + ", ".join(theirs) + "." if len(theirs) <= 8 else
                           f" Never edit what other lanes own: every other lane's folder and owned files ({len(theirs)}).")
         if r.get("owns"):
+            if str(TOOL_DIR / "share") not in sys.path:
+                sys.path.insert(0, str(TOOL_DIR / "share"))
+            from codeteam_walls_owns import walls_owns
             walls = ((f"Files under `{r['path']}`, and these: " if r["path"] != "." else "These paths: ")
-                     + ", ".join(f"`{x}`" for x in r["owns"]))
+                     + walls_owns(r["owns"], t.manifest))
         if pinned:
             walls = f"Read-only checkout of `{lane_repo(t, r)}` at `{r['ref']}`"
         (outd / f"{n}.md").write_text(render(tpl.read_text(), {
@@ -1948,7 +2094,9 @@ def write_launch_script(t, name, cwd, display, agent, role, mode, model, sid, re
         env += f"export CODETEAM_ZONE='{team_lanes[name].get('path', '')}'\n"
         if team_lanes[name].get("test"):   # the lane's own zone-test command (zone.mk's ZONE_TEST)
             env += f"export ZONE_TEST={shlex.quote(team_lanes[name]['test'])}\n"
-        if team_lanes[name].get("owns"):   # more folders or files the lane owns (the zone guard reads them)
+        # More folders or files the lane owns. The zone guard reads the lane's owns from team.json first; this
+        # variable is its fallback.
+        if team_lanes[name].get("owns"):
             env += f"export CODETEAM_OWNS='{':'.join(team_lanes[name]['owns'])}'\n"
         env += f"export CODETEAM_EXCHANGE='{t.ex_wt()}'\n"
         env += f"export CODETEAM_SWT='{lane_wt(t, name, team_lanes[name])}'\n"
@@ -2107,27 +2255,20 @@ def tmux_attached(session) -> bool:
 
 
 def tmux_add(session, tab, script):
-    """Run the launch script as a tab named `tab` in tmux session `session`."""
+    """Run the launch script as a tab named `tab` in tmux session `session`. With no tmux server, Terminal starts it
+    when it can (share/codeteam_tmux_terminal_start.py says why); otherwise the server starts detached."""
     cmd = f"/bin/bash -l '{script}'"
+    if str(TOOL_DIR / "share") not in sys.path:
+        sys.path.insert(0, str(TOOL_DIR / "share"))
+    from codeteam_tmux_terminal_start import tmux_terminal_start
     if tmux("has-session", "-t", f"={session}").returncode == 0:
         r = tmux("new-window", "-d", "-t", f"={session}:", "-n", tab, cmd)
-    elif tmux("list-sessions").returncode != 0 and sys.platform == "darwin":
-        # macOS runs a process started from a background context (cron, an
-        # agent's shell) at a lower scheduling priority, and every pane inherits
-        # the tmux server's. Start the server from Terminal so the sessions get
-        # the same priority as a Terminal window.
-        args = " ".join(shlex.quote(x) for x in
-                        [TMUX, "-L", TMUX_SOCKET, "new-session", "-d", "-s", session, "-n", tab,
-                         "-x", "220", "-y", "60", cmd])
-        osa(f'tell application "{TERMINAL_APP}" to do script "{args.replace(chr(34), chr(92) + chr(34))}; exit"')
-        for _ in range(40):
-            if tmux("has-session", "-t", f"={session}").returncode == 0:
-                break
-            time.sleep(0.25)
-        r = tmux("has-session", "-t", f"={session}")
-        if r.returncode == 0:
-            tmux_setup()
     else:
+        r = tmux_terminal_start(session, tab, cmd, tmux=tmux, osa=osa, warn=warn, tmux_bin=TMUX, socket=TMUX_SOCKET,
+                                terminal_app=TERMINAL_APP, wait_s=TMUX_START_WAIT_S)
+        if r is not None:
+            tmux_setup()
+    if r is None:
         r = tmux("new-session", "-d", "-s", session, "-n", tab, "-x", "220", "-y", "60", cmd)
         if r.returncode == 0:
             tmux_setup()
@@ -3636,7 +3777,7 @@ def _rt():
 
 IDLE_SENDER = "codeteam"
 COMPACT_AFTER_H = float(os.environ.get("CT_COMPACT_HOURS", "3"))
-EXIT_AFTER_H = float(os.environ.get("CT_EXIT_HOURS", "6"))
+EXIT_AFTER_H = float(os.environ.get("CT_EXIT_HOURS", "1"))
 
 
 def registry_file(t):
@@ -3965,11 +4106,20 @@ def swap_out(t, team, n, now):
 
 
 def _lead_paths(t, n, ids):
-    """Worktree paths for the lead ids on a ledger row (lane requests/ first, then the store)."""
+    """Worktree paths for the lead ids on a ledger row: a path as written; else lane requests/, then (branch flow v5)
+    the lane's work order trees under <root>/wo/<lane>/ by the id as written or as agent-<id>, then the store. A row
+    staged with a work order's name or agent id, not its tree's full path, counts its lead (a
+    patrol once called a research lane SERIAL, '0 lead running', while two leads were live in their work order trees; the
+    rows still read 'queued · -', and a row staged with only the agent id would have found no tree either)."""
     out = []
-    for i in ids:
-        i = i if i.startswith("agent-") or "/" in i else f"agent-{i}"
-        for cand in (Path(i), t.lane_dir(n) / "requests" / i, Path(t.repo) / ".claude" / "worktrees" / i):
+    wo_root = Path(t.root) / "wo" / n if getattr(t, "root", None) else None
+    for raw in ids:
+        i = raw if raw.startswith("agent-") or "/" in raw else f"agent-{raw}"
+        cands = [Path(i), t.lane_dir(n) / "requests" / i]
+        if wo_root is not None and "/" not in raw:
+            cands += [wo_root / raw, wo_root / i]
+        cands.append(Path(t.repo) / ".claude" / "worktrees" / i)
+        for cand in cands:
             if cand.is_dir():
                 out.append(cand); break
     return out
@@ -3996,7 +4146,11 @@ def cmd_patrol(t: Team, args):
         if awake and len(queued) >= 2 and len(active) <= 1 and not (quiet is not None and quiet >= PATROL_IDLE_MIN):
             flags.append(f"{n}: SERIAL, {len(active)} lead running and {len(queued)} queued ({', '.join(queued[:4])})")
         if parked:
-            flags.append(f"{n}: {parked} ledger row(s) past queued with no live lead for a day or more; close or requeue them")
+            # The patrol skips a waiting row by the stage words only on a landing team; elsewhere by an awaited
+            # feature the stage names (lane_work).
+            hint = 'stage it "waits for <what>"' if landing(t) else 'await its feature and stage it "waiting <feature>"'
+            flags.append(f"{n}: {parked} ledger row(s) past queued with no live lead for a day or more; close or "
+                         f"requeue them (a row that waits on purpose: {hint}; a running lead's row names its tree)")
         if not awake and queued and not waiting_files(t, n):
             flags.append(f"{n}: ASLEEP WITH WORK, {len(queued)} queued and nothing in its inbox to wake it")
     # The branch rule: leftovers are reported the day they appear.
@@ -4026,8 +4180,8 @@ def cmd_patrol(t: Team, args):
 
 
 def cmd_tick(t: Team, args):
-    """Cron, hourly. 3 h idle: /compact. 6 h idle: /exit; if it stays, ask;
-    then a precise kill of the one recorded PID. Asleep sessions are cleaned."""
+    """Cron, hourly. 1 h idle: /exit; if it stays, ask; then a precise kill of the one recorded PID.
+    3 h idle: /compact, reached only when CT_EXIT_HOURS is set above CT_COMPACT_HOURS. Asleep sessions are cleaned."""
     rt = _rt()
     lock = cron_lock(t)
     team = load_team(t)
@@ -4328,8 +4482,14 @@ def branch_leftovers(t, team):
         return [l for l in r.stdout.splitlines() if l]
     keep = kept_branches(t, team)
     allow = ["pin/*", *t.m.get("branch_allow", [])]
-    checked_out = {l.split(" ", 1)[1].replace("refs/heads/", "") for l in lines("worktree", "list", "--porcelain")
-                   if l.startswith("branch ")}
+    trees = lines("worktree", "list", "--porcelain")
+    checked_out = {l.split(" ", 1)[1].replace("refs/heads/", "") for l in trees if l.startswith("branch ")}
+    if getattr(t, "root", None):
+        # An open work order's tree that the landing tool has detached for a set's check is still its work in progress.
+        if str(TOOL_DIR / "share") not in sys.path:     # once: the loop calls this on every patrol
+            sys.path.insert(0, str(TOOL_DIR / "share"))
+        from codeteam_detached_wo_branches import detached_wo_branches
+        checked_out |= detached_wo_branches(Path(t.root) / "land" / "wo", trees)
     local = {l.split()[1]: l.split()[0] for l in lines("for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads")}
     remote = {}
     for l in lines("ls-remote", "--heads", "origin"):
@@ -4527,9 +4687,10 @@ def git_error_line(result: subprocess.CompletedProcess) -> str:
 
 
 def branches_swept_by_loop(t: Team) -> bool:
-    """A team on codeteam v2 has its branch sweep in its loop's hourly backup (`sweep-branches`, after the push),
-    not in cron's `sweep`: git reaches GitHub from the loop, and from cron it has not since 2026-11-13 14:10 ("could
-    not read Username for 'https://github.com': Device not configured", every team)."""
+    """A team on codeteam v2 has its branch sweep in its loop's hourly backup (`sweep-branches`, after the push, or
+    alone when the loop pushes nothing: backup off, no origin), not in cron's `sweep`: git reaches GitHub from
+    the loop, and from cron it has not since 2026-11-13 14:10 ("could not read Username for 'https://github.com':
+    Device not configured", every team)."""
     return (t.home / "v2" / "up").exists()
 
 
@@ -5357,6 +5518,7 @@ def main():
     p("trust")
     p("link-guides")
     p("roles")
+    p("sync-lanes")
     sp = p("rotate")
     sp.add_argument("--hours", type=float, default=24)
     sp = p("watch")
@@ -5501,6 +5663,9 @@ def main():
      "snapshot": cmd_snapshot, "drop": cmd_drop, "sleep": cmd_sleep,
      "repin": cmd_repin, "trust": cmd_trust, "watch": cmd_watch,
      "link-guides": cmd_link_guides, "roles": cmd_roles, "rotate": cmd_rotate, "unit": cmd_unit,
+     # share/codeteam_sync_lanes.py, imported only when this command runs (as tm_exclude_team imports codeteam_tm).
+     "sync-lanes": lambda t, a: sys.path.insert(0, str(TOOL_DIR / "share")) or __import__("codeteam_sync_lanes")
+         .sync_lanes_command(t, a.manifest, discover_lanes, sync_lanes, load_team),
      "squash": cmd_squash, "backup": cmd_backup, "ready": cmd_ready, "register": cmd_register, "nudge": cmd_nudge, "await": cmd_await,
      "tick": cmd_tick, "wake": cmd_wake, "sweep": cmd_sweep, "sweep-accepted": cmd_sweep_accepted, "patrol": cmd_patrol, "compact-now": cmd_compact_now, "branch-audit": cmd_branch_audit, "sweep-branches": cmd_sweep_branches, "procreg": cmd_procreg,
      "approve": cmd_approve, "retire": cmd_retire, "accept": cmd_accept,

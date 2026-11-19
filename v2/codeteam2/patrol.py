@@ -1,7 +1,8 @@
 """codeteam v1's patrol, run by the v2 loop: what the orchestrator would otherwise learn only by asking.
 
-The checks are v1's (its lane ledgers through `lane_work`, its branch rule through `branch_leftovers`);
-only the source of a session's state changes, from v1's guesses to herdr's. Findings are recorded in
+The checks are v1's (its lane ledgers through `lane_work`, its branch rule through `branch_leftovers`), plus the
+landing tool's open work-order records, read once a round, whose live trees count as a lane's running leads;
+a session's state comes from herdr, not v1's guesses. Findings are recorded in
 team/v2/patrol.json, shown by `codeteam2 status` and the board, and the new ones ride along with the
 orchestrator's next prompt instead of waking it (spend analysis, 2026-10-25: Opus request leads
 waited 276 h in total; report stalls without waking the orchestrator each time).
@@ -11,7 +12,10 @@ import os
 import time
 from pathlib import Path
 
-READY = ("idle", "done")
+from .lane_lines import READY, lane_lines
+from .own_work_time import own_work_time
+from .team_idle import team_idle
+from .work_order_records import work_order_records
 
 TEXT = ("PATROL (codeteam, riding along): act on each line. IDLE WITH WORK or ASLEEP WITH WORK: send that lane "
         "its next queued request. DEAD LEAD: tell the lane its lead is gone and to start a new one from the lead's "
@@ -23,7 +27,7 @@ TEXT = ("PATROL (codeteam, riding along): act on each line. IDLE WITH WORK or AS
 STALL_MIN = 60          # a work order tree with work in it, untouched this long, with its coordinator asleep or idle
 REVIEW_WAIT_H = 2       # a Stage 3 review asked for this long ago and still not answered
 WAKES = ("STALLED WORK ORDER", "ASLEEP WITH WORK", "IDLE WITH WORK", "DEAD LEAD",
-         "REVIEW WAITING")      # findings that wake the orchestrator
+         "REVIEW WAITING", "TEAM IDLE WITH WORK")      # findings that wake the orchestrator
 
 
 # Free space on the machine's data volume, every team's builds and shells on it (it once filled
@@ -137,47 +141,32 @@ def running_lands(manifest):
     return landing_work_orders(listing, manifest)
 
 
-def stalled_work_orders(land_dir, status, st, pending, now, idle_min=20, stall_min=STALL_MIN, landing=frozenset()):
+def stalled_work_orders(land_dir, status, st, pending, now, idle_min=20, stall_min=STALL_MIN, landing=frozenset(),
+                        lab=False, held=frozenset(), records=None):
     """Branch flow v5 (a team once sat all day with a rework untouched since the morning, its coordinator
     asleep and the orchestrator idle, and nothing said so). One line per open work order that holds work (a commit of
     its own), is not queued for landing, is not held on purpose (`codeteam-land wo-hold`), has not changed
     for stall_min minutes, and whose zone's coordinator is asleep, or idle idle_min minutes, with no mail waiting. The
     line carries no changing number, so it is new once. A work order sent back by a landing conflict waits for the next
-    promote and is not stalled before it. A work order a live land names (`landing`, from running_lands) is not
-    stalled: Stage 2 changes nothing in its tree for the whole run."""
-    import json
-    import subprocess
-    from pathlib import Path
+    promote and is not stalled before it, except in a lab, which never promotes: there the landing tool tells it
+    to merge the base at once, so it is judged as any other. A work order a live land names (`landing`, from running_lands) is not
+    stalled: Stage 2 changes nothing in its tree for the whole run. Nor is one whose zone is in
+    `held`, the lanes the user holds (team/held/<lane>): that stops the whole lane, where wo-hold stops one work
+    order. records: the open work-order records already read this round (work_order_records); None reads them
+    from land_dir."""
     out = []
     promoted = None                     # the newest promote's time, read once and only for a bounced work order
-    for f in sorted(Path(land_dir, "wo").glob("*.json")):
-        if f.name.endswith((".landed.json", ".retired.json", ".bounce.txt")):
-            continue
-        try:
-            rec = json.loads(f.read_text())
-            tree, zone, wo = Path(rec["tree"]), rec["zone"], rec["wo"]
-        except (OSError, ValueError, KeyError):
-            continue
-        if (rec.get("queued") or rec.get("held") or wo in landing or not tree.is_dir() or zone == "orc"
-                or wo.startswith(("docs-", "revert-"))):
+    for rec in work_order_records(land_dir) if records is None else records:
+        tree, zone, wo = Path(rec["tree"]), rec["zone"], rec["wo"]
+        if (rec.get("queued") or rec.get("held") or zone in held or wo in landing or not tree.is_dir()
+                or zone == "orc" or wo.startswith(("docs-", "revert-"))):
             continue
         s = status.get(zone, "absent")
         quiet = (now - (st.get(zone, {}).get("state_since") or now)) / 60
         if pending.get(zone) or not (s == "absent" or (s in READY and quiet >= idle_min)):
             continue
-
-        def git(*a):
-            return subprocess.run(["git", "-C", str(tree), *a], capture_output=True, text=True, timeout=20).stdout
-        # Cheap on purpose (this runs inside the loop's tick, over every open tree): two small git calls, never a walk
-        # of the tree. Work = a commit of its own; the time of its last commit is when it last moved (the index file's
-        # time is no measure: any `git status` rewrites it).
-        try:
-            base = rec.get("base") or ""
-            own = git("rev-list", "--count", f"{base}..HEAD").strip() if base else "0"
-            if own in ("", "0"):
-                continue                    # no commit of its own: held on purpose, or left by a cancelled start
-            times = [float(git("log", "-1", "--format=%ct").strip() or 0)]
-        except (OSError, ValueError, subprocess.SubprocessError):
+        last = own_work_time(tree, rec.get("base") or "")
+        if last is None:
             continue
         # Sent back by a landing conflict (<wo>.bounce.txt) with no commit since: the landing tool told it to wait for
         # the landed work to be promoted, so it is not stalled until a promote is recorded after the bounce.
@@ -186,12 +175,12 @@ def stalled_work_orders(land_dir, status, st, pending, now, idle_min=20, stall_m
             bounced = Path(land_dir, "wo", f"{wo}.bounce.txt").stat().st_mtime
         except OSError:
             bounced = 0.0
-        if bounced >= max(times):
+        if bounced >= last and not lab:
             if promoted is None:
                 promoted = last_promote(land_dir)
             if promoted < bounced:
                 continue
-        if now - max(times) >= stall_min * 60:
+        if now - last >= stall_min * 60:
             out.append(f"{zone}: STALLED WORK ORDER {wo}, work in its tree ({tree}) and nothing changed for over "
                        f"{stall_min} min; its coordinator is {'asleep' if s == 'absent' else 'idle'} with no mail. "
                        "Send the lane its next step.")
@@ -199,40 +188,49 @@ def stalled_work_orders(land_dir, status, st, pending, now, idle_min=20, stall_m
 
 
 def findings(team, status, st, store, now=None):
-    """The patrol lines for a v2 team. status: key -> herdr state; st: the loop's state per session."""
+    """The patrol lines for a v2 team. status: key -> herdr state; st: the loop's state per session. A lane the user
+    holds (team/held/<lane>, read each round) gets no lane line, and its work orders count neither as stalled
+    nor as the team's open work. On a team with land/wo, its open work-order records are read once a round and given
+    to every lane's lines and to the stalled check; a failed read gives none."""
     from .team import v1
+    # v1 caches lsof's cwds per process and the loop loads v1 once: each round lists once, then reuses
+    v1._CWDS = None
     now = now or time.time()
     t, tj = team.t, team.team_json()
     pending = {}
     for m in store.pending(held=True):
         pending[m["target"]] = pending.get(m["target"], 0) + 1
     idle_min = v1.PATROL_IDLE_MIN
+    held = frozenset(n for n in tj["lanes"] if team.held(n))
     flags = []
+    records = []
+    try:
+        if (t.root / "land" / "wo").is_dir():
+            records = work_order_records(t.root / "land")
+    except Exception:      # a patrol never fails on one check
+        pass
     for n, r in sorted(tj["lanes"].items()):
-        rows, active, dead, parked, queued = v1.lane_work(t, n, r, now)
-        if not rows:
+        if n in held:
             continue
-        s = status.get(n, "absent")
-        awake = s != "absent"
-        quiet = (now - (st.get(n, {}).get("state_since") or now)) / 60 if s in READY else 0
-        if awake and quiet >= idle_min and not active and (queued or dead) and not pending.get(n):
-            flags.append(f"{n}: IDLE WITH WORK, idle {quiet:.0f} min, {len(queued)} queued ({', '.join(queued[:3])})")
-        for d in dead:
-            flags.append(f"{n}: DEAD LEAD on {d}, its worktree untouched {v1.PATROL_DEAD_MIN}+ min and nothing running in it")
-        if awake and len(queued) >= 2 and len(active) <= 1 and quiet < idle_min:
-            flags.append(f"{n}: SERIAL, {len(active)} lead running and {len(queued)} queued ({', '.join(queued[:4])})")
-        if parked:
-            flags.append(f"{n}: {parked} ledger row(s) past queued with no live lead for a day or more; close or requeue them")
-        if not awake and queued and not pending.get(n):
-            flags.append(f"{n}: ASLEEP WITH WORK, {len(queued)} queued and no mail to wake it")
+        flags += lane_lines(t, n, r, status, st, pending, now, idle_min, records=records)
     try:
         if (t.root / "land" / "wo").is_dir():
             flags += stalled_work_orders(t.root / "land", status, st, pending, now, idle_min,
-                                         landing=running_lands(team.manifest))
+                                         landing=running_lands(team.manifest), lab=bool(getattr(t, "lab", False)),
+                                         held=held, records=records)
     except Exception:      # a patrol never fails on one check
         pass
     try:
         flags += waiting_reviews(t.root / "land", now)
+    except Exception:      # a patrol never fails on one check
+        pass
+    try:
+        # A halted or ending team is idle on purpose (team/HALTED, `codeteam2 down`).
+        if (t.root / "land" / "wo").is_dir() and not getattr(team, "halted", lambda: False)() \
+                and not (team.dir / "down").exists():
+            line = team_idle(status, st, now, t.root / "land", held=held)
+            if line:
+                flags.append(line)
     except Exception:      # a patrol never fails on one check
         pass
     try:

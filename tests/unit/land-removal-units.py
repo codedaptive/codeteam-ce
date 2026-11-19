@@ -99,7 +99,7 @@ def test_public_api_and_security_changes_queue_for_review() -> None:
                              "changed_files": ["A/auth/store.rs"], "reach": ["A", "B"],
                              "check_integration": ["A", "B"], "interface_changes": {"open": ["B"]},
                              "api_delta": {"removed": ["fn open"], "changed": [], "added": []},
-                             "now": "queued-time", "tag_wo": None,
+                             "now": "queued-time", "tag_wo": None, "carried_check": None,
                              "git": SimpleNamespace(returncode=0)}
             for name, result in collaborators.items():
                 stack.enter_context(patch.object(cl, name, return_value=result))
@@ -108,11 +108,12 @@ def test_public_api_and_security_changes_queue_for_review() -> None:
             cl.cmd_land(team, SimpleNamespace(wo="api", with_=[], untested=False))
         entry = json.loads(next((directory / "queue").iterdir()).read_text())
         assert entry == {"wos": ["api"], "wo": "api", "tip": "tip", "base": "tip", "zones": ["A", "B"],
-                         "queued": "queued-time", "state": "waiting", "review": "pending"}
+                         "queued": "queued-time", "state": "waiting", "review": "pending",
+                         "integration": "owed", "files": ["A/auth/store.rs"]}
         assert rec["api"]["removed"] == ["fn open"]
         assert not {"blocking", "perkins", "review"} & rec.keys()
-        assert [call.args[1] for call in team.notify.call_args_list] == ["NOTE", "REQUEST", "REQUEST"]
-        assert [call.args[0] for call in team.notify.call_args_list] == ["Coord-B", "Kong", "Perkins"]
+        assert [call.args[1] for call in team.notify.call_args_list] == ["NOTE", "REQUEST"]
+        assert [call.args[0] for call in team.notify.call_args_list] == ["Coord-B", "Kong"]
 
 
 def test_feature_records_review_after() -> None:
@@ -237,11 +238,15 @@ def test_an_owned_folder_with_no_package_is_a_wall_not_a_test_root() -> None:
 
 
 def tooling_tree(tmp: str) -> tuple[Path, SimpleNamespace]:
-    """A tooling lane: path ".", owning plain folders that hold independent packages, and a top-level file."""
+    """acme's tooling lane: path ".", owning plain folders that hold independent packages (Swift, Python), a folder
+    that holds only a tests folder (scripts/repo_sync, no package), and a top-level file."""
     tree = Path(tmp)
-    for folder in ("tools/packager/Sources", "tools/guardian/tests", "scripts/repo_sync/tests", "scripts/bin"):
+    for folder in ("tools/packager/Sources", "tools/guardian/tests", "scripts/dependency_lines/tests",
+                   "scripts/repo_sync/tests", "scripts/bin"):
         (tree / folder).mkdir(parents=True)
-    (tree / "tools" / "packager" / "Package.swift").write_text("")
+    for package in ("tools/packager/Package.swift", "tools/guardian/Package.swift",
+                    "scripts/dependency_lines/pyproject.toml"):
+        (tree / package).write_text("")
     team = SimpleNamespace(m={"lanes": [{"name": "tooling", "path": ".", "owns": ["tools", "scripts", "Makefile"]}]},
                            zones={"tooling": ["tools", "scripts", "Makefile"]},
                            c=lambda key, default: ["tools/guardian"] if key == "skip_tests" else default)
@@ -252,13 +257,29 @@ def test_a_plain_owned_folder_runs_the_test_roots_holding_a_changed_file() -> No
     # A tooling lane's packages once ran at no landing stage.
     with tempfile.TemporaryDirectory(prefix="land-roots-") as tmp:
         tree, team = tooling_tree(tmp)
-        files = ["tools/packager/Sources/a.swift", "tools/packager/Package.swift", "scripts/repo_sync/tests/test_x.py",
-                 "scripts/bin/run.sh", "scripts/top.sh", "Makefile", "docs/x.md"]
-        assert cl.test_folders(team, tree, "tooling", "integration", files) == ["tools/packager", "scripts/repo_sync"]
+        files = ["tools/packager/Sources/a.swift", "tools/packager/Package.swift",
+                 "scripts/dependency_lines/tests/test_d.py", "scripts/bin/run.sh", "scripts/top.sh", "Makefile",
+                 "docs/x.md"]
+        assert cl.test_folders(team, tree, "tooling", "integration", files) == ["tools/packager",
+                                                                                "scripts/dependency_lines"]
         assert cl.zone_tests(team, tree, "tooling", "land", group="integration", files=files) == [
             ("tests tooling (tools/packager)", "make --no-print-directory zone-test-one DIR=tools/packager CLASS=land"),
-            ("tests tooling (scripts/repo_sync)",
-             "make --no-print-directory zone-test-one DIR=scripts/repo_sync CLASS=land")]
+            ("tests tooling (scripts/dependency_lines)",
+             "make --no-print-directory zone-test-one DIR=scripts/dependency_lines CLASS=land")]
+
+
+def test_a_folder_holding_only_a_tests_folder_below_a_plain_owned_folder_is_no_root() -> None:
+    # Acme's test command runs packages only, so DIR=scripts/repo_sync exits 2 and Stage 2 asked
+    # the lead for a unit record no command could make. Below a plain owned folder a root is a package or a crate.
+    with tempfile.TemporaryDirectory(prefix="land-roots-") as tmp:
+        tree, team = tooling_tree(tmp)
+        files = ["scripts/repo_sync/mapped_blob.py", "scripts/repo_sync/tests/test_zone_command_mapping.py"]
+        assert cl.changed_roots(tree, "scripts", files) == []
+        assert cl.test_folders(team, tree, "tooling", "unit", files) == []
+        assert cl.test_folders(team, tree, "tooling", "integration", files) == []
+        with patch.object(cl, "team_env", return_value={}), patch.object(cl.subprocess, "run") as make:
+            assert cl.unit_step_keys(team, tree, "tooling", files) == []
+        make.assert_not_called()
 
 
 def test_a_landing_that_changes_no_test_root_runs_none_and_skips_stand() -> None:
@@ -548,6 +569,7 @@ for test in (test_alpha_suite_has_no_runtime_limit, test_runner_waits_for_every_
              test_queue_runner_prunes_unchecked_entry_before_checked_entry,
              test_an_owned_folder_with_no_package_is_a_wall_not_a_test_root,
              test_a_plain_owned_folder_runs_the_test_roots_holding_a_changed_file,
+             test_a_folder_holding_only_a_tests_folder_below_a_plain_owned_folder_is_no_root,
              test_a_landing_that_changes_no_test_root_runs_none_and_skips_stand,
              test_a_whole_repo_path_or_a_folder_already_a_root_adds_nothing,
              test_unit_steps_and_their_evidence_keys_take_the_changed_roots,

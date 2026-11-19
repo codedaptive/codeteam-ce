@@ -1,18 +1,19 @@
-"""Integration: spec v5.2's hang rule end to end. `zone-tool test` runs a real child in a scratch git
-repo with a short hang window: a silent, idle child and the process under it are stopped and recorded HUNG (exit 124,
-`zone-test: HUNG:` on stderr); a child that keeps printing while idle runs past the window and passes.
+"""Integration (D281): spec v5.2's hang rule end to end (D314). `zone-tool test` runs a real child in a scratch git
+repo with a short hang window: a silent, idle child is stopped and recorded HUNG (exit 124, `zone-test: HUNG:` on
+stderr); a child that keeps printing while idle runs past the window and passes. That the process under a hung run is
+gone afterwards takes launchd reaping the orphan, a live OS service, so it is validation:
+tests/validation/hang-orphan-reaped.py (rule 11, S-33; codeteam-jj #4671).
 Joins: bin/zone-tool's cmd_test, share/codeteam_hang.py (tree CPU from proc_pid_rusage, the window), kill_tree, the
 record file and real processes. Skipped unless CODETEAM_TEST_GROUP=integration."""
 import json
 import os
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.skipif(os.environ.get("CODETEAM_TEST_GROUP", "unit") != "integration",
-                                reason="integration group only; run with CODETEAM_TEST_GROUP=integration")
+                                reason="integration group only (D281); run with CODETEAM_TEST_GROUP=integration")
 
 HOME = Path(__file__).resolve().parents[2]
 ZONE_TOOL = str(HOME / "bin" / "zone-tool")
@@ -42,28 +43,13 @@ def record(repo):
     return json.loads(path.read_text())
 
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def test_a_silent_idle_child_is_hung_and_its_tree_is_stopped(repo):
-    pidfile = repo / "grandchild.pid"
-    r = zone_test(repo, "/bin/sh", "-c", f"sleep 300 & echo $! > {pidfile}; wait")
+def test_a_silent_idle_child_is_hung_and_recorded(repo):
+    r = zone_test(repo, "/bin/sh", "-c", "sleep 300 & wait")
     assert r.returncode == 124, (r.returncode, r.stdout, r.stderr)
     assert "zone-test: HUNG:" in r.stderr
     rec = record(repo)
     assert (rec["result"], rec["exit"]) == ("HUNG", 124)
     assert rec["reason"].startswith("hung:")
-    grandchild = int(pidfile.read_text())
-    for _ in range(100):  # an orphan is reaped by launchd, not by us: give it the chance
-        if not alive(grandchild):
-            break
-        time.sleep(0.1)
-    assert not alive(grandchild), f"the sleep under the hung run (pid {grandchild}) is still running"
 
 
 def test_a_child_that_keeps_printing_runs_past_the_window_and_passes(repo):

@@ -48,8 +48,8 @@ class Walls:
     "path"; one that is not a dict is skipped); `zone_docs` is zone-docs.json (keys starting
     "_" are comments); `orchestrator_owns` is the manifest's top-level list of paths the
     orchestrator owns on every lane, matched as `owns` is; empty by default.
-    Methods: others, walled, in_area, owns_doc, and orchestrator_owned (is a path one the
-    orchestrator owns), which refused_by asks first."""
+    Methods: others, walled, in_area, owns_doc, lockfile, and orchestrator_owned (is a path one
+    the orchestrator owns), which refused_by asks first."""
     lane: str
     zone: str
     owns: tuple[str, ...]
@@ -67,6 +67,13 @@ class Walls:
         an exact file or a glob, also with case folded on both sides. It holds for every
         lane, whatever its zone, and reads nothing but this object."""
         return any(_matches(rel, p) or _matches(rel.casefold(), p.casefold()) for p in self.orchestrator_owns)
+
+    def lockfile(self, rel):
+        """True when rel is a lock file (its name is in LOCKFILES) the orchestrator does not own:
+        every lane may edit one anywhere, since its own builds change it. The landing
+        tool's wall check asks this too, so a work order may commit the lock its build
+        regenerates."""
+        return os.path.basename(rel) in LOCKFILES and not self.orchestrator_owned(rel)
 
     def walled(self):
         """A whole-repo lane (zone ".") on a team where other lanes own folders: it edits
@@ -152,7 +159,7 @@ def refused_by(rel: str, walls: Walls) -> str | None:
     if walls.orchestrator_owned(rel):
         return ORCHESTRATOR
     claim = walls._doc_claim(rel)
-    if os.path.basename(rel) in LOCKFILES or walls.owns_doc(rel):
+    if walls.lockfile(rel) or walls.owns_doc(rel):
         return None
     # A walled lane's area is "everything but the others'", so in_area alone would let it into a
     # reference doc named for another lane; a claimed doc goes to the claim's owner.

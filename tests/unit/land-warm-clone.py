@@ -4,12 +4,15 @@
 import importlib.machinery
 import importlib.util
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "share"))
+from codeteam_clean_idle_tree import CLEANED_DIRS  # noqa: E402  (what clean_idle removes)
 loader = importlib.machinery.SourceFileLoader("cl_warm", str(ROOT / "bin" / "codeteam-land"))
 cl = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
 with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=0)):
@@ -28,7 +31,7 @@ def test_target_is_not_cloned_and_cargo_target_is():
 
 
 def test_an_idle_tree_with_only_target_still_counts_as_build_output():
-    assert "target" in cl.BUILD_OUTPUT_DIRS and "target" not in cl.WARM_DIRS
+    assert "target" in CLEANED_DIRS and "target" not in cl.WARM_DIRS
 
 
 if __name__ == "__main__":

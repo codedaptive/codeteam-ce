@@ -333,6 +333,73 @@ def test_a2_conflict_names_landed_work_orders_and_keeps_tree():
         assert (team.dir / "wo" / "w.bounce.txt").read_text() == "A/value\n"
 
 
+
+def lab_team_at(root):
+    """A lab that lands (mode = "lab"): its integration and landing are its base."""
+    manifest = root / "lab.toml"
+    manifest.write_text(f'mode = "lab"\nrepo = "{root / "repo"}"\nworktree_root = "{root / "team"}"\n'
+                        'guard = "Kong"\n[[lanes]]\nname = "A"\npath = "A"\n[[lanes]]\nname = "B"\npath = "B"\n'
+                        '[land]\norchestrator = "Skippy"\n')
+    team = cl.Team(manifest)
+    team.notify = Mock()
+    return team
+
+
+def test_a2_a_lab_conflict_merges_the_base_at_once():
+    """A lab never promotes, so its lead is told to merge main now, not to wait for a promotion."""
+    with tempfile.TemporaryDirectory() as tmp:
+        team = lab_team_at(Path(tmp)); rec = work(team); p = review(team)
+        assert team.lab and team.integration == team.landing == "main"
+        e = json.loads(p.read_text()); e["review"] = "land"; p.write_text(json.dumps(e))
+        (team.dir / "landed.log").write_text(json.dumps({"hash": "X", "wos": ["older"], "range": "B..X"}) + "\n")
+        with patch.object(cl, "integration_holders", return_value=[]), patch.object(cl, "out", side_effect=lambda repo, *a: "L" if a[0] == "rev-parse" else "A/value"), \
+                patch.object(cl, "git", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+                patch.object(cl, "intervening_landings", return_value=[("older", ["A/value"])]), \
+                patch.object(cl, "merge_landing_member", return_value=(None, ["A/value"])):
+            assert cl.land_entry(team, p) == 2
+        text = team.notify.call_args.args[2]
+        assert all(s in text for s in ("A/value", "older", "on main already", "merge main now (wo-pull w)")), text
+        assert "promoted" not in text and "landing" not in text, text
+        assert Path(rec["tree"]).is_dir()
+
+
+def test_a_lab_review_notice_says_no_changelog_line_is_used():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert "write none" in cl.review_entry_notice(lab_team_at(Path(tmp)), "w1")
+
+
+def test_dependents_with_open_work_are_told_in_a_lab_and_left_to_promotion_elsewhere():
+    """Tell_dependents leaves a zone with an open work order to promotion's notice; a lab has none."""
+    for maker, told in ((lab_team_at, True), (team_at, False)):
+        with tempfile.TemporaryDirectory() as tmp:
+            team = maker(Path(tmp))
+            (team.root / "workcrews" / "B").mkdir(parents=True)
+            rec = {"wo": "w", "zone": "A", "tip": "T", "reach": ["B"]}
+            with patch.object(cl, "open_records", return_value=[(None, {"zone": "B"})]), \
+                    patch.object(cl, "reach", return_value=["A", "B"]), \
+                    patch.object(cl, "out", return_value="change A's SPEC"):
+                cl.tell_dependents(team, rec, "X" * 40, ["A/SPEC.md"])
+            f = team.root / "workcrews" / "B" / "ledger" / "reports" / "dependency-changes.md"
+            assert f.exists() is told, (maker.__name__, f.exists())
+
+
+def test_a_recheck_row_carries_the_files_the_landing_changed():
+    """Stage 5 takes the changed test roots from the recheck row's files, git's names for old..tip
+    (nothing asserted them)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        team = team_at(Path(tmp))
+        entry = {"wo": "w", "base": "B", "zones": ["A"], "tip": "T"}
+        calls = []
+        def out(repo, *args):
+            calls.append(args)
+            return "tools/pkg/Sources/a.swift\nA/value\n"
+        with patch.object(cl, "intervening_landings", return_value=[("older", ["A/value"])]), \
+                patch.object(cl, "out", side_effect=out):
+            assert cl.landing_recheck(team, entry, "OLD", "TIP") is True
+        rows = cl.read_recheck(team)
+        assert len(rows) == 1 and rows[0]["files"] == ["tools/pkg/Sources/a.swift", "A/value"], rows
+        assert ("diff", "--name-only", "OLD", "TIP") in calls, calls
+
 def test_a3_at_or_before_C_by_ancestry_never_clock():
     findings = [{"id": "future", "test": "A", "Ms": ["later"], "state": "open", "time": "invalid"},
                 {"id": "late-fix", "test": "B", "commits": ["M"], "state": "closed", "closed_at": "F2", "closed": "invalid"},
@@ -341,15 +408,17 @@ def test_a3_at_or_before_C_by_ancestry_never_clock():
         assert cl.unfixed_failures("C", findings, {"fix": "F"}, ancestor) == ["late-fix"]
 
 
-def test_a5_perkins_only_with_security_paths():
+def test_a5_stage3_is_kong_only():
+    import inspect
     with tempfile.TemporaryDirectory() as tmp:
         team = team_at(Path(tmp))
-        assert cl.stage3_reviewers(team, ["A/auth.py"]) == ["Kong"]
         team.cfg["security_paths"] = ["A/auth*", "secrets/**"]
-        assert cl.stage3_reviewers(team, ["A/auth.py"]) == ["Kong", "Perkins"]
-        assert cl.stage3_reviewers(team, ["B/value"]) == ["Kong"]
+        assert list(inspect.signature(cl.stage3_reviewers).parameters) == ["team"]
+        assert cl.stage3_reviewers(team) == ["Kong"]
+        team.cfg["security_paths"] = []
+        assert cl.stage3_reviewers(team) == ["Kong"]
         team.m["assistants"] = []
-        assert cl.stage3_reviewers(team, ["A/auth.py"]) == ["Kong"]
+        assert cl.stage3_reviewers(team) == ["Kong"]
 
 
 def test_a6_docs_stamp_queued_on_landing_without_waiting():

@@ -13,7 +13,21 @@ The model can't skip it: the trailers are added to the command by Claude Code be
 `--no-verify` does not affect `--trailer`."""
 import json, os, re, shlex, subprocess, sys
 
+sys.dont_write_bytecode = True          # no __pycache__ beside the hooks in production's checkout
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shell_text import code_only
+
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# `git [options] commit`: the subcommand commit itself, never commit-tree or commit-graph. A rewrite of
+# `git commit-tree <tree> -p <parent> -m ...` spliced the trailers into it and ran a porcelain commit under the
+# session's name instead (an upstream PR lead's commit, then mirrored by the backup).
+COMMIT = r"\bgit\b(?:\s+(?:-C|-c)\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+commit(?![\w-])"
+# ...where the shell runs it: at the start of the line or after a separator or `then`/`do`/`else`, past any
+# VAR=value prefixes and a path to git. Searched in shell_text.code_only's copy, so a `git commit` in a heredoc body,
+# a quoted string or a comment is text, not a command (the rewrite spliced trailers into a Python comment a
+# heredoc wrote, and into a message's words).
+RUNS = re.compile(r"(?:^|[;&|(\n{`]|\b(?:then|do|else)\b)\s*(?:[A-Za-z_]\w*=\S*\s+)*(?P<git>(?:[^\s;&|()<>]*/)?"
+                  + COMMIT + ")")
 
 def git(cwd, *a):
     r = subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True, timeout=10)
@@ -75,18 +89,34 @@ def load(gd):
             except ValueError: pass
     return p, out
 
-def commit_dir(cmd, cwd):
-    """The directory the commit runs in: `git -C <dir>`, else the last `cd <dir>` before it, else cwd."""
-    g = re.search(r"\bgit\b(?:\s+(?:-C|-c)\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+commit\b", cmd)
-    pre = cmd[:g.start()] if g else cmd
-    cds = re.findall(r"(?:^|[;&|(]\s*)cd\s+(\S+)", pre)
-    if cds:
-        cwd = os.path.join(cwd, os.path.expanduser(cds[-1].strip("'\"")))
-    return _git_c_dir(cmd, cwd)
+def running_commit(cmd):
+    """The (start, end) in cmd of the first `git commit` the shell runs (RUNS), or None."""
+    m = RUNS.search(code_only(cmd))
+    return m.span("git") if m else None
 
-def _git_c_dir(cmd, cwd):
-    m = re.search(r"\bgit\b(?:\s+(?:-c\s+\S+|--?[\w-]+(?:=\S+)?))*\s+-C\s+(\S+)(?:\s+(?:-c\s+\S+|--?[\w-]+(?:=\S+)?))*\s+commit\b", cmd)
+def commit_dir(cmd, cwd):
+    """The directory the commit runs in: `git -C <dir>`, else the last `cd <dir>` the shell runs before it, else cwd."""
+    span = running_commit(cmd)
+    if not span:
+        return cwd
+    cds = list(re.finditer(r"(?:^|[;&|(\n]\s*)cd\s+(\S+)", code_only(cmd)[:span[0]]))
+    if cds:
+        cwd = os.path.join(cwd, os.path.expanduser(cmd[slice(*cds[-1].span(1))].strip("'\"")))
+    return _git_c_dir(cmd[span[0]:span[1]], cwd)
+
+def _git_c_dir(git_cmd, cwd):
+    m = re.search(r"\s-C\s+(\S+)", git_cmd)
     return os.path.join(cwd, os.path.expanduser(m.group(1).strip("'\""))) if m else cwd
+
+def is_commit(cmd):
+    """True when the shell runs a `git commit` in cmd (RUNS), however the git options before it are written."""
+    return running_commit(cmd) is not None
+
+def add_trailers(cmd, add):
+    """cmd with any provenance trailer the model wrote itself removed, and add put after the `git commit` it runs."""
+    cmd = re.sub(r"""\s--trailer[\s=]+(?:'(?:Agent|Model|Effort|Worktree)\s*[:=][^']*'|"(?:Agent|Model|Effort|Worktree)\s*[:=][^"]*"|(?:Agent|Model|Effort|Worktree)[:=]\S*)""", "", cmd, flags=re.I)
+    span = running_commit(cmd)
+    return cmd[:span[1]] + add + cmd[span[1]:] if span else cmd
 
 def main():
     d = json.load(sys.stdin)
@@ -105,7 +135,7 @@ def main():
         with open(os.path.join(gd, "codeteam-provenance.jsonl"), "a") as fh:
             fh.write(json.dumps(rec) + "\n")
         return 0
-    if tool != "Bash" or not re.search(r"\bgit\b[^;&|]*\bcommit\b", inp.get("command", "")):
+    if tool != "Bash" or not is_commit(inp.get("command", "")):
         return 0
     cmd = inp["command"]; wd = commit_dir(cmd, cwd); gd, top = gitdir_of(wd)
     if not gd: return 0
@@ -122,10 +152,8 @@ def main():
             tr += ["--trailer", f"Agent: {a}", "--trailer", f"Model: {m or 'unknown'}", "--trailer", f"Effort: {e or 'unknown'}"]
         br = git(wd, "rev-parse", "--abbrev-ref", "HEAD")
         if br: tr += ["--trailer", f"Worktree: {br}"]
-        add = " " + " ".join(shlex.quote(x) for x in tr)
         # the model may not write its own provenance
-        cmd = re.sub(r"""\s--trailer[\s=]+(?:'(?:Agent|Model|Effort|Worktree)\s*[:=][^']*'|"(?:Agent|Model|Effort|Worktree)\s*[:=][^"]*"|(?:Agent|Model|Effort|Worktree)[:=]\S*)""", "", cmd, flags=re.I)
-        new = re.sub(r"(\bgit\b(?:\s+(?:-C|-c)\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+commit\b)", lambda m: m.group(1) + add, cmd, count=1)
+        new = add_trailers(cmd, " " + " ".join(shlex.quote(x) for x in tr))
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {**inp, "command": new}}}))
         return 0
     if ev == "PostToolUse":

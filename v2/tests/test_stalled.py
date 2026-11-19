@@ -118,6 +118,17 @@ class StalledTest(unittest.TestCase):
 
     # integration: tree() runs real git processes
     @integration_only
+    def test_a_bounced_work_order_in_a_lab_is_judged_at_once(self):
+        """A lab never promotes, and the landing tool tells its lead to merge main at once, so a bounce there
+        does not wait for a promote."""
+        self.tree("conflicted")
+        self.bounce("conflicted", 60)
+        out = patrol.stalled_work_orders(self.land, {}, {}, {}, self.now, lab=True)
+        self.assertEqual(len(out), 1)
+        self.assertIn("STALLED WORK ORDER conflicted", out[0])
+
+    # integration: tree() runs real git processes
+    @integration_only
     def test_work_after_a_bounce_is_judged_as_before(self):
         self.tree("resolved")                               # committed 120 min ago, after the bounce
         self.bounce("resolved", 180)
@@ -154,6 +165,29 @@ class StalledTest(unittest.TestCase):
 ACME = "/home/u/codeteam/teams/acme.toml"
 PY = "/opt/homebrew/Cellar/python@3.15/3.15.0_1/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python"
 LAND = "/home/u/codeteam/bin/codeteam-land"
+
+
+class PatrolHeldStalledTest(unittest.TestCase):
+    def test_patrolheld_work_order_is_not_stalled(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            land = root / "land"
+            (land / "wo").mkdir(parents=True)
+            tree = root / "tree"
+            tree.mkdir()
+            (land / "wo" / "rework.json").write_text(json.dumps({
+                "wo": "rework", "zone": "eventlog", "tree": str(tree), "base": "base"}))
+
+            def git(args, **kwargs):
+                return SimpleNamespace(stdout="1" if "rev-list" in args else "1000000")
+
+            with patch("subprocess.run", side_effect=git):
+                lines = patrol.stalled_work_orders(land, {}, {}, {}, 2_000_000_000.0)
+                self.assertEqual(len(lines), 1)
+                self.assertIn("eventlog: STALLED WORK ORDER rework", lines[0])
+                self.assertEqual(patrol.stalled_work_orders(land, {}, {}, {}, 2_000_000_000.0,
+                                                          held=frozenset({"eventlog"})), [])
 
 
 class LandingWorkOrdersTest(unittest.TestCase):

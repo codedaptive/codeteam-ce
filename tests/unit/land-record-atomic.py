@@ -4,7 +4,8 @@ save_record writes a temporary file of the writer's own, flushes it to
 disk and moves it into place; a write that fails removes its temporary file. save_wo and wo-retire's .retired.json use
 it. open_records, clean_idle and Team.wo skip or refuse a record a concurrent retire removed between the listing and
 the read. A failing write is simulated by os.fsync raising ENOSPC; a vanished record by read_text raising
-FileNotFoundError for it."""
+FileNotFoundError for it. The unit tests (rule 11); the test of two writers at once is in
+tests/integration/land-record-atomic.py."""
 import importlib.machinery
 import importlib.util
 import json
@@ -13,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -108,22 +108,6 @@ def test_a_save_is_on_disk_before_it_replaces_the_record():
         shutil.rmtree(d)
 
 
-def test_two_writers_never_share_a_temporary_file():
-    d = scratch()
-    try:
-        names, real_replace = [], Path.replace
-        with patch.object(Path, "replace", lambda self, to: (names.append(self.name), real_replace(self, to))[1]):
-            writers = [threading.Thread(target=cl.save_record, args=(d / "r.json", {"n": n})) for n in range(2)]
-            for w in writers:
-                w.start()
-            for w in writers:
-                w.join()
-        assert len(names) == 2 and names[0] != names[1], names
-        assert json.loads((d / "r.json").read_text())["n"] in (0, 1)
-    finally:
-        shutil.rmtree(d)
-
-
 def test_a_retire_cut_short_leaves_no_torn_retired_record():
     d = scratch()
     try:
@@ -131,6 +115,7 @@ def test_a_retire_cut_short_leaves_no_torn_retired_record():
         team.save_wo({"wo": "a", "zone": "cli", "tree": str(d / "gone"), "branch": "wo/cli/a"})
         a = SimpleNamespace(wo="a", force=False, reason=None)
         with patch.object(cl, "entry_path", return_value=None), \
+                patch.object(cl, "codegraph_unregister", create=True), \
                 patch.object(cl, "git", return_value=SimpleNamespace(stdout="", stderr="", returncode=0)), \
                 patch.object(os, "fsync", full_disk):
             try:
@@ -180,7 +165,7 @@ def test_idle_clean_skips_a_record_gone_since_the_listing():
     try:
         team = FakeTeam(d)
         team.save_wo({"wo": "b", "zone": "v2", "tree": str(d / "no-tree")})
-        with patch.object(Path, "read_text", vanishing("b.json")):
+        with patch.object(Path, "read_text", vanishing("b.json")), patch.object(cl, "process_cwds", return_value=[]):
             cl.clean_idle(team)
     finally:
         shutil.rmtree(d)
@@ -204,7 +189,7 @@ def test_a_work_order_gone_since_it_was_named_is_unknown_not_a_crash():
 
 if __name__ == "__main__":
     for fn in (test_a_save_cut_short_leaves_the_old_record_whole_and_no_temporary_file, test_a_save_leaves_only_the_record,
-               test_a_save_is_on_disk_before_it_replaces_the_record, test_two_writers_never_share_a_temporary_file,
+               test_a_save_is_on_disk_before_it_replaces_the_record,
                test_a_retire_cut_short_leaves_no_torn_retired_record, test_a_retire_keeps_the_whole_record_as_retired,
                test_open_records_skip_a_record_gone_since_the_listing_or_one_that_does_not_parse,
                test_idle_clean_skips_a_record_gone_since_the_listing,

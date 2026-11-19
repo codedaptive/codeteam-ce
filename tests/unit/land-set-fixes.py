@@ -40,7 +40,7 @@ def finding(fid, time, by="Kong", wo="port"):
 
 
 def ranges(findings, rec=PORT, members=None, reviewers=("Kong",), commits=COMMITS):
-    """reviewer_ranges for the port with nothing unseen; `reviewers` is who stage3_reviewers names for any files."""
+    """reviewer_ranges for the port with nothing unseen; `reviewers` is who stage3_reviewers names."""
     def review_range(team, tip, seen):
         return [] if seen else list(commits.get(tip, {}))
 
@@ -85,7 +85,7 @@ def test_a_claim_whose_commits_all_came_before_the_finding_is_refused():
 
 
 def test_a_partner_fix_the_findings_reviewer_does_not_review_is_refused():
-    # Perkins reviews only security paths: data's test files bring Kong alone, so Perkins never sees the fix.
+    # The patched reviewer set stands for whoever stage3_reviewers names for the partner's fix.
     assert refused([finding("f#2", T2, by="Perkins")], members=[PORT, DATA], reviewers=("Kong",))
 
 

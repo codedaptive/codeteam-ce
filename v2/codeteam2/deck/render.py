@@ -12,6 +12,11 @@ import datetime as dt
 import functools
 import math
 
+from .build_shown import build_shown
+from .class_chips import class_chips
+from .job_strip import job_strip
+from .teams_chips import teams_chips
+
 SPARK = "▁▂▃▄▅▆▇█"
 # The partial cell of an eighth-block bar, one to seven eighths.
 EIGHTHS = "▏▎▍▌▋▊▉"
@@ -733,36 +738,35 @@ def _class_rows(classes):
 
 
 def _build_rows(builds, body, motion=False):
-    """BUILDS body rows laid out against body cells; [] unless running or queued jobs, waits,
-    a live runner or warms exist."""
+    """BUILDS body rows laid out against body cells: the job strip, the counts, the runner, the teams row (a live
+    runner with per-team counts only), the class chips, the running and queued jobs, the waits and the warms. []
+    unless running or queued jobs, waits, a live runner or warms exist."""
     builds = _mapping(builds)
     queue = _mapping(builds.get("queue"))
     runner = _mapping(queue.get("runner"))
     classes, running, queued = _queue_jobs(queue)
     warms = _dicts(builds.get("warms"))
-    active = any((_num(_mapping(c.get("waits")).get("n")) or 0) > 0 for c in classes)
-    if not (running or queued or active or runner.get("state") == "live" or warms):
+    waits = _class_rows(classes)
+    if not build_shown(running, queued, waits, runner, warms):
         return []
-    sweep = "~sweep" if motion and running else None
-    strip = _tag(_c("█" * len(running), "green"), sweep) + _c("█" * len(queued), "faint")
+    strip = job_strip(len(running), len(queued), motion)
+    teams = teams_chips(runner)
     rows = [_clip(strip, body) if body < _len(strip) else strip,
             _c(f"■ {len(running)} running", "green") + _c(f"   ■ {len(queued)} queued", "dim"),
-            _runner_part(runner, motion)]
-    chips = [_c(c.get("class") or "?", "teal bold")
-             + _c(f" {len(_dicts(c.get('running')))}/{'∞' if c.get('ceiling') == 0 else _g(c.get('ceiling'))}", "dim")
-             for c in classes]
-    rows.append(_listed(chips, body, "  "))
+            _runner_part(runner, motion), *([_listed(teams, body, "  ")] if teams else []),
+            _listed(class_chips(classes, _g, _dicts), body, "  ")]
     rows += [_running_row(j, body) for j in sorted(running, key=lambda j: -(_num(j.get("running_s")) or 0))]
     rows += [_queued_row(j, body) for j in queued]
-    rows += _class_rows(classes)
+    rows += waits
     rows += [_c(f"warm {w.get('state') or '?'} {_dur(w.get('elapsed_s'))} {_tail(w.get('worktree'), PATH_CAP)}", "dim")
              for w in warms]
     return rows
 
 
 def _builds(builds: dict) -> list[Row]:
-    """BUILDS body rows for running and queued jobs, runner, class limits, waits and warms (no width;
-    the box lays them out against its body). Ignores malformed queue entries and never reads runner load fields."""
+    """BUILDS body rows for running and queued jobs, runner, per-team counts, class limits, waits and warms (no
+    width; the box lays them out against its body). Ignores malformed queue entries and never reads runner load
+    fields."""
     return _build_rows(builds, math.inf)
 
 

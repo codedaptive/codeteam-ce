@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -u
 """A landing step's record carries its build-queue wait apart from its seconds: zone-tool
-prints the wait just before a queue job's summary line, and codeteam-land reads it from there. Nothing runs and no
-file is read: the queue folder given to print_done does not exist."""
+prints the wait just before a queue job's summary line, and codeteam-land reads it from there. Stage 2 and recheck
+rows also retain known run times, including zero. The queue folder given to print_done does not exist."""
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -89,10 +89,37 @@ def test_stage2_and_recheck_rows_carry_the_wait_only_when_there_was_one():
                      {"name": "v2", "result": "pass", "seconds": 3.0}]
 
 
+def test_landing_reads_step_timing():
+    assert callable(cl.codeteam_step_timing.step_timing)
+
+
+def test_stage2_rows_carry_ran_independently_of_queued():
+    results = [{"name": "job", "outcome": "PASS", "seconds": 20.0, "queued": 12, "ran": 7},
+               {"name": "cached", "outcome": "PASS", "seconds": 3.0, "ran": 0},
+               {"name": "plain", "outcome": "PASS", "seconds": 2.0}]
+    assert cl.stage2_record(results) == [
+        {"step": "job", "result": "pass", "seconds": 20.0, "queued": 12, "ran": 7},
+        {"step": "cached", "result": "pass", "seconds": 3.0, "ran": 0},
+        {"step": "plain", "result": "pass", "seconds": 2.0}]
+
+
+def test_integration_rows_carry_ran_independently_of_queued():
+    results = [{"name": "job", "outcome": "PASS", "seconds": 20.0, "queued": 12, "ran": 7},
+               {"name": "cached", "outcome": "PASS", "seconds": 3.0, "ran": 0},
+               {"name": "plain", "outcome": "PASS", "seconds": 2.0}]
+    row = {"M": "m", "wo": "w", "overlapping": [], "zones": ["cli"]}
+    assert cl.integration_result(row, results, "now")["tests"] == [
+        {"name": "job", "result": "pass", "seconds": 20.0, "queued": 12, "ran": 7},
+        {"name": "cached", "result": "pass", "seconds": 3.0, "ran": 0},
+        {"name": "plain", "result": "pass", "seconds": 2.0}]
+
+
 if __name__ == "__main__":
     for fn in (test_a_job_that_ran_prints_its_wait_just_before_its_summary, test_an_answered_job_prints_no_wait,
                test_a_job_with_no_start_time_prints_no_wait, test_the_wait_is_read_from_the_line_before_a_summary,
                test_two_jobs_in_one_step_add_up, test_a_wait_line_not_followed_by_a_summary_is_not_counted,
-               test_stage2_and_recheck_rows_carry_the_wait_only_when_there_was_one):
+               test_stage2_and_recheck_rows_carry_the_wait_only_when_there_was_one,
+               test_landing_reads_step_timing, test_stage2_rows_carry_ran_independently_of_queued,
+               test_integration_rows_carry_ran_independently_of_queued):
         fn()
     print("all passed")

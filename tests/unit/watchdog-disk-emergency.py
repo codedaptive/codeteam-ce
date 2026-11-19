@@ -185,13 +185,19 @@ class Order(unittest.TestCase):
             raise OSError(28, "No space left on device")
 
         out = io.StringIO()
-        with (patch.object(wd, "sweep_queue", side_effect=lambda: ran.append("queue")),
-              patch.object(wd, "disk_emergency", side_effect=fail),
-              patch.object(wd, "sweep_disk", side_effect=lambda: ran.append("disk")),
-              patch.object(wd, "check_teams", side_effect=lambda: ran.append("teams")),
-              contextlib.redirect_stdout(out)):
-            wd.check()
-        self.assertEqual(ran, ["queue", "emergency", "disk", "teams"])
+        with tempfile.TemporaryDirectory() as tmp:
+            with (patch.object(wd, "sweep_queue", side_effect=lambda: ran.append("queue")),
+                  patch.object(wd, "disk_emergency", side_effect=fail),
+                  patch.object(wd, "sweep_disk", side_effect=lambda: ran.append("disk")),
+                  patch.object(wd, "sweep_stale_targets", side_effect=lambda *a, **k: ran.append("stale")),
+                  patch.object(wd, "prune_reused_trees", side_effect=lambda *a, **k: ran.append("prune"), create=True),
+                  patch.object(wd, "manifests", return_value=[]),
+                  patch.object(wd, "free_gb", return_value=200),
+                  patch.dict(os.environ, {"CODETEAM_QUEUE_DIR": str(Path(tmp) / "queue")}),
+                  patch.object(wd, "check_teams", side_effect=lambda: ran.append("teams")),
+                  contextlib.redirect_stdout(out)):
+                wd.check()
+        self.assertEqual(ran, ["queue", "emergency", "disk", "stale", "prune", "teams"])
         self.assertIn("disk_emergency failed: OSError", out.getvalue())
 
 

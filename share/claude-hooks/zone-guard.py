@@ -4,8 +4,18 @@ agent it starts, works in its own zone and nowhere else. The whole repo is in th
 lane's worktree only so its zone can build; nothing outside the zone is the lane's
 to edit, build alone, test or run.
 
-Acts for a lane session only (CODETEAM_SWT and CODETEAM_SESSION set), so Orc, the
-assistants and other teams pass straight through. A lane on a zone (not ".") gets
+Acts for a lane session (CODETEAM_SWT and CODETEAM_SESSION set), and in pretool for the
+orchestrator's session (ORC_ZONE: CODETEAM_SESSION "orc", a manifest, no CODETEAM_SWT:
+the orchestrator holds no code package and runs no coders). The orchestrator's writes (edits,
+shell writes, git rm, mv, restore, checkout, clean, reset --hard/--merge/--keep, stash
+push/save/pop/apply/branch) inside a code package folder, or on a folder holding one, are
+refused with the lane that should own it (orc_package_refusal.py, orc_git_refusal.py), so a
+bare `git stash` in a tree holding a package is refused; its git merge, its other git
+commands, make, test and build commands are not checked, and the manifest's
+orchestrator_owns is never read for it. The check refuses what it recognises; its accepted
+limits (the fail-open forms below, interpreter writes, git aliases, exclude pathspecs, git
+merge, git add, a branch switch by git switch or checkout <branch>) are listed in orc_package_refusal.py. The assistants and other teams pass straight through. A lane on a
+zone (not ".") gets
 everything below. A whole-repo lane (zone ".") with other lanes' folders to respect
 (a walled lane) may run and build anything; its edits and shell writes are walled, it
 gets the git checks (the scratch-clone refusal, the paths of git add, rm and mv),
@@ -21,7 +31,8 @@ event (argv[1]):
             (exit 2; the reason goes back to the agent). A walled lane is not
             refused the make, test or build; for an unwalled whole-repo lane only a
             write to an orchestrator_owns path is refused (an edit, a shell write, git
-            add, rm or mv); its other git commands are not checked.
+            add, rm or mv); its other git commands are not checked. For the
+            orchestrator only a write in or on a code package folder is refused.
   context   PostToolUse. At 70% of the context window, tells the session to write
             its handoff (/prepare-for-compact) and posts the same as a message.
   stop      Stop. After the handoff ("Ready. Run /compact now."), has codeteam run
@@ -49,7 +60,11 @@ import sys
 import time
 from pathlib import Path
 
+from lane_own_owns import lane_own_owns                          # the lane's current owns, team.json first
+from make_dir_refusal import make_dir_refusal                    # the item of a relative DIR refused
 from lane_walls import OWNED_DOC_DIRS, load_walls, refused_by   # the ownership rule, shared with push-up
+from orc_git_refusal import orc_git_refusal                      # the orchestrator's git rm, mv and worktree writes
+from orc_package_refusal import orc_package_refusal              # its writes: code package folders
 
 HOME = Path.home()
 ZONE = os.environ.get("CODETEAM_ZONE", "").strip().strip("/")
@@ -67,12 +82,15 @@ TEAM_ROOT = LANE_DIR.parent.parent if LANE_DIR else None
 # The guard applies inside the team workspace and the codeteam checkout; paths elsewhere are free.
 PROTECTED = [str(WORKSPACE), str(CT_HOME)]
 PREPARE_AT = float(os.environ.get("CT_CTX_PREPARE", "0.70"))
-# More paths the lane owns besides its zone folder (the manifest's `owns`; globs allowed).
-OWNS = [x.strip().strip("/") for x in os.environ.get("CODETEAM_OWNS", "").split(":") if x.strip()]
+# The launch-time copy of the lane's `owns` (globs allowed): only the fallback when team.json has none (lane_rule).
+ENV_OWNS = os.environ.get("CODETEAM_OWNS", "").split(":")
 PRODUCT = TEAM_ROOT.name.removeprefix("team-") if TEAM_ROOT else "team"
 ORC = f"Orc-{PRODUCT[:1].upper()}{PRODUCT[1:]}"
 # MCP tool names (substrings, comma-separated) that count as filing a note after a push; empty: no note check.
 NOTE_TOOLS = [x.strip() for x in os.environ.get("CODETEAM_NOTE_TOOLS", "").split(",") if x.strip()]
+# The orchestrator's own session, as codeteam launches it: its writes in or on a code
+# package folder are refused (git rm, mv and the worktree writes too, not merge), nothing else.
+ORC_ZONE = LANE == "orc" and not SWT and bool(os.environ.get("CODETEAM_MANIFEST"))
 
 # Unconditionally listed lane targets at the repo root; scoped targets and the
 # zone's configured targets are checked separately before other targets are refused.
@@ -116,7 +134,8 @@ def walls():
 
 
 def orc_only():
-    """An unwalled whole-repo lane (zone ".") on a team whose manifest sets orchestrator_owns:
+    """An unwalled whole-repo lane session (zone ".", with its own worktree) on a team whose
+    manifest sets orchestrator_owns; not the orchestrator's own session, which is ORC_ZONE:
     it is refused only writes to those paths: edits, shell writes and git add, rm
     and mv. git restore, checkout, commit, push and other git subcommands are not checked, and
     no zone fence, test route, make or build check applies to it."""
@@ -127,12 +146,13 @@ _WALLS = None
 
 
 def lane_rule():
-    """The lane's ownership facts (lane_walls.Walls), built on first use, never at import."""
+    """The lane's ownership facts (lane_walls.Walls), built on first use, never at import. Its owns
+    are team.json's for the lane (it follows the manifest, refreshed at promote), else CODETEAM_OWNS."""
     global _WALLS
     if _WALLS is None:
-        _WALLS = load_walls(lane=LANE, zone=ZONE, owns=OWNS,
-                            team_json=TEAM_ROOT / "team" / "team.json" if TEAM_ROOT else None,
-                            codeteam_home=CT_HOME, manifest=manifest())
+        team_json = TEAM_ROOT / "team" / "team.json" if TEAM_ROOT else None
+        _WALLS = load_walls(lane=LANE, zone=ZONE, owns=lane_own_owns(team_json, LANE, ENV_OWNS),
+                            team_json=team_json, codeteam_home=CT_HOME, manifest=manifest())
     return _WALLS
 
 
@@ -167,7 +187,7 @@ def rule_text():
                 + ", ".join(f"`{x}` ({n})" for n, x in other_owned()) +
                 f". A change one of them needs goes to {ORC} as a NOTE naming the file and what it needs; "
                 "the lane that owns it makes it. A guard refuses edits there.")
-    own = ", ".join(f"`{x}`" for x in [ZONE, *OWNS])
+    own = ", ".join(f"`{x}`" for x in [ZONE, *lane_rule().owns])
     return (f"You work for the {LANE} lane, in zone {own}, and nowhere else. Edit, build and test "
             "only what is there" + DOC_EXCEPTION + ". When other code needs a change, say so in your report (the lane sends "
             f"{ORC} a NOTE naming the file and what it needs): its own lane does that work. "
@@ -380,7 +400,8 @@ def refuses_write(p):
     (orc_only) is refused only an orchestrator_owns path that classify calls "outside", so its
     "own" carve-outs (scratchpad, ledger, .claude, untracked top files, ...) and its "free"
     (outside the workspace and the codeteam checkout) hold as for any lane. Any other lane is refused what
-    classify calls "outside"."""
+    classify calls "outside". The orchestrator (ORC_ZONE) is judged in check_write and
+    check_git instead."""
     if orc_only():
         return orchestrator_owned_path(p) and classify(p) == "outside"
     return classify(p) == "outside"
@@ -392,7 +413,11 @@ def check_write(path, cwd, how):
     if cwd is None and not os.path.isabs(os.path.expanduser(path)):
         return   # after `cd $VAR` the folder is unknown
     p = resolve(path, cwd)
-    if refuses_write(p):
+    if ORC_ZONE:   # Refused only in or on a code package folder, with the lane that should own it
+        why = orc_package_refusal(p, manifest(), str(CT_HOME))
+        if why:
+            deny(f"{how} `{p}`: {why}")
+    elif refuses_write(p):
         deny(f"{how} `{p}`")
 
 
@@ -559,7 +584,9 @@ def check_make_vars(vars_: dict[str, str]) -> None:
 def check_make_dir(vars_: dict[str, str], mdir: str | None, root: str, rel_m: str | None) -> bool:
     """Check DIR against lane boundaries; return True for a DIR containing '$'.
 
-    True makes the caller skip the own-Makefile and target checks as well.
+    True makes the caller skip the own-Makefile and target checks as well. A relative
+    DIR is refused at the first item make_dir_refusal names: the DIR itself, or for a
+    comma list of dotted Python names an item whose module file is missing or outside.
     """
     if "DIR" in vars_:
         d = vars_["DIR"].strip().rstrip("/") or "."
@@ -570,9 +597,9 @@ def check_make_dir(vars_: dict[str, str], mdir: str | None, root: str, rel_m: st
                 deny(f"make DIR={d}")
         else:
             base = mdir if (rel_m and in_zone_rel(rel_m)) else root
-            rel = os.path.relpath(resolve(d, base), root)
-            if not in_zone_rel(rel):
-                deny(f"make DIR={d}")
+            item = make_dir_refusal(d, base, root, in_zone_rel)
+            if item is not None:
+                deny(f"make DIR={item}")
     return False
 
 
@@ -704,8 +731,15 @@ def check_git(args, cwd, envs=None):
     # find -exec. Other ways to make or move commits (merge, cherry-pick,
     # commit-tree, send-pack, a pull from the clone into the worktree) are
     # outside this rule and not refused here. An unwalled whole-repo lane is not
-    # checked for it.
+    # checked for it, nor is the orchestrator, judged by orc_git_refusal below instead.
+    # For the orchestrator SWT is "", so with gcwd None (a variable -C or cd) where[0] is "";
+    # the orc_* helpers take gcwd None as an unknown folder and pass, never resolving it.
     where = [gcwd or SWT] + [resolve(o, gcwd or SWT) for o in others if "$" not in o]
+    if ORC_ZONE:   # Rm, mv and the worktree writes, in or on a code package folder
+        why = orc_git_refusal(args[i], args[i + 1:], gcwd, where, manifest(), str(CT_HOME))
+        if why:
+            deny(why)
+        return
     if not orc_only() and any(in_lane_scratch(w) for w in where):
         sub = args[i]
         if sub == "config":
@@ -792,9 +826,9 @@ def check_segment(seg, cwd):
         check_test_route(words)
     if cmd == "eval":
         check_command(" ".join(args), cwd)
-    elif (walls() or orc_only()) and (cmd in ("make", "gmake", "cargo", "swift", "xcodebuild", *DIR_HELPERS)
-                                      or cmd.startswith("python")):
-        pass        # a whole-repo lane runs and builds anything; only its writes are checked (walled: another lane's folders, orc_only: orchestrator_owns)
+    elif (ORC_ZONE or walls() or orc_only()) and (cmd in ("make", "gmake", "cargo", "swift", "xcodebuild", *DIR_HELPERS)
+                                                  or cmd.startswith("python")):
+        pass        # the orchestrator and a whole-repo lane run and build anything; only their writes are checked (walled: another lane's folders, orc_only: orchestrator_owns, ORC_ZONE: code package folders)
     elif cmd in ("make", "gmake"):
         check_make(args, cwd, envs)
     elif cmd in ("cargo", "swift", "xcodebuild"):
@@ -925,6 +959,9 @@ def mode_pretool(d):
         sys.exit(2)
     if why:
         log("block", why)
+        if ORC_ZONE:   # why carries orc_package_refusal's reason and the lane
+            print(f"Zone guard: {why}", file=sys.stderr)
+            sys.exit(2)
         if orc_only():
             print(f"Zone guard: {why} belongs to the orchestrator ({ORC}): the team manifest's "
                   f"orchestrator_owns names it ({LANE} lane). A change there goes to {ORC} as a NOTE "
@@ -1186,10 +1223,11 @@ def mode_subagent(d):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     # walls() already builds lane_rule() (team.json, zone-docs.json, the manifest TOML, cached in
-    # _WALLS) for every "." lane session, so orc_only() adds no reads; on a manifest without
-    # orchestrator_owns it is False and the pretool hook returns early.
+    # _WALLS) for every "." lane session, so orc_only() adds no reads; an unwalled "." lane
+    # session on a manifest without orchestrator_owns gets no pretool hook. ORC_ZONE (the
+    # orchestrator's session) reads only the environment and gets the pretool hook.
     if not (active() or (walls() and mode in ("pretool", "subagent"))
-            or (orc_only() and mode == "pretool")
+            or ((orc_only() or ORC_ZONE) and mode == "pretool")
             or (lane_session() and mode in ("context", "stop", "start"))
             or (staff_session() and mode in ("context", "stop"))):
         return

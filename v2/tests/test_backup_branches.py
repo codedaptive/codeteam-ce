@@ -6,6 +6,12 @@ import pytest
 
 from test_v2 import FakeTeam, Runtime        # puts v2/ on sys.path
 from codeteam2.team import CT_HOME
+from conftest import integration_module  # noqa: E402
+
+# integration: every case here runs real git (the repo fixture; backup_runtime's remote and v1's git calls) or
+# /bin/sh over fake tools on PATH (rule 11). The job's own choices are unit-tested in
+# test_backup_sweep.py.
+pytestmark = integration_module
 
 
 def git(repo, *args):
@@ -118,21 +124,24 @@ def test_a_manifest_outside_teams_with_nothing_to_push_starts_nothing(repo, monk
 
 
 def fake_tools(tmp_path, push_rc):
-    """A git and a v1 that write their arguments to calls.txt; the git push answers push_rc. git rev-parse answers
+    """A git and a v1 that write their arguments to calls.txt; the git push answers push_rc, and 1 for any push naming
+    "refused" (a ref the repo's pre-push hook turns down: the hook fails the whole push). git rev-parse answers
     quietly: no branch for a ref naming "gone", one for any other."""
     calls, tools = tmp_path / "calls.txt", tmp_path / "tools"
     tools.mkdir()
     for name, rc in (("git", push_rc), ("codeteam", 0)):
-        verify = 'if [ "$3" = rev-parse ]; then case "$*" in *gone*) exit 1;; esac; exit 0; fi\n' if name == "git" else ""
+        verify = ('if [ "$3" = rev-parse ]; then case "$*" in *gone*) exit 1;; esac; exit 0; fi\n'
+                  f'case "$*" in *refused*) echo "{name} $*" >> "{calls}"; exit 1;; esac\n') if name == "git" else ""
         (tools / name).write_text(f'#!/bin/sh\n{verify}echo "{name} $*" >> "{calls}"\nexit {rc}\n')
         (tools / name).chmod(0o755)
     return calls, tools
 
 
-def run_job(tools, *refspecs, manifest="/m.toml"):
+def run_job(tools, *refspecs, manifest="/m.toml", out=None):
     env = {"PATH": f"{tools}:/usr/bin:/bin", "CT_REPO": "/r", "CT_V1": str(tools / "codeteam"),
            "CT_MANIFEST": manifest}
-    return subprocess.run(["/bin/sh", "-c", Runtime.PUSH_THEN_SWEEP, "backup", *refspecs], env=env).returncode
+    return subprocess.run(["/bin/sh", "-c", Runtime.PUSH_THEN_SWEEP, "backup", *refspecs], env=env,
+                          stdout=out).returncode
 
 
 def test_the_sweep_runs_after_the_push_whatever_the_push_answered(tmp_path):
@@ -168,3 +177,30 @@ def test_when_every_branch_is_gone_only_the_sweep_runs(tmp_path):
     calls, tools = fake_tools(tmp_path, push_rc=0)
     assert run_job(tools, "refs/heads/gone:refs/heads/gone") == 0
     assert calls.read_text().splitlines() == ["codeteam sweep-branches /m.toml"]
+
+
+def test_a_refused_branch_holds_back_only_itself(tmp_path):
+    """acme, 2026-11-16 09:05-13:05: its pre-push hook refused wo/orc/ce-zone-test-one-twins, which fails the
+    whole push, and five hourly backups of about 99 branches went nowhere."""
+    calls, tools = fake_tools(tmp_path, push_rc=0)
+    log = tmp_path / "backup.log"
+    with log.open("w") as out:
+        assert run_job(tools, "refs/heads/a:refs/heads/a", "refs/heads/refused:refs/heads/refused",
+                       "refs/heads/b:refs/heads/b", out=out) == 0
+    assert calls.read_text().splitlines() == [
+        "git -C /r push --force origin refs/heads/a:refs/heads/a refs/heads/refused:refs/heads/refused "
+        "refs/heads/b:refs/heads/b",
+        "git -C /r push --force origin refs/heads/a:refs/heads/a",
+        "git -C /r push --force origin refs/heads/refused:refs/heads/refused",
+        "git -C /r push --force origin refs/heads/b:refs/heads/b",
+        "codeteam sweep-branches /m.toml"]
+    assert log.read_text().splitlines() == ["backup: the push of 3 branches failed; pushing each on its own",
+                                            "backup: not pushed: refs/heads/refused"]
+
+
+def test_a_whole_push_that_goes_is_not_repeated_branch_by_branch(tmp_path):
+    calls, tools = fake_tools(tmp_path, push_rc=0)
+    assert run_job(tools, "refs/heads/a:refs/heads/a", "refs/heads/b:refs/heads/b") == 0
+    assert calls.read_text().splitlines() == [
+        "git -C /r push --force origin refs/heads/a:refs/heads/a refs/heads/b:refs/heads/b",
+        "codeteam sweep-branches /m.toml"]

@@ -15,7 +15,15 @@ execs its tool.
 
 - **Budget.** CPU units, 6 by default. A job's cost is its expected CPU share (cpu seconds over wall seconds of its last
   5 runs, 1 to the budget; 1 with no history, 4 for a `full` job; `slot_cost` (1) for a slot job).
-- **Classes**, in start order: `land` (guaranteed 2, no ceiling), `full` (1, 1), `post` (1, 2), `pre` (1, 2), `dev` (1, no ceiling). A job
+- **Team guarantee** (decision 555 in v2/DECISIONS.md): ahead of the classes, a team with a startable job waiting and
+  no job running (any class, run or slot) starts one job: the first class in start order with a startable job of that
+  team, the oldest submitted there; when several teams qualify, the team whose job was submitted first goes first, and
+  each starts in the same decision. It may take the budget over its figure, and the ceilings and reservation do not
+  apply to it; it obeys the same holds as a class's next job (priced, not warm-held, worktree and port free, not held
+  by swap). Nothing is kept for a team with nothing waiting. A job's team is its `team` field, or else the first
+  `team-` folder of its worktree; a job with neither is in the shared pool only. Such a start writes
+  `guarantee: "team"` into the job file with its `running` mark.
+- **Classes**, in start order after the team guarantee (the shared pool): `land` (guaranteed 2, no ceiling), `full` (1, 1), `post` (1, 2), `pre` (1, 2), `dev` (1, no ceiling). A job
   may start when its class is under its guaranteed share, or when the budget has room for its cost plus what the other
   classes' waiting jobs reserve, and its class is under its ceiling. Inside a class the next job is the oldest of the team
   whose last start in that class is least recent (round-robin by team).
@@ -33,8 +41,9 @@ execs its tool.
   chance to write HUNG. Each ticket's watch starts at its first observation; a restart starts a fresh window.
   One process table is shared by the run jobs at each decision, excluding the runner and its subtree from CPU.
   A hung tree gets TERM, then KILL after 10 seconds on a later decision if still alive.
-- **The environment.** A run job carries the submitter's whole environment (`env`) for the life of its file, in every
-  state (queued, running, done or broken). The runner starts the child with it.
+- **The environment.** A run job carries the submitter's whole environment (`env`) while it is queued or running; its
+  env is `{}` once it settles (done or broken), and the runner empties settled records' env when it starts. The runner
+  starts the child with it.
 - **One read per decision.** A decision lists and reads Q once and updates that snapshot as it writes.
 - **Fallback.** The queue never fails a build; each client falls back on exactly these, with one line on stderr:
   - `codeteam-slot`: any exception on the queue path; no runner (none alive after `CODETEAM_BUILDQ_START_WAIT`); a
@@ -61,7 +70,7 @@ execs its tool.
   selects a launchctl substitute for any queue; see `INTERFACE.md` for the test seam and errors.
 
 Files: Q is `run/queue/` (0700, its files 0600); `run/queue.toml` (config, read at every decision), `run/queue-runner.json` (the runner's
-heartbeat and state), `run/queue-history.jsonl`, `run/buildq.log`.
+heartbeat and state, with each team's running and waiting count under `teams`), `run/queue-history.jsonl`, `run/buildq.log`.
 
 **Known limit.** The runner cannot see a slot job's output because `codeteam-slot` execs the tool on the caller's
 own stdout. Under the spec's rule (no output AND under 1% CPU), the runner therefore never kills a slot job. A hung

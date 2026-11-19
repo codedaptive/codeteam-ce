@@ -1,10 +1,11 @@
 #!/usr/bin/env -S python3 -u
 """A Stage 5 recheck keeps each failing step's whole log under land/recheck-logs/ and names its failing tests on the
 finding and the FIX-FORWARD notice (2026-11-12: an app's failure at 730921fee0 reached the
-finding with no test name and no log, and zone-tool's itest record had been overwritten by the next recheck)."""
+finding with no test name and no log, and zone-tool's itest record had been overwritten by the next recheck).
+The unit tests (rule 11): failing_test_names over captured logs, and keep_recheck_logs on a temp folder. The
+test of a whole failing recheck is in tests/integration/land-recheck-logs.py."""
 import importlib.machinery
 import importlib.util
-import json
 import os
 import subprocess
 import tempfile
@@ -60,55 +61,6 @@ def test_names_from_swift_test_rust_xctest_and_pytest():
         "tests/unit/test_x.py::test_y", "hpkeRejects()"]
 
 
-def make_team(root):
-    repo = root / "repo"
-    repo.mkdir()
-    manifest = root / "sample.toml"
-    manifest.write_text(f'repo = "{repo}"\nworktree_root = "{root / "team"}"\n[land]\norchestrator = "Skippy"\n')
-    team = cl.Team(str(manifest))
-    team.notify = Mock()
-    return team
-
-
-def test_a_failing_recheck_keeps_its_log_and_names_the_tests_on_the_finding():
-    with tempfile.TemporaryDirectory() as tmp:
-        team = make_team(Path(tmp))
-        M = "730921fee0dabeda0e48ff2c150a7f4a31d5521c"
-        row = {"M": M, "wo": "work", "overlapping": ["other"], "zones": ["AcmeX-App"]}
-        (team.dir / "wo" / "work.landed.json").write_text(json.dumps({"wo": "work", "zone": "AcmeX-App"}))
-        (team.dir / "recheck.jsonl").write_text(json.dumps(row) + "\n")
-        name = "tests AcmeX-App (apps/AcmeX-App)"
-        calls = []
-
-        def steps(tree, batch, env, **kw):
-            calls.append(kw)
-            return [{"name": n, "outcome": "FAIL" if n == name else "PASS", "seconds": 1, "tail": ["last"],
-                     "text": XCODEBUILD if n == name else "ok\n"} for n, _ in batch]
-
-        with patch.object(cl, "itest_checkout", return_value=team.dir / "itest"), \
-                patch.object(cl, "recheck_steps", return_value=([("type check", "c")], [(name, "t"), ("tests B (b)", "t")])), \
-                patch.object(cl, "step_results", side_effect=steps), \
-                patch.object(cl, "after_landing"), patch.object(cl, "now", return_value="now"):
-            cl.recheck_one(team, row)
-        assert all(kw.get("keep_text") for kw in calls), calls
-        log = team.dir / "recheck-logs" / "730921fee0-tests-AcmeX-App-apps-AcmeX-App.log"
-        assert log.read_text() == XCODEBUILD
-        assert sorted(p.name for p in (team.dir / "recheck-logs").iterdir()) == [log.name]
-        [result] = [json.loads(x) for x in (team.dir / "integration-results.jsonl").read_text().splitlines()]
-        failed = next(t for t in result["tests"] if t["name"] == name)
-        assert failed == {"name": name, "result": "fail", "seconds": 1.0, "tail": ["last"], "log": str(log),
-                          "failing": ["FirstPartyPinnedExchangeTests.authenticatedTransportHeadGatePrecedesBody()"]}
-        assert next(t for t in result["tests"] if t["name"] == "tests B (b)") == {
-            "name": "tests B (b)", "result": "pass", "seconds": 1.0}
-        [finding] = cl.load_findings(team, "work")
-        assert "failing tests: FirstPartyPinnedExchangeTests.authenticatedTransportHeadGatePrecedesBody()" in finding["what"]
-        assert f"log: {log}" in finding["what"]
-        message = team.notify.call_args.args[2]
-        assert "authenticatedTransportHeadGatePrecedesBody()" in message and str(log) in message
-        # The fix tree may merge M when the cause is on landing and not in integration.
-        assert "merge 730921fee0 into the fix tree" in message
-
-
 def test_only_the_newest_logs_are_kept():
     with tempfile.TemporaryDirectory() as tmp:
         team = SimpleNamespace(dir=Path(tmp))
@@ -127,6 +79,5 @@ def test_only_the_newest_logs_are_kept():
 if __name__ == "__main__":
     test_names_from_xcodebuild_prefer_its_failing_list_over_swift_testing_display_names()
     test_names_from_swift_test_rust_xctest_and_pytest()
-    test_a_failing_recheck_keeps_its_log_and_names_the_tests_on_the_finding()
     test_only_the_newest_logs_are_kept()
     print("all passed")

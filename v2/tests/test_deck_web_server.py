@@ -5,7 +5,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -92,6 +93,67 @@ class PayloadTests(unittest.TestCase):
         payload = json.loads(snapshot_payload(fixture, [{"text": "alert é"}]).decode("utf-8"))
         self.assertEqual(payload.pop("alert_log"), [{"text": "alert é"}])
         self.assertEqual(payload, fixture)
+
+
+class HandlerFileLookupTests(unittest.TestCase):
+    def setUp(self):
+        from codeteam2.deck.server.handler import make_handler
+
+        self.files = {
+            "index.html": Mock(suffix=".html", read_text=Mock(return_value="<html></html>")),
+            "js/existing.js": Mock(suffix=".js", read_bytes=Mock(return_value=b"existing();")),
+            "js/gone.js": Mock(suffix=".js", read_bytes=Mock(side_effect=FileNotFoundError)),
+        }
+        self.listing = patch("codeteam2.deck.server.handler.web_files", side_effect=lambda _: dict(self.files))
+        self.web_files = self.listing.start()
+        self.addCleanup(self.listing.stop)
+        cls = make_handler(Mock(), Path("/fake/web"), False, 2.0)
+        self.handler = cls.__new__(cls)
+        self.handler.command = "GET"
+        self.handler.headers = {"Host": "localhost:8770"}
+        self.handler.server = SimpleNamespace(server_address=("127.0.0.1", 8770))
+        self.handler._send = Mock()
+
+    def request(self, path):
+        self.handler.path = path
+        self.handler._send.reset_mock()
+        try:
+            self.handler._dispatch()
+        except (KeyError, FileNotFoundError):
+            return None
+        return self.handler._send.call_args.args if self.handler._send.called else None
+
+    def test_added_name_is_served_with_javascript_content_type(self):
+        self.files["js/late.js"] = Mock(suffix=".js", read_bytes=Mock(return_value=b"late();"))
+        self.assertEqual(self.request("/js/late.js"), (200, "text/javascript; charset=utf-8", b"late();"))
+
+    def test_dropped_name_is_not_found(self):
+        self.assertEqual(self.request("/js/existing.js"), (200, "text/javascript; charset=utf-8", b"existing();"))
+        del self.files["js/existing.js"]
+        self.assertEqual(self.request("/js/existing.js")[0], 404)
+
+    def test_listing_is_read_once_per_request_from_web_folder(self):
+        self.web_files.reset_mock()
+        self.request("/js/existing.js")
+        self.request("/js/existing.js")
+        self.assertEqual(self.web_files.call_args_list, [call(Path("/fake/web")), call(Path("/fake/web"))])
+
+    def test_missing_index_is_not_found(self):
+        del self.files["index.html"]
+        result = self.request("/")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], 404)
+
+    def test_static_file_removed_between_listing_and_read_is_not_found(self):
+        result = self.request("/js/gone.js")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], 404)
+
+    def test_page_removed_between_listing_and_read_is_not_found(self):
+        self.files["index.html"].read_text.side_effect = FileNotFoundError
+        result = self.request("/")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], 404)
 
 
 class FakeScanner:

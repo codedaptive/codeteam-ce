@@ -23,7 +23,7 @@ def team_at(root):
     manifest = root / "sample.toml"
     manifest.write_text(f'repo = "{root / "repo"}"\nworktree_root = "{root / "team"}"\n'
                         '[[lanes]]\nname = "A"\npath = "A"\n[[assistants]]\nname = "Perkins"\n'
-                        '[land]\nsecurity_paths = ["A/auth*"]\nseed_index = false\n')
+                        '[land]\nseed_index = false\n')
     team = cl.Team(manifest); team.notify = Mock()
     return team
 
@@ -46,9 +46,7 @@ def test_stage2_records_every_batch_in_order_including_failed_batch():
     with tempfile.TemporaryDirectory() as tmp:
         team = team_at(Path(tmp)); rec = record(team)
         batches = [[{"name": "compile A", "outcome": "PASS", "seconds": 1.24, "tail": []}],
-                   [{"name": "repo units", "outcome": "PASS", "seconds": 2.36, "tail": []}],
-                   [{"name": "zone integration", "outcome": "FAIL", "seconds": 3.14, "tail": ["bad"]},
-                    {"name": "repo integration", "outcome": "PASS", "seconds": 4.16, "tail": []}]]
+                   [{"name": "repo units", "outcome": "FAIL", "seconds": 2.36, "tail": ["bad"]}]]
         def run(tree, steps, env, **kwargs):
             rows = batches.pop(0)
             for row in reversed(rows):
@@ -62,12 +60,10 @@ def test_stage2_records_every_batch_in_order_including_failed_batch():
                 patch.object(cl, "team_env", return_value={}), patch.object(cl, "run_steps", side_effect=run):
             try: cl.check_integration(team, rec, False)
             except SystemExit as exc: assert exc.code == 3
-            else: raise AssertionError("failed integration batch was accepted")
+            else: raise AssertionError("failed unit batch was accepted")
         assert team.wo("w")["stage2"] == [
-            {"step": "compile A", "result": "pass", "seconds": 1.2},
-            {"step": "repo units", "result": "pass", "seconds": 2.4},
-            {"step": "zone integration", "result": "fail", "seconds": 3.1},
-            {"step": "repo integration", "result": "pass", "seconds": 4.2}]
+            {"step": "compile A", "result": "pass", "seconds": 1.2, "group": "compile"},
+            {"step": "repo units", "result": "fail", "seconds": 2.4, "group": "unit"}]
         assert batches == []
 
 
@@ -85,6 +81,29 @@ def test_landed_log_preserves_stage2_failed_then_fixed_history():
                                  {"step": "tests A", "result": "pass", "seconds": 0.8}]
 
 
+def test_landing_keeps_stage2_records_before_tree_cleanup():
+    with tempfile.TemporaryDirectory() as tmp:
+        team = team_at(Path(tmp)); rec = record(team)
+        tree = Path(rec["tree"]); tree.mkdir()
+        source = tree / ".test-record.json"; source.write_text('{"result":"PASS"}')
+        rec["stage2"] = [{"step": "tests A", "result": "pass", "seconds": 1, "records": [str(source)]}]
+        team.save_wo(rec)
+        entry = {"wo": "w", "tip": "T", "base": "B", "zones": ["A"]}
+
+        def cleanup(team, rec):
+            source.unlink()
+
+        with patch.object(cl, "git"), patch.object(cl, "cleanup_landing", side_effect=cleanup):
+            cl.record_landing_members(team, entry, "OLD", {"w": rec}, [("w", "M")], False)
+        kept = team.dir / "stage2-records" / "w" / "00-tests-A-.test-record.json"
+        assert kept.exists(), "stage2 record was not retained before cleanup"
+        assert kept.read_text() == '{"result":"PASS"}'
+        landed = json.loads(team.wo_file("w").with_suffix(".landed.json").read_text())
+        logged = json.loads((team.dir / "landed.log").read_text())
+        assert landed["stage2"][0]["records"] == [str(kept)]
+        assert logged["stage2"][0]["records"] == [str(kept)]
+
+
 def test_unit_batch_is_recorded_before_its_failure_exits():
     with tempfile.TemporaryDirectory() as tmp:
         team = team_at(Path(tmp)); rec = record(team)
@@ -96,7 +115,7 @@ def test_unit_batch_is_recorded_before_its_failure_exits():
             try: cl.test_units(team, rec)
             except SystemExit as exc: assert exc.code == 3
             else: raise AssertionError("failed units accepted")
-        assert team.wo("w")["stage2"] == [{"step": "units A", "result": "fail", "seconds": 0.1}]
+        assert team.wo("w")["stage2"] == [{"step": "units A", "result": "fail", "seconds": 0.1, "group": "unit"}]
 
 
 def test_guarded_refs_order_and_deduplication():
@@ -283,13 +302,16 @@ def test_intent_write_is_atomic_if_interrupted_before_replace():
         assert json.loads(path.read_text()) == {"C": "NEW", "old_integration": "OLD", "time": "later"}
 
 
-failed = 0
-for test in [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]:
-    try:
-        test()
-        print(f"  PASS {test.__name__}")
-    except (Exception, SystemExit) as exc:
-        failed += 1
-        print(f"  FAIL {test.__name__}: {type(exc).__name__}: {exc}")
-print(f"{failed} failed" if failed else "all passed")
-sys.exit(1 if failed else 0)
+# Run as a script (zone-tool and Stage 2 run tests/unit's plain scripts with python3); pytest, given the file by path,
+# imports it without running this and collects the test_ functions.
+if __name__ == "__main__":
+    failed = 0
+    for test in [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]:
+        try:
+            test()
+            print(f"  PASS {test.__name__}")
+        except (Exception, SystemExit) as exc:
+            failed += 1
+            print(f"  FAIL {test.__name__}: {type(exc).__name__}: {exc}")
+    print(f"{failed} failed" if failed else "all passed")
+    sys.exit(1 if failed else 0)

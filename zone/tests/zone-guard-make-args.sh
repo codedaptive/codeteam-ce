@@ -6,14 +6,15 @@ G="$root/share/claude-hooks/zone-guard.py"
 T="$root/scratchpad/zone-guard-make-args-test-$$"
 trap 'rm -rf "$T"' EXIT
 W="$T/team-x/workcrews/AKit/repo-AKit"
-mkdir -p "$T/team-x/team" "$W/packages/kits/AKit" "$W/packages/kits/BKit" "$T/non-lane"
+mkdir -p "$T/team-x/team" "$W/packages/kits/AKit" "$W/packages/kits/BKit" "$W/tests" "$T/non-lane"
 export GIT_CEILING_DIRECTORIES="$(dirname "$W")"
 git -C "$W" init -q
 [ -d "$W/.git" ] || { echo '  FAIL setup: lane repo not created'; exit 1; }
 echo '# AKit' > "$W/packages/kits/AKit/Makefile"
 echo '# BKit' > "$W/packages/kits/BKit/Makefile"
+touch "$W/tests/test_a.py" "$W/tests/test_b.py"
 git -C "$W" add -A && git -C "$W" -c user.email=t@t -c user.name=t commit -qm init || exit 1
-echo '{"lanes": {"AKit": {"path": "packages/kits/AKit"}, "BKit": {"path": "packages/kits/BKit"}}}' > "$T/team-x/team/team.json"
+echo '{"lanes": {"AKit": {"path": "packages/kits/AKit", "owns": ["tests/test_a.py"]}, "BKit": {"path": "packages/kits/BKit", "owns": ["tests/test_b.py"]}}}' > "$T/team-x/team/team.json"
 for v in $(compgen -e); do case "$v" in CODETEAM_*|CT_*) unset "$v";; esac; done
 export CODETEAM_WORKSPACE="$T"   # the throwaway team folder is in the workspace, so the guard applies
 export CODETEAM_ZONE=packages/kits/AKit CODETEAM_SESSION=AKit CODETEAM_SWT="$W"
@@ -94,5 +95,12 @@ expect_msg 2 'make zone-test-one ZONE=packages/kits/BKit' '' 'make ZONE=packages
 expect_msg 2 'make zone-test-one DIR=packages/kits/BKit' '' 'make DIR=packages/kits/BKit' 'relative DIR refusal text'
 expect_msg 2 "make zone-test-one DIR=$T/non-lane" '' "make DIR=$T/non-lane" 'absolute DIR refusal text'
 expect_msg 2 'make build' '' 'make target `build` (a whole-product target; lanes run make zone-test, zone-test-one, zone-test-status, zone-check DIR=<zone>, warm, test-one DIR=<zone>)' 'whole-product target refusal text'
+expect 0 'make zone-test-one DIR=tests.test_a' '' 'owned dotted module allowed'
+expect 0 'make zone-test-one DIR=tests.test_a.Case.test_y' '' 'owned dotted module with test suffix allowed'
+expect 0 'make zone-test-one DIR=tests.test_a,tests.test_a' '' 'owned dotted module list allowed'
+expect 0 'make zone-test-one DIR=tests/test_a.py' '' 'owned file path still allowed'
+expect_msg 2 'make zone-test-one DIR=tests.test_b' '' 'make DIR=tests.test_b' 'other lane dotted module refused'
+expect_msg 2 'make zone-test-one DIR=tests.test_a,tests.test_b' '' 'make DIR=tests.test_b' 'dotted module list names other lane item'
+expect_msg 2 'make zone-test-one DIR=tests.nothing' '' 'make DIR=tests.nothing' 'missing dotted module refused'
 echo "== zone-guard-make-args: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

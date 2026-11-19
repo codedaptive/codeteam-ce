@@ -17,6 +17,11 @@ from pathlib import Path
 
 LAND = str(Path(__file__).resolve().parents[2] / "bin" / "codeteam-land")
 W = Path(tempfile.mkdtemp(prefix="land-docs-"))
+CG = W / "codegraph"
+CG.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{W / "codegraph.calls"}"\n'
+              f'if [ -d "$3" ]; then echo present >> "{W / "codegraph.calls"}"; else echo absent >> "{W / "codegraph.calls"}"; fi\n')
+CG.chmod(0o755)
+os.environ["CODETEAM_CODEGRAPH"] = str(CG)
 REPO, ROOT = W / "repo", W / "team"
 TODAY = dt.date.today().isoformat()
 fails = 0
@@ -48,6 +53,7 @@ def land(*args, env=None):
                  ("GIT_COMMITTER_EMAIL", "t@t")):
         e.setdefault(k, v)
     e.update(env or {})
+    e["CODETEAM_CODEGRAPH"] = str(CG)
     result = subprocess.run([LAND, str(W / "team.toml"), *args], capture_output=True, text=True, env=e)
     if args[0] == "land" and result.returncode == 0:
         row = json.loads((ROOT / "land" / "reviews" / f"{args[1]}.json").read_text())

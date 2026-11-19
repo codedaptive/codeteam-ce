@@ -1114,6 +1114,45 @@ class QueueRunnerTests(unittest.TestCase):
                                        "load": 2.0, "load_max": 36, "swap": 0.1, "swap_max": 0.9,
                                        "load_hold": False, "swap_hold": False})
 
+    def test_teamslot_live_runner_keeps_valid_teams(self):
+        write_runner(self.path, teams={"acme": {"running": 8, "waiting": 3},
+                                       "-": {"running": 0, "waiting": 1}})
+        self.assertEqual(self.read().get("teams"), {"acme": {"running": 8, "waiting": 3},
+                                                    "-": {"running": 0, "waiting": 1}})
+
+    def test_teamslot_live_runner_drops_invalid_entries(self):
+        write_runner(self.path, teams={"acme": {"running": 2, "waiting": 1}, "not_object": 4,
+                                       "missing_running": {"waiting": 2}, "missing_waiting": {"running": 1},
+                                       "float": {"running": 1.0, "waiting": 0},
+                                       "string": {"running": 0, "waiting": "1"},
+                                       "null": {"running": None, "waiting": 0}})
+        self.assertEqual(self.read().get("teams"), {"acme": {"running": 2, "waiting": 1}})
+
+    def test_teamslot_live_runner_drops_boolean_counts(self):
+        write_runner(self.path, teams={"valid": {"running": 0, "waiting": 0},
+                                       "boolean_running": {"running": True, "waiting": 0},
+                                       "boolean_waiting": {"running": 0, "waiting": False}})
+        self.assertEqual(self.read().get("teams"), {"valid": {"running": 0, "waiting": 0}})
+
+    def test_teamslot_live_runner_drops_negative_counts(self):
+        write_runner(self.path, teams={"valid": {"running": 0, "waiting": 0},
+                                       "negative_running": {"running": -1, "waiting": 0},
+                                       "negative_waiting": {"running": 0, "waiting": -1}})
+        self.assertEqual(self.read().get("teams"), {"valid": {"running": 0, "waiting": 0}})
+
+    def test_teamslot_live_runner_without_dict_teams_has_no_key(self):
+        for value in (None, [], "acme", 1, True):
+            with self.subTest(value=value):
+                write_runner(self.path, teams=value)
+                self.assertEqual(self.read()["state"], "live")
+                self.assertNotIn("teams", self.read())
+
+    def test_teamslot_stale_runner_discards_teams(self):
+        write_runner(self.path, beat=NOW - 61, teams={"acme": {"running": 8, "waiting": 3}})
+        got = self.read()
+        self.assertEqual(got["state"], "stale")
+        self.assertNotIn("teams", got)
+
     def test_a_beat_of_exactly_60_seconds_is_live_and_an_older_beat_is_stale(self):
         write_runner(self.path, beat=NOW - 60)
         self.assertEqual(self.read()["state"], "live")
@@ -2344,7 +2383,7 @@ class RenderHaltedTests(RenderCase):
 
     def test_all_agents_lists_none_of_a_halted_teams_agents(self):
         screen = self.screen(self.halted_with_sessions(), all_agents=True)
-        self.assertIn("2 total", screen)
+        self.assertRegex(screen, r"(?<![0-9A-Za-z])2 total")      # not "12 total"
 
     def test_a_down_team_with_sessions_keeps_its_box_and_visible_sessions(self):
         snap = self.halted_with_sessions()
@@ -3235,6 +3274,40 @@ class BuildsPanelTests(RenderCase):
                 queue_class(queue, "pre")["broken"] = broken
                 row = self.row(self.panel(queue), "running")
                 self.assertEqual(row_text(row), "■ 3 running   ■ 3 queued")
+
+    def test_teamslot_terminal_row_is_after_runner_and_busiest_first(self):
+        queue = self.live(teams={"zeta": {"running": 1, "waiting": 2},
+                                 "widgets": {"running": 1, "waiting": 0},
+                                 "acme": {"running": 8, "waiting": 3},
+                                 "alpha": {"running": 1, "waiting": 2}})
+        rows = self.panel(queue)
+        texts = [row_text(row) for row in rows]
+        runner = next(i for i, text in enumerate(texts) if "budget" in text)
+        self.assertEqual(texts[runner + 1], "teams  acme 8 run 3 wait  alpha 1 run 2 wait  "
+                                            "zeta 1 run 2 wait  widgets 1 run 0 wait")
+        self.assertWord(colour_of(rows[runner + 1], "teams"), "dim", "teams")
+        box = self.r._build_box({"queue": queue}, 140, False)
+        self.assertIn("teams  acme 8 run 3 wait  alpha 1 run 2 wait  zeta 1 run 2 wait  widgets 1 run 0 wait",
+                      "\n".join(row_text(row) for row in box))
+
+    def test_teamslot_terminal_omits_row_without_teams(self):
+        rows = self.panel(self.live())
+        self.assertIn("budget", self.text(rows))
+        self.assertNotIn("teams", self.text(rows))
+
+    def test_teamslot_terminal_omits_row_for_empty_teams(self):
+        rows = self.panel(self.live(teams={}))
+        self.assertIn("budget", self.text(rows))
+        self.assertNotIn("teams", self.text(rows))
+
+    def test_teamslot_terminal_omits_row_for_nonlive_runner(self):
+        for state in ("stale", "none", "?"):
+            with self.subTest(state=state):
+                queue = self.live(state=state, teams={"acme": {"running": 8, "waiting": 3}})
+                rows = self.panel(queue, warms=[self.WARM])
+                self.assertIn("no live runner", self.text(rows))
+                self.assertNotIn("teams", self.text(rows))
+                self.assertNotIn("acme", self.text(rows))
 
     def test_a_live_runner_shows_budget_and_swap_and_no_load_reading(self):
         rows = self.panel(self.queue)

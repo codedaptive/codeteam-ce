@@ -2,13 +2,15 @@
 
     codeteam2 up <manifest>                 the team's herdr workspace, roles, the staff, the loop
     codeteam2 run <manifest> [--once]       the loop (normally in the workspace's daemon pane)
-    codeteam2 say <manifest> <channel> <sender> <TYPE> <to> <text...>
-                                            send a message (v1's signature, so role files keep working)
+    codeteam2 say <manifest> [--ride] <channel> <sender> <TYPE> <to> <text...>
+                                            send a message (v1's signature, so role files keep working);
+                                            --ride stores it as a ride-along: it starts and wakes no one and
+                                            goes with the recipient's next prompt that carries real mail
     codeteam2 watch <manifest> <name> [--now]   messages for a session that are not delivered yet
     codeteam2 await <manifest> <lane> <feature>   record that the lane waits for a feature (v1's wait record);
                                             push-up of that feature sends the lane a NOTE
     codeteam2 launch <manifest> <name...>   start sessions now (the loop also starts them for mail)
-    codeteam2 sleep <manifest> <name>       end a session (/exit) when it is idle
+    codeteam2 sleep <manifest> <name>       end a session (/exit) when it is idle; one with background work is left running unless --force
     codeteam2 status <manifest>             every session's real state and its mail
     codeteam2 tail <manifest>               follow the team's messages live
     codeteam2 compact-now <manifest> <name> [transcript]   /compact, then the resume line, when idle
@@ -30,6 +32,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .herdr import HerdrError
+from .say_unknown import unknown_names
 from .scheduler import READY, Runtime, last_mids
 from .store import RUNTIME
 from .team import CODETEAM2, OWNER, WORKSPACE, Team, v1
@@ -190,12 +193,14 @@ CREATOR_INBOX = WORKSPACE / "team-codeteam" / "creator-inbox.log"
 
 
 def for_creator(a, kind, name, text):
-    """A message to `codeteam` or `creator` that is meant for codeteam's builder (the creator): every kind but the
-    patrol's answers. It goes to one inbox file and a notice for the owner (without it, messages to the creator
-    reached no one). True when it was taken."""
+    """A message to `codeteam` or `creator` that is meant for codeteam's builder (the creator): every kind, except an
+    ANSWER to `codeteam` that is a reply to the patrol. It goes to one inbox file and a notice for the owner (2026-11-08:
+    an orchestrator sent the creator 25 messages that reached no one; 2026-11-15: 35 ANSWERs addressed to
+    `creator` were still dropped as patrol replies). True when it was taken."""
     if name.strip().lower() not in ("codeteam", "creator") or a.sender == "codeteam":
         return False
-    if kind == "ANSWER" and not a.sender.startswith("Designer-") and "creator" not in text.lower():
+    if (kind == "ANSWER" and name.strip().lower() == "codeteam" and not a.sender.startswith("Designer-")
+            and "creator" not in text.lower()):
         return False                # an answer to a patrol line or an idle check: recorded as before
     CREATOR_INBOX.parent.mkdir(parents=True, exist_ok=True)
     with open(CREATOR_INBOX, "a") as f:
@@ -205,6 +210,7 @@ def for_creator(a, kind, name, text):
 
 def cmd_say(team, rt, a):
     kind = a.type.upper()
+    ride = getattr(a, "ride", False)    # nudge and tests build `a` without it
     if kind not in TYPES and kind != RUNTIME:
         sys.exit(f"type must be one of {', '.join(TYPES)}")
     text = " ".join(a.text)
@@ -258,6 +264,11 @@ def cmd_say(team, rt, a):
         return
     # TO may list several sessions (v1: `Nagatha,Kong`): one message each (found in the factory smoke run).
     names = [n.strip() for n in a.to.split(",") if n.strip()] or [a.to]
+    unknown = unknown_names(team, names, sender, a.channel, lambda n: other_team(team, n, kind) is not None)
+    if unknown:
+        sys.exit(f"codeteam2 say: no session named {', '.join(unknown)} in team {team.product}, so this would reach "
+                 f"no one; nothing was sent. For a session of another team, give that team's manifest: "
+                 f"codeteam2 say <its manifest> {a.channel} {a.sender} {kind} <name> \"<text>\"")
     targets = []
     for n in list(names):
         m = other_team(team, n, kind)
@@ -294,7 +305,7 @@ def cmd_say(team, rt, a):
         return
     ids = []
     for s in targets:
-        mid = rt.store.add(a.channel, a.sender, kind, a.to, s.key, text)
+        mid = rt.store.add(a.channel, a.sender, kind, a.to, s.key, text, ride=ride)
         ids.append(mid)
     team.mirror_to_channel_log(a.channel, a.sender, kind, a.to, text)   # exactly v1's line: v1 parses it (READY)
     print(f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M')} | #{','.join(map(str, ids))} | {a.sender} | {kind} {a.to} -> "
@@ -371,8 +382,13 @@ def cmd_sleep(team, rt, a):
     if status == "absent":
         print(f"{s.display}: not running")
     elif status in READY or a.force:
-        if not rt.stop(s, st):
+        if not rt.stop(s, st, "asked" if a.force else "sleep"):
             print(f"{s.display}: not ended (unsent text in its input box, its pane shows a subagent's view, or herdr refused); try again")
+        elif a.force:
+            print(f"{s.display}: /exit sent; it ends with its background work")
+        else:
+            print(f"{s.display}: /exit sent; it ends, or is left running if background work is running "
+                  f"(--force ends it with its work)")
         team.save_state(st)
     else:
         # Nothing is recorded: the loop ends a lane only by its swap and idle-exit rules.
@@ -546,6 +562,7 @@ def main(argv=None):
     for x in ("channel", "sender", "type", "to"):
         sp.add_argument(x)
     sp.add_argument("text", nargs="+")
+    sp.add_argument("--ride", action="store_true", help="a ride-along: wakes no one, goes with the next real mail")
     for name in ("watch", "await"):
         sp = p(name); sp.add_argument("name")
         if name == "await":

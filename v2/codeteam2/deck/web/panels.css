@@ -39,8 +39,10 @@
 .fleet .cells { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0 10px; }
 .fleet .cell { min-width: 0; }
 
-/* A team box: stats over the session rows; each row a grid of cursor, glyph, name, age, bar, %, cost, badge. */
-.srow { display: grid; grid-template-columns: 8px 12px minmax(56px, 1fr) 38px 36px 32px 50px minmax(0, max-content);
+/* A team box: stats over the session rows; each row a grid of cursor, glyph, name, age, bar, %, cost, badge. The
+   badge track is a fixed 98px (the badge's 96px max-width and its 2px margin), empty or not, so every row of a box
+   puts its age, bar, % and cost at the same x. */
+.srow { display: grid; grid-template-columns: 8px 12px minmax(56px, 1fr) 38px 36px 32px 50px 98px;
   align-items: center; column-gap: 4px; height: var(--row); cursor: pointer; border-radius: 3px; }
 .srow > .num { text-align: right; }
 .srow:hover { background: var(--track); }
@@ -48,15 +50,40 @@
 .srow .badge { margin-left: 2px; max-width: 96px; }
 .halted .tname { width: 84px; }
 
-/* Focus and agents. */
+/* Focus and agents. An agent row is a grid of glyph, description, swimlane, elapsed, tags and, with team or all
+   agents (.owners), owner. The description takes the free width and shrinks first; the tracks right of it are the
+   same width in every row, so they line up at the panel's right edge. The swimlane is 18% of the panel between 56px
+   and 220px, so in a narrow panel it gives way before the description (about 101px at a 562px panel, 220px from
+   about 1222px); elapsed is 42px, room for "25h34" in the mono figures (37px), set in px because ch on the row is
+   the sans body font; tags is 140px, the longest single chip ("waits on finished child", 133px), only when a shown
+   agent has a flag (.has-tags), else 0; owner is 80px. */
 .focus .detail, .agents .detail { padding-left: 14px; }
 .agents { padding: 0 2px; }
 .agents .ahead { margin-bottom: 1px; }
-.arow .label { width: 150px; flex: none; }
-.arow .owner { max-width: 70px; }
+.row.arow { display: grid; grid-template-columns: 12px minmax(0, 1fr) clamp(56px, 18%, 220px) 42px var(--tags);
+  --tags: 0px; }
+.agents.has-tags .arow { --tags: 140px; }
+.agents.owners .arow { grid-template-columns: 12px minmax(0, 1fr) clamp(56px, 18%, 220px) 42px var(--tags) 80px; }
+.arow > .num { text-align: right; }
+.arow .tags { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0; }
+.arow .lane { width: auto; }
+/* Running agents first, finished below them, dimmed; with both groups shown, a label row opens each. */
+.agents .arow.done { opacity: 0.55; }
+.agents .agroup { margin-top: 2px; font-size: 0.85em; }
 .lane { position: relative; display: inline-block; width: 92px; height: 7px; flex: none;
   background: repeating-linear-gradient(90deg, var(--faint) 0 1px, transparent 1px 5px); }
 .lane > i { position: absolute; top: 2px; height: 3px; border-radius: 2px; }
+
+/* A wide panel's two columns (focus, BUILDS): a fixed left track for the panel's own rows and the rest of the
+   width for its side list (focus's recent tools and messages, BUILDS' queued jobs). minmax(0, 1fr) and min-width 0 let
+   a column shrink below its rows' text, which then cuts with an ellipsis instead of widening the box; align-items
+   start keeps the shorter column's rows at the top. Wide detail rows sit flush in their own column, so they drop
+   the 14px indent the narrow expanded rows keep. */
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 16px; align-items: start; }
+.split-l, .split-r { min-width: 0; }
+.focus .split { grid-template-columns: 410px minmax(0, 1fr); }
+.builds .split { grid-template-columns: 390px minmax(0, 1fr); }
+.focus .split-r .detail { padding-left: 0; }
 
 /* BUILDS. */
 .strip { display: flex; gap: 2px; flex-wrap: nowrap; overflow: hidden; }

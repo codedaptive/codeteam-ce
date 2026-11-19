@@ -90,11 +90,15 @@ for z, dep in (("A", None), ("B", "A"), ("C", "B")):
     (REPO / z / "value").write_text("1\n")
 (REPO / "C" / "notes").write_text("1\n2\n3\n4\n5\n")
 (REPO / "type-check.sh").write_text("! grep -rq SYNTAX A B C\n")
-# a zone's test: its own value is a number, and every value it depends on is below 100
+# a zone's test: its own value is a number, and every value it depends on is below 100; a failure names the value's
+# file and line, as a stack frame would, so queue-run can match it to the entry that changed it. A zone's
+# "silent" file fails its integration test with no frame at all (decision 3's case, the last one below).
 (REPO / "run-tests.sh").write_text(
     'echo "$1 $CODETEAM_TEST_GROUP" >> "$GATE_LOG"\n'
     'case "$1" in A) deps="A";; B) deps="A B";; C) deps="A B C";; esac\n'
-    'for d in $deps; do v=$(cat $d/value); case "$v" in *[!0-9]*|"") exit 1;; esac; [ "$v" -lt 100 ] || exit 1; done\n')
+    'bad() { echo "File \\"$1/value\\", line 1"; exit 1; }\n'
+    'for d in $deps; do v=$(cat $d/value); case "$v" in *[!0-9]*|"") bad $d;; esac; [ "$v" -lt 100 ] || bad $d; done\n'
+    'if [ "$CODETEAM_TEST_GROUP" = integration ] && [ -e "$1/silent" ]; then exit 1; fi\n')
 sh("git init -q -b main && git add -A && git -c user.email=t@t -c user.name=t commit -qm init && git branch integration && git branch landing")
 (W / "team.toml").write_text(f'''repo = "{REPO}"
 integration = "integration"
@@ -129,19 +133,22 @@ cut("A", "a1"); edit("a1", "A/value", "2")
 cut("C", "c1"); edit("c1", "C/value", "3")
 before = len(gate_runs())
 r = land("land", "a1")
-t("land checks A's units and A and its direct dependent B's integration tests before queueing",
-  r.returncode == 0 and sorted(gate_runs()[before:]) == ["A integration", "A unit", "B integration"], r.stdout + r.stderr)
+t("land checks A's units only and queues it with its integration step owed",
+  r.returncode == 0 and gate_runs()[before:] == ["A unit"] and "integration step owed" in r.stdout, r.stdout + r.stderr)
 before = len(gate_runs())
 r = land("land", "c1")
-t("land checks C's units and integration tests only", r.returncode == 0 and
-  gate_runs()[before:] == ["C unit", "C integration"], r.stdout + r.stderr)
+t("land checks C's units only", r.returncode == 0 and gate_runs()[before:] == ["C unit"], r.stdout + r.stderr)
 cut("B", "b-open")                 # B has a work order open, so it is told; a zone with none is not
 before = len(gate_runs())
 land("queue-run", "--once")
-t("one pass lands the oldest entry only", integ("A/value") == "2" and integ("C/value") == "1", land("queue").stdout)
-t("the landing runner runs no tests", gate_runs()[before:] == [], gate_runs()[before:])
+t("one pass lands both owed entries", integ("A/value") == "2" and integ("C/value") == "3", land("queue").stdout)
+# The batch rule: one integration run for the batch: A and its direct dependent B for a1, C for c1, each once.
+t("the pass runs the batch's integration tests once: A and B for a1, C for c1",
+  sorted(gate_runs()[before:]) == ["A integration", "B integration", "C integration"], gate_runs()[before:])
+before = len(gate_runs())
 land("queue-run", "--once")
-t("the next pass lands C without repeating its tests", integ("C/value") == "3" and gate_runs()[before:] == [], gate_runs()[before:])
+t("the next pass finds nothing to test or land", gate_runs()[before:] == [] and "queue empty" in land("queue").stdout,
+  gate_runs()[before:])
 log = [json.loads(l) for l in (W / "team" / "land" / "landed.log").read_text().splitlines()]
 t("one landing merge commit per work order, in order", [r["wos"] for r in log if r.get("hash")] == [["a1"], ["c1"]] and
   sh("git log --first-parent --format=%s integration -2").stdout.split("\n")[:2] == ["c1 (C)", "a1 (A)"])
@@ -172,12 +179,26 @@ def unit_record(tree, folder):
 
 cut("A", "bad"); tree = edit("bad", "A/value", "200")
 unit_record(tree, "A")
+cut("C", "ok"); edit("ok", "C/value", "9")
 before = len(gate_runs())
 r = land("land", "bad")
-t("a work order that breaks integration tests does not queue (exit 3)", r.returncode == 3 and
-  integ("A/value") == "2" and "bad" not in land("queue").stdout, r.stdout + r.stderr)
-t("a lead's current PASS record satisfies only the unit step", sorted(gate_runs()[before:]) == ["A integration", "B integration"],
+t("a work order that breaks integration tests still queues at land", r.returncode == 0 and "bad" in land("queue").stdout,
+  r.stdout + r.stderr)
+t("a lead's current PASS record satisfies the unit step and land runs no integration step", gate_runs()[before:] == [],
   gate_runs()[before:])
+land("land", "ok")
+before = len(gate_runs())
+land("queue-run", "--once")
+log = [json.loads(l) for l in (W / "team" / "land" / "landed.log").read_text().splitlines()]
+t("queue-run sends it back: integration failed, nothing of it lands", integ("A/value") == "2" and
+  "bad" not in land("queue").stdout and any(row.get("wos") == ["bad"] and row.get("result") == "integration failed" for row in log)
+  and not any("bad" in row["wos"] for row in log if row.get("hash")), log[-2:])
+t("its zone is told it did not land", any(line.startswith("REQUEST Coord-A") and "bad" in line and "did not land" in line
+                                         for line in (W / "notify.log").read_text().splitlines()))
+t("the rest of the batch lands", integ("C/value") == "9" and [row["wos"] for row in log if row.get("hash")][-1] == ["ok"],
+  integ("C/value"))
+t("its integration step ran at queue-run, A's and B's tests among them",
+  {"A integration", "B integration"} <= set(gate_runs()[before:]), gate_runs()[before:])
 t("--untested is refused", land("land", "bad", "--untested").returncode == 5)
 cut("B", "syn"); tree = edit("syn", "B/value", "SYNTAX"); unit_record(tree, "B")
 r = land("land", "syn")
@@ -189,10 +210,10 @@ submissions = {}
 for wo, z, v in (("b1", "B", "5"), ("b2", "A", "300"), ("b3", "C", "6")):
     cut(z, wo); edit(wo, f"{z}/value", v); submissions[wo] = land("land", wo)
 land("queue-run", "--once")
-land("queue-run", "--once")
-land("queue-run", "--once")
-t("separate passes with a broken middle entry land the other two in order", integ("B/value") == "5" and integ("C/value") == "6"
-  and integ("A/value") == "2", (integ("A/value"), integ("B/value"), integ("C/value")))
+landed = [json.loads(l)["wos"] for l in (W / "team" / "land" / "landed.log").read_text().splitlines()
+          if json.loads(l).get("hash")]
+t("one pass with a broken middle entry lands the other two in order", integ("B/value") == "5" and integ("C/value") == "6"
+  and integ("A/value") == "2" and landed[-2:] == [["b1"], ["b3"]], (integ("A/value"), integ("B/value"), integ("C/value")))
 t("the broken one fails its unit check and stays unqueued", submissions["b2"].returncode == 3 and
   "FAIL tests A" in submissions["b2"].stdout and "b2" not in land("queue").stdout, submissions["b2"].stdout)
 
@@ -211,7 +232,11 @@ edit("s1", "C/notes", "one-changed\n2\n3\n4\n5"); edit("s3", "C/notes", "1\n2\n3
 edit("s2", "A/value", "11")
 land("land", "s3"); land("land", "s2")
 land("land", "s1"); land("land-next", "s1")
+before = len(gate_runs())
 r = land("land-one", "s1")
+t("land-one runs an owed entry's integration step alone, then lands it (exit 0)", r.returncode == 0 and
+  gate_runs()[before:] == ["C integration"] and "one-changed" in integ("C/notes") and "s3" in land("queue").stdout
+  and "s2" in land("queue").stdout, (r.stdout, r.stderr, gate_runs()[before:]))
 land("queue-run", "--once")
 land("queue-run", "--once")
 t("an independent entry lands after integration moves", integ("A/value") == "11")
@@ -219,9 +244,16 @@ t("nonconflicting edits to the same file merge", integ("C/notes").splitlines() =
 
 print("== land-one, --with, hook, revert")
 cut("B", "d1"); edit("d1", "B/value", "14"); land("land", "d1")
+before = len(gate_runs())
 r = land("land-one", "d1")
 t("land-one lands the reviewed tip and records review before", r.returncode == 0 and integ("B/value") == "14" and
   [json.loads(line) for line in (W / "team" / "land" / "landed.log").read_text().splitlines() if json.loads(line).get("hash")][-1]["review"] == "before", r.stderr)
+t("land-one ran its owed integration step: B and its direct dependent C",
+  sorted(gate_runs()[before:]) == ["B integration", "C integration"], gate_runs()[before:])
+cut("A", "bad2"); unit_record(edit("bad2", "A/value", "300"), "A"); land("land", "bad2")
+r = land("land-one", "bad2")
+t("land-one sends back an owed entry whose integration step fails (exit 3)", r.returncode == 3 and
+  integ("A/value") != "300" and "bad2" not in land("queue").stdout, (r.stdout, r.stderr))
 cut("A", "w1"); cut("B", "w2"); edit("w1", "A/value", "15"); edit("w2", "B/value", "13")
 r = land("land", "w1", "--with", "w2")
 queued = [json.loads(p.read_text()) for p in (W / "team" / "land" / "queue").glob("*.json")]
@@ -247,6 +279,17 @@ cut("C", "h1"); cut("C", "h2"); edit("h1", "C/value", "20"); edit("h2", "C/doc",
 land("land", "h1"); land("land", "h2"); land("land-next", "h2"); land("land-hold", "h1")
 q = land("queue").stdout.splitlines()
 t("land-next puts it first; land-hold parks it", q and "h2" in q[0] and "HELD" in q[1], q)
+
+print("== a failure no entry's diff explains")
+cut("C", "q1"); edit("q1", "C/silent", "x"); land("land", "q1")
+land("queue-run", "--once")
+findings = [item for path in (W / "team" / "land" / "findings").glob("*.json") for item in json.loads(path.read_text())
+            if item.get("by") == "queue-run" and "q1" in item["wos"]]
+t("a silent failure lands its entry", integ("C/silent") == "x" and "q1" not in land("queue").stdout, land("queue").stdout)
+t("and opens an open test finding for the failing step's zone",
+  [(item["kind"], item["state"], item["zone"]) for item in findings] == [("test", "open", "C")], findings)
+t("with a FIX-FORWARD REQUEST to that zone", any(line.startswith("REQUEST Coord-C") and "FIX-FORWARD" in line
+                                                  for line in (W / "notify.log").read_text().splitlines()))
 
 print(f"\n{'all passed' if not fails else f'{fails} failed'}  ({W})")
 sys.exit(1 if fails else 0)

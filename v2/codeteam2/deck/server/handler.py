@@ -18,8 +18,8 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 
 def make_handler(collector, web_dir: Path, motion_on: bool, interval: float) -> type[BaseHTTPRequestHandler]:
-    """A handler class bound to one collector and web folder. The web folder's file list is taken once, here."""
-    files = web_files(web_dir)
+    """A handler class bound to one collector and web folder. Each request lists the web folder afresh, so a page
+    file added while the server runs is served and a removed one is a 404."""
 
     class DeckHandler(BaseHTTPRequestHandler):
         def _answer(self):
@@ -29,19 +29,34 @@ def make_handler(collector, web_dir: Path, motion_on: bool, interval: float) -> 
                 app._log(traceback.format_exc())
 
         def _dispatch(self):
+            files = web_files(web_dir)
             status, action, arg = route(self.command, self.path, self.headers, self.server.server_address[1], files)
-            if action == "page":
-                body = page_html(files[arg].read_text(), motion_on, interval).encode("utf-8")
-                self._send(status, CONTENT_TYPES[".html"], body)
+            if action in ("page", "static"):
+                self._send_file(status, action, files.get(arg))
             elif action == "snapshot":
                 self._send(status, "application/json", snapshot_payload(*collector.latest()))
-            elif action == "static":
-                self._send(status, CONTENT_TYPES[files[arg].suffix], files[arg].read_bytes())
             elif action == "disk_now":
                 collector.disk_now()
                 self._send(status, None, b"")
             else:
-                self._send(status, "text/plain; charset=utf-8", HTTPStatus(status).phrase.encode("utf-8"))
+                self._refuse(status)
+
+        def _send_file(self, status, action, path):
+            """A page or static file; 404 when it is not in this request's listing or is gone by the time it is read."""
+            if path is None:
+                return self._refuse(404)
+            try:
+                if action == "page":
+                    content_type = CONTENT_TYPES[".html"]
+                    body = page_html(path.read_text(), motion_on, interval).encode("utf-8")
+                else:
+                    content_type, body = CONTENT_TYPES[path.suffix], path.read_bytes()
+            except FileNotFoundError:
+                return self._refuse(404)
+            self._send(status, content_type, body)
+
+        def _refuse(self, status):
+            self._send(status, "text/plain; charset=utf-8", HTTPStatus(status).phrase.encode("utf-8"))
 
         def _send(self, status, content_type, body):
             self.send_response(status)

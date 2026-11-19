@@ -1,11 +1,10 @@
 #!/usr/bin/env -S python3 -u
-"""Stage 6 names the failing zones and tests from the validation machine's whole log.
-ssh and findings are faked; nothing reaches a machine."""
+"""Stage 6 names failing zones and tests from the kept log, locally or on valhost.
+ssh, findings and the kept log are faked; no process starts. The cases that run the remote grep and tail in a real
+/bin/sh are in tests/integration/land-failing-tests.py."""
 import importlib.machinery
 import importlib.util
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,71 +16,34 @@ cl = importlib.util.module_from_spec(spec)
 with patch.object(subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=0)):
     loader.exec_module(cl)
 
-LOG = ("   Compiling widgetcorekit\n"
-       "test dreaming::dreaming_pump_emits_think_events ... FAILED\n"
-       + "test dreaming::passes ... ok\n" * 500 +
-       "test intake::encode_intake_parity ... FAILED\n"
-       "FAILED ZONES: WidgetCoreKit WidgetStoreKit\n")
 TEAM = SimpleNamespace()
 
 
-def shell_ssh(log, calls):
-    """A fake ssh that runs the command it is given in a local shell, with HOME at a folder holding the log, so the
-    remote grep and tail are exercised as written."""
-    def fake_ssh(a, cmd, timeout=None, input=None):
-        calls.append(cmd)
-        with tempfile.TemporaryDirectory() as home:
-            logs = Path(home) / "land-check-logs"
-            logs.mkdir()
-            (logs / ("c" * 40 + ".log")).write_text(log)
-            r = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True, timeout=timeout,
-                               env=dict(os.environ, HOME=home))
-        return SimpleNamespace(returncode=r.returncode, stdout=r.stdout, stderr=r.stderr)
-    return fake_ssh
-
-
-def rows(res, log, local=False, findings=()):
-    calls = []
-    with patch.object(cl, "ssh", shell_ssh(log, calls)), patch.object(cl, "all_findings", return_value=list(findings)):
-        out = cl.validation_test_rows(TEAM, {"local": local}, "c" * 40, res)
-    return out, calls
-
-
-def test_a_remote_failure_names_its_zones_and_tests_from_the_whole_log():
-    out, calls = rows({"result": "fail", "tail": "error: test failed, to rerun pass `--lib`"}, LOG)
-    assert [t["name"] for t in out] == ["WidgetCoreKit", "WidgetStoreKit"], out
-    assert out[0]["failing"] == ["dreaming::dreaming_pump_emits_think_events", "intake::encode_intake_parity"]
-    assert len(calls) == 1 and "land-check-logs/" + "c" * 40 + ".log" in calls[0]
-
-
-def test_failing_tests_alone_still_reach_the_suite_row():
-    out, _ = rows({"result": "fail", "tail": ""}, "test a::b ... FAILED\n")
-    assert out == [{"name": "suite", "result": "fail", "seconds": None, "failing": ["a::b"]}], out
-
-
-def test_only_failure_lines_come_back_from_the_remote_read():
-    with patch.object(cl, "ssh", shell_ssh(LOG + "error: 2 tests FAILED in this run\n", [])):
-        got = cl.remote_failure_lines({}, "c" * 40)
-    assert got.splitlines() == ["test dreaming::dreaming_pump_emits_think_events ... FAILED",
-                                "test intake::encode_intake_parity ... FAILED",
-                                "FAILED ZONES: WidgetCoreKit WidgetStoreKit"], got
+def rows(res, local=False, findings=()):
+    with patch.object(cl, "ssh", side_effect=AssertionError("pass ssh")), \
+            patch.object(cl, "all_findings", return_value=list(findings)):
+        return cl.validation_test_rows(TEAM, {"local": local, "host": "val"}, "c" * 40, res)
 
 
 def test_a_pass_reads_no_remote_log():
-    out, calls = rows({"result": "pass", "tail": ""}, LOG)
-    assert calls == [] and [t["name"] for t in out] == ["suite"]
+    out = rows({"result": "pass", "tail": ""})
+    assert [t["name"] for t in out] == ["suite"]
 
 
 def test_a_local_tier_reads_no_remote_log():
-    out, calls = rows({"result": "fail", "tail": "FAILED ZONES: zone"}, LOG, local=True)
-    assert calls == [] and [t["name"] for t in out] == ["zone"]
+    with patch.object(cl, "kept_failure_lines", return_value=""), \
+            patch.object(cl, "ssh", side_effect=AssertionError("local ssh")), \
+            patch.object(cl, "all_findings", return_value=[]):
+        out = cl.validation_test_rows(TEAM, {"local": True, "host": "val"}, "c" * 40,
+                                      {"result": "fail", "tail": "FAILED ZONES: zone"})
+    assert [t["name"] for t in out] == ["zone"]
 
 
 def test_an_unreachable_machine_falls_back_to_the_tail():
     def broken(a, cmd, timeout=None, input=None):
         raise subprocess.TimeoutExpired(cmd, timeout)
     with patch.object(cl, "ssh", broken), patch.object(cl, "all_findings", return_value=[]):
-        out = cl.validation_test_rows(TEAM, {}, "c" * 40, {"result": "fail", "tail": "FAILED ZONES: A"})
+        out = cl.validation_test_rows(TEAM, {"host": "val"}, "c" * 40, {"result": "fail", "tail": "FAILED ZONES: A"})
     assert [t["name"] for t in out] == ["A"] and "failing" not in out[0]
 
 
@@ -95,6 +57,90 @@ def test_the_finding_text_names_the_failing_tests():
                                                     "failing": ["dreaming::x"]}, "now")
     assert saved[0]["zone"] == "WidgetCoreKit" and "failing tests: dreaming::x" in saved[0]["what"], saved
     assert "failing tests: dreaming::x" in sent[0][2]
+
+
+VITEST = (" FAIL   engine  __tests__/daemon-older-version.test.ts > a launcher > never stops a server from a newer install\n"
+          " FAIL  src/broken.test.ts [ src/broken.test.ts ]\n")
+LOCAL_LOG = "~/land-check-logs/" + "c" * 40 + ".log"
+
+
+def local_rows(res, log="", findings=()):
+    with patch.object(cl, "kept_failure_lines", return_value=log), \
+            patch.object(cl, "ssh", side_effect=AssertionError("local ssh")), \
+            patch.object(cl, "all_findings", return_value=list(findings)):
+        return cl.validation_test_rows(TEAM, {"local": True}, "c" * 40, res)
+
+
+def test_team_vitest_failures_become_file_rows():
+    assert cl.validation_tests({"result": "fail", "tail": VITEST}, None, []) == [
+        {"name": "__tests__/daemon-older-version.test.ts", "result": "fail", "seconds": None,
+         "failing": ["__tests__/daemon-older-version.test.ts > a launcher > never stops a server from a newer install"]},
+        {"name": "src/broken.test.ts", "result": "fail", "seconds": None, "failing": []}]
+
+
+def test_team_hung_vitest_keeps_suite():
+    assert cl.validation_tests({"result": "hung", "seconds": 30, "tail": VITEST}, None, []) == [
+        {"name": "__tests__/daemon-older-version.test.ts", "result": "fail", "seconds": None,
+         "failing": ["__tests__/daemon-older-version.test.ts > a launcher > never stops a server from a newer install"]},
+        {"name": "src/broken.test.ts", "result": "fail", "seconds": None, "failing": []},
+        {"name": "suite", "result": "hung", "seconds": 30}]
+
+
+def test_failed_zones_take_precedence_over_vitest_files():
+    assert cl.validation_tests({"result": "fail", "tail": VITEST + "FAILED ZONES: core\n"}, None, []) == [
+        {"name": "core", "result": "fail", "seconds": None}]
+
+
+def test_local_failed_log_supplies_files_and_preserves_each_files_tests():
+    assert local_rows({"result": "fail", "tail": "last line"}, VITEST) == [
+        {"name": "__tests__/daemon-older-version.test.ts", "result": "fail", "seconds": None,
+         "failing": ["__tests__/daemon-older-version.test.ts > a launcher > never stops a server from a newer install"],
+         "log": LOCAL_LOG},
+        {"name": "src/broken.test.ts", "result": "fail", "seconds": None, "failing": [], "log": LOCAL_LOG}]
+
+
+def test_local_hung_log_adds_log_to_suite_and_files_not_passes():
+    findings = [{"state": "open", "by": "validation", "test": "src/old.test.ts"}]
+    assert local_rows({"result": "hung", "seconds": 30, "tail": ""}, VITEST, findings=findings) == [
+        {"name": "__tests__/daemon-older-version.test.ts", "result": "fail", "seconds": None,
+         "failing": ["__tests__/daemon-older-version.test.ts > a launcher > never stops a server from a newer install"],
+         "log": LOCAL_LOG},
+        {"name": "src/broken.test.ts", "result": "fail", "seconds": None, "failing": [], "log": LOCAL_LOG},
+        {"name": "src/old.test.ts", "result": "pass", "seconds": None},
+        {"name": "suite", "result": "hung", "seconds": 30,
+         "failing": ["__tests__/daemon-older-version.test.ts > a launcher > never stops a server from a newer install"],
+         "log": LOCAL_LOG}]
+
+
+def test_local_pass_does_not_read_failure_log():
+    with patch.object(cl, "kept_failure_lines", side_effect=AssertionError("pass read a log")), \
+            patch.object(cl, "ssh", side_effect=AssertionError("local ssh")), \
+            patch.object(cl, "all_findings", return_value=[]):
+        assert cl.validation_test_rows(TEAM, {"local": True}, "c" * 40,
+                                       {"result": "pass", "seconds": 4}) == [
+            {"name": "suite", "result": "pass", "seconds": 4}]
+
+
+def test_finding_and_notice_append_log_after_failing_tests():
+    team = SimpleNamespace(c=lambda k, d: d, notify=lambda *a: sent.append(a), manifest="m.toml", landing="landing",
+                           zones={"core": ["core"]})
+    sent, saved = [], []
+    with patch.object(cl, "load_findings", return_value=[]), \
+            patch.object(cl, "save_findings", lambda team, feature, items: saved.extend(items)):
+        cl.open_validation_finding(team, "c" * 40, {"name": "core", "result": "fail", "failing": ["a::b"],
+                                                    "log": LOCAL_LOG}, "now")
+    assert saved[0]["what"].endswith("; failing tests: a::b; log: " + LOCAL_LOG), saved
+    assert "; failing tests: a::b; log: " + LOCAL_LOG in sent[0][2], sent
+
+
+def test_finding_without_log_is_unchanged():
+    team = SimpleNamespace(c=lambda k, d: d, notify=lambda *a: None, manifest="m.toml", landing="landing",
+                           zones={"core": ["core"]})
+    saved = []
+    with patch.object(cl, "load_findings", return_value=[]), \
+            patch.object(cl, "save_findings", lambda team, feature, items: saved.extend(items)):
+        cl.open_validation_finding(team, "c" * 40, {"name": "core", "result": "fail"}, "now")
+    assert saved[0]["what"] == "core fails in validation at C cccccccccc"
 
 
 if __name__ == "__main__":

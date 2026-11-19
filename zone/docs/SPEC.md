@@ -7,6 +7,8 @@ What this zone must do. Changes come from the user and the repo-orchestrator.
 - Every test run (`make zone-test`, `make zone-test-one`) and every gated build (`swift`, `cargo`, `xcodebuild`) goes
   through one runner, `bin/codeteam-buildq`, which shares a CPU budget between five classes (`land`, `full`, `post`, `pre`,
   `dev`): each has a guaranteed share and may borrow what is idle up to its ceiling, round-robin by team inside a class.
+  Ahead of the classes, a team with work waiting and nothing running starts one job, over the budget if need be;
+  an idle team keeps nothing back. The runner's heartbeat shows each team's running and waiting count.
   No load guard: load never holds a start. The swap guard holds dev starts when swap use exceeds `swap_max`
   (90% by default).
 - A job is a file. A test run's submitter gets a ticket at once and waits in bounded steps (`zone-tool job submit`,

@@ -16,10 +16,11 @@ KONG = SimpleNamespace(key="kong", display="Kong")
 
 class FakeStore:
     def __init__(self):
-        self.rows, self.marks = [], []
+        self.rows, self.marks, self.rides = [], [], []
 
-    def add(self, channel, sender, kind, to, recipient, text):
+    def add(self, channel, sender, kind, to, recipient, text, ride=False):
         self.rows.append((to, recipient, text))
+        self.rides.append(ride)
         return len(self.rows)
 
     def mark(self, mid, state, note):
@@ -55,6 +56,18 @@ class SayTest(unittest.TestCase):
             inbox = (Path(d) / "creator-inbox.log").read_text().splitlines() if (Path(d) / "creator-inbox.log").exists() else []
         return team, rt.store, inbox
 
+    def test_session_ride_is_recorded(self):
+        team, rt = FakeTeam(), SimpleNamespace(store=FakeStore(), herdr=SimpleNamespace(notify=lambda *a: None))
+        cli.cmd_say(team, rt, SimpleNamespace(type="NOTE", text=["hello"], channel="general",
+                                              sender="Orc-Codeteam", to="Kong", ride=True))
+        self.assertEqual(rt.store.rows, [("Kong", "kong", "hello")])
+        self.assertEqual(rt.store.rides, [True])
+
+    def test_session_without_ride_attribute_does_not_ride(self):
+        _, store, _ = self.say("Kong")
+        self.assertEqual(store.rows, [("Kong", "kong", "hello")])
+        self.assertEqual(store.rides, [False])
+
     def test_a_message_for_the_creator_is_recorded_once(self):
         team, store, inbox = self.say("creator")
         self.assertEqual(store.rows, [("creator", "codeteam", "hello")])
@@ -72,6 +85,30 @@ class SayTest(unittest.TestCase):
         self.assertEqual(store.rows, [("codeteam", "codeteam", "idle: nothing open")])
         self.assertEqual(store.marks[-1][2], "for codeteam; no session")
         self.assertEqual(inbox, [])
+
+    def test_an_answer_to_the_creator_reaches_its_inbox(self):
+        # D496: 35 ANSWERs addressed to `creator` were dropped as patrol replies because they did not name the creator.
+        team, store, inbox = self.say("creator", kind="ANSWER", text="#4371: confirmed")
+        self.assertEqual(store.rows, [("creator", "codeteam", "#4371: confirmed")])
+        self.assertEqual(len(inbox), 1)
+
+    def test_a_name_that_would_reach_no_one_is_refused_and_nothing_is_recorded(self):
+        # D496: from the orchestrator, a name no session has fell back to the orchestrator itself and was dropped.
+        with self.assertRaises(SystemExit) as refused:
+            self.say("Orc-Codeteam-jj", kind="DONE", text="#4387 is live")
+        self.assertIn("no session named Orc-Codeteam-jj", str(refused.exception.code))
+        self.assertIn("nothing was sent", str(refused.exception.code))
+
+    def test_a_refused_name_in_a_list_stops_the_whole_message(self):
+        team, rt = FakeTeam(), SimpleNamespace(store=FakeStore(), herdr=SimpleNamespace(notify=lambda *a: None))
+        with self.assertRaises(SystemExit):
+            cli.cmd_say(team, rt, SimpleNamespace(type="NOTE", text=["x"], channel="general", sender="Orc-Codeteam",
+                                                  to="Kong,Orc-Codeteam-jj"))
+        self.assertEqual((rt.store.rows, team.logged), ([], []))
+
+    def test_an_unknown_name_from_another_session_still_goes_to_the_orchestrator(self):
+        team, store, inbox = self.say("Orc-Codeteam-jj", sender="Kong")
+        self.assertEqual(store.rows, [("Orc-Codeteam-jj", "orc", "hello")])
 
 
 if __name__ == "__main__":

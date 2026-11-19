@@ -18,7 +18,9 @@ not a package). Pure stdlib, Python 3.11. Importing it reads no environment and 
   other lanes own (their zone folder, unless it is `""` or `"."`, and their `owns`); `walled()` is true for a
   whole-repo lane (zone `"."`) when `others()` is not empty; `orchestrator_owned(rel)` is true when `rel` matches an entry of
   `orchestrator_owns` the way `owns` matches (the folder and what is under it, an exact file, or a glob), or matches one with
-  case folded on both sides; `in_area(rel)`; `owns_doc(rel)`.
+  case folded on both sides; `in_area(rel)`; `owns_doc(rel)`; `lockfile(rel)` is true when `rel`'s file name is in `LOCKFILES`
+  and `orchestrator_owned(rel)` is false: a lock file every lane may edit, anywhere. `refused_by` and the landing tool's
+  wall check (`bin/codeteam-land` `check_work_order`) both ask it.
 - `load_walls(*, lane, zone, owns, team_json, codeteam_home, manifest=None) -> Walls`: strips whitespace and `/` from `zone` and
   each `owns` entry (empties dropped), reads `team_json` (a path, or `None`) for the lanes and
   `<codeteam_home>/zone/zone-docs.json`. A team.json that is missing, unreadable, not JSON or without a `"lanes"`
@@ -64,6 +66,10 @@ for that lane, and the scratch-clone refusal does not apply to it. Push-up's wal
 changes such a path. Nothing else is refused for that lane: no zone fence, no test-route, make or build refusal. The
 refusal names the orchestrator (`Orc-<Product>`) and the manifest's `orchestrator_owns`. A manifest without the key makes
 the pretool hook return early for such a lane. Zoned and walled lanes are unchanged.
+The orchestrator's own session (`CODETEAM_SESSION` `orc`, no `CODETEAM_SWT`, `CODETEAM_MANIFEST` set) is checked
+differently: its writes, `git rm` and `git mv`, and the git forms that rewrite the worktree are refused only in or on a
+code package folder, naming the lane whose area covers it or saying it has none (`orc_package_refusal.py`);
+`orchestrator_owns` is not read for it, and `git add` is not judged.
 
 Case: paths match exactly (`V2/x` is not inside `v2`, and a glob is matched with `fnmatchcase`). Case is folded
 only to refuse more: a walled lane's `in_area` refuses a case-only match of another lane's area, and `refused_by`
@@ -101,7 +107,10 @@ reaches this module.
 
 ## bin/zone-tool ledger: the ledger files are git-excluded
 
-The ledger lives at git top inside a checkout, else in the current folder (such as a v5 zone folder).
+The ledger lives in `CODETEAM_LEDGER_ROOT` when it is set, whatever the current folder: a lane session's launch
+script sets it to the folder codeteam's patrol, sweep and push-up read (`lane_ledger_dir`: the lane folder for a lane
+without a `ref` on a team that lands with codeteam-land, else the lane's standing worktree), and `zone-tool backlog`
+then names the zone after that folder. Unset, it lives at git top inside a checkout, else in the current folder.
 Outside a checkout, nothing is excluded and there is no exclude warning.
 
 In a checkout, every `zone-tool ledger` write (add, stage, close, first) adds missing `/.ledger.md` and
@@ -182,8 +191,8 @@ Every test run and every gated build (`swift`, `cargo`, `xcodebuild` through `bi
 queue folder Q. One runner (`bin/codeteam-buildq`) decides which job starts; nothing else starts a queued job.
 Design: `zone/docs/build-queue.md`.
 
-**Paths.** Q is `$CODETEAM_QUEUE_DIR`, else `<codeteam>/run/queue`, created 0700 because a run job holds the submitter's
-whole environment. `Q/..` is `<codeteam>/run`. The config is `$CODETEAM_QUEUE_CONF`, else `Q/../queue.toml`; it is read at
+**Paths.** Q is `$CODETEAM_QUEUE_DIR`, else `<codeteam>/run/queue`, created 0700 because a queued or running run job holds the
+submitter's whole environment. `Q/..` is `<codeteam>/run`. The config is `$CODETEAM_QUEUE_CONF`, else `Q/../queue.toml`; it is read at
 every decision, and a missing or unreadable file means the defaults.
 
 **What is in Q.** `Q/<ticket>.json` is a job; `Q/<ticket>.log` is a run job's output; every name starting with `.` is
@@ -195,7 +204,8 @@ finished run job: `hkey`, `class`, `cpu_seconds`, `wall_seconds`, `finished`; `h
 
 **Writing.** A job file is written atomically (a temporary `.<ticket>.json.tmp`, then `os.replace`), mode 0600. Every
 read-modify-write of a job file holds `flock(Q/.lock)` (LOCK_EX), briefly: never across a wait or a build. Readers take
-no lock. The runner holds `flock(Q/.runner.lock)` for its whole life: a free lock means no runner.
+no lock. The runner holds `flock(Q/.runner.lock)` while it serves Q: a free lock means no runner serves it. At an idle
+exit the runner releases it, rechecks Q once, and exits or retakes it.
 
 **Job file.** Times are epoch seconds except `stopped`, which uses monotonic seconds for signal escalation. A run job is `zone-tool test`; a slot job is a build that `codeteam-slot` will exec
 once the runner marks it running.
@@ -208,8 +218,8 @@ once the runner marks it running.
 | `key` str | the record key (run); `"slot <tool>"` (slot) |
 | `command` [str] | argv: after `--` for a run job; `[tool, *args]` for a slot job |
 | `worktree` str or null | the git top level of the submitter's folder |
-| `env` {str: str} | run: the submitter's whole environment, kept in every state (queued, running, done, broken), adopted and fallback jobs included, so a job can be re-run exactly; slot: `{}`. The deck never shows it |
-| `team` str or null | the first `team-<x>` folder in `worktree` |
+| `env` {str: str} | run: the submitter's whole environment while the job is queued or running, adopted and fallback jobs included, so a job can be re-run exactly; `{}` once it settles (done or broken, a cancel included), and the runner empties every settled record already in Q when it starts; slot: `{}`. The deck never shows it |
+| `team` str or null | the first `team-<x>` folder in `worktree`. The runner takes a job's team from this field when it is a non-empty string, else from that folder; a job with neither has no team |
 | `session` str or null | `CODETEAM_SESSION`; empty is null |
 | `submitted`, `started`, `finished` | `started` and `finished` are null until they happen |
 | `pid` int or null | run: the `zone-tool test` child (null from marking to spawn); slot: the waiting `codeteam-slot` process, which execs the tool and keeps the pid |
@@ -217,7 +227,7 @@ once the runner marks it running.
 | `record` str or null | run: absolute path of the record `zone-tool test` writes; slot: null |
 | `cost` float or null | CPU units against the budget; see build-queue.md |
 | `estimated_start` float or null | refreshed at each decision, for queued jobs |
-| `position` int or null | 1-based place among the queued jobs of the same class, in start order; null once not queued |
+| `position` int or null | 1-based place among the queued jobs of the same class, in the class's start order; null once not queued. The team guarantee may start a job ahead of its place |
 | `hold` str or null | why a queued job is not starting, written at each decision: `"warm"` (its `warm_lock` is flock-held) or `"swap"` (the guard holds its class); null otherwise and once not queued |
 | `warm_lock` str or null | `<git dir>/codeteam-warm.lock`; null when `CODETEAM_WARMING` is set. A held lock keeps the job queued |
 | `test_flags` [str] | run: the `zone-tool test` options (`--key`, `--salt`, `--scope`, `--timeout`, `--cached`, `--single`); slot: `[]` |
@@ -228,6 +238,7 @@ once the runner marks it running.
 | `reason` str or null | why `broken`, `"fallback: ..."` when the submitter ran it itself, or `"hung: ..."` for a run job the backstop stopped |
 | `fallback` bool | the submitter ran it itself because the queue was unavailable |
 | `answered` bool | only on a `done` run job that `zone-tool test` answered from an existing record instead of running (`--cached` or `--single` found one): true. Its `result` and `exit` are that record's, and the history gets no line |
+| `guarantee` str | only on a job the team guarantee started: `"team"`, written with its `running` mark (a team with a startable job waiting and nothing running starts its first job ahead of the classes, over the budget if need be; see build-queue.md). A job the classes started has no such key |
 | `stopped` float | only after a hung run job's stop: monotonic seconds when SIGTERM was sent (SIGKILL follows on a later decision at least 10 s later) |
 
 States. A submitter writes `queued`. The runner marks `running` (a run job gets its `pid` a moment later), then `done`
@@ -261,7 +272,9 @@ silence under the full hang rule. A slot job settles done only when its pid is g
 
 **The runner's state: `Q/../queue-runner.json`** (not in Q, so every `Q/*.json` is a job). Rewritten
 atomically at every decision:
-`{"pid", "beat" (epoch), "budget", "used" (sum of running costs), "swap", "swap_max", "swap_hold"}`. A `beat` older than `CODETEAM_BUILDQ_STALE` (60 s) while the runner lock is held means a hung runner.
+`{"pid", "beat" (epoch), "budget", "used" (sum of running costs), "swap", "swap_max", "swap_hold", "teams"}`. `teams` is
+`{<team without its "team-" prefix>: {"running": n, "waiting": n}}` for every team with a running or queued job; jobs
+with no team count under `"-"`, and `waiting` counts every queued job, held or not. A `beat` older than `CODETEAM_BUILDQ_STALE` (60 s) while the runner lock is held means a hung runner.
 What each client does with a hung or missing runner:
 
 - `codeteam-slot`: runs the build itself on any exception on the queue path, with no runner (none alive within
@@ -321,7 +334,8 @@ decision is seen at the next (one tick later).
   `queued`; a job the runner already started carries on as a wait). `--wait auto` waits `BASH_DEFAULT_TIMEOUT_MS` / 1000
   less 60 seconds when that variable is set (1740 in a codeteam session), at least 30, else 100.
 - `job wait <ticket> [--max SECONDS]` (default 540): exit 0 DONE (prints the job's log, then, for a job that ran,
-  `zone-tool: queued N s, ran M s (job <ticket>)`, then `zone-test: <result> (exit N); record <path>`, or
+  `zone-tool: queued N s, ran M s (job <ticket>)` (`(job <ticket>, build B s)` when the job's record holds a
+  numeric `build_seconds`), then `zone-test: <result> (exit N); record <path>`, or
   `zone-test: <result> (exit N); answered from record <path>` for an `answered` job; a FAIL is still 0), 4 WAITING
   (`WAITING: queued, number N in class C, estimated start HH:MM` or `unknown`, with `, held: <hold>` added when
   `hold` is set, or `WAITING: running for M min`;
@@ -330,7 +344,7 @@ decision is seen at the next (one tick later).
   exits 4. It never runs the test.
 - `job status [<ticket>]`: exit 0. First line `budget <used>/<budget> swap <s>/<max>[ HOLD dev]`
   (`runner: not running` without a runner), then one line per queued and running job (with a ticket: that job in any
-  state): `<ticket> <class> <state> <team|-> <session|-> <worktree|-> cost=<c> <queued N s|running N s|done exit N|broken: why>`.
+  state): `<ticket> <class> <state> <team|-> <session|-> <worktree|-> cost=<c> <queued N s|running N s|done exit N|broken: why>`, then ` guarantee=<g>` when the job file has a `guarantee`.
 
 **zone.mk.** `make zone-test` submits class `$(or $(CLASS),full)`, `make zone-test-one` class `$(or $(CLASS),dev)`, each with
 `--wait $(ZONE_JOB_WAIT)`. `ZONE_JOB_WAIT` is `auto` by default: the session's own shell limit minus a minute (1740 s
@@ -340,6 +354,10 @@ still waiting then makes make fail with zone-tool's exit 4 (make reports "Error 
 `CODETEAM_TEST_GROUP` passes through the queue and zone-tool `test-one` to the tests; its non-unit value adds
 ` test-group=<group>` to the `zone-test-one` record key, separate from `GROUP`'s ` group=<group>` term. Unset or
 `unit` keeps the existing key, and a pass in one group cannot satisfy another group's whole-run retry guard.
+`CODETEAM_KINDS_BY_NAME=1` (exactly `1` after stripping) makes `test-one` run only the tests named the group
+and adds ` env:CODETEAM_KINDS_BY_NAME=1` once to the `zone-test-one` key and `zone-test`'s salt, also when
+`ZONE_TEST_KEY_VARS` lists it; its records carry `"kinds": "by-name"` and answer only runs with it on, other records
+only runs with it off.
 `PYTEST_ARGS` and `PYTEST_ADDOPTS`, when non-empty after stripping whitespace, append ` pytest=<value>` and
 ` pytest-addopts=<value>` before the group terms; unset, empty or whitespace-only values leave the key unchanged.
 `PYTEST_ARGS` can reach a repo Makefile's `test-one`, but zone.mk's own does not pass it to pytest. An exported
@@ -347,7 +365,7 @@ still waiting then makes make fail with zone-tool's exit 4 (make reports "Error 
 unlabelled SWIFT/CARGO terms, with two accepted collision limits: values containing label words can still collide,
 and `zone-tool job submit` collapses whitespace in `--key`, so values differing only in inner whitespace share a record.
 Either variable with a non-whitespace value makes the key a filtered run for zone-tool's whole-run guard: `_key_parts` treats any word
-after `one DIR` other than `owns=`, `group=` or `test-group=` metadata as a filter.
+after `one DIR` other than `owns=`, `group=`, `test-group=` or `env:` metadata as a filter.
 
 **zone-check.** `make zone-check DIR=<path>` runs `zone-tool check <DIR>`, the type-check also used by the test
 submission guard. The guard skips it for joined jobs, build-queue tickets and landings, as well as recorded answers.
@@ -395,6 +413,8 @@ so a reader can see an empty file or the previous holder's record for a moment; 
 means unknown. The flock is the only truth: the runner probes it (try, release at once) to keep a job queued while its
 worktree is still being warmed, and readers never take, test or release it for any other reason.
 
-Tests: `zone/tests/test_buildq_launch.py` (kickstart, queue guard, override and errors), `zone/tests/buildq-sched.sh`, `buildq-restart.sh`, `buildq-plist.sh`, `buildq-e2e.sh` (the runner),
+Tests: `zone/tests/test_buildq_launch.py` (kickstart, queue guard, override and errors), `zone/tests/test_buildq_team_slot.py`
+(the team guarantee and the heartbeat's `teams`), `zone/tests/test_zone_tool_job_line.py` (the status line's `guarantee`),
+`tests/unit/test_codeteam_job_team.py`, `test_codeteam_team_slot.py`, `test_codeteam_team_counts.py`, `test_codeteam_startable.py`, `test_codeteam_class_pick.py`, `test_codeteam_pool_admits.py` (the share modules), `zone/tests/buildq-sched.sh`, `buildq-restart.sh`, `buildq-plist.sh`, `buildq-e2e.sh` (the runner),
 `zone-job.sh`, `zone-job-mk.sh` (the verbs and make targets), `slot-queue.sh`, `slot-record.sh` (codeteam-slot),
 `warm-lock-record.sh` (the warm lock record).

@@ -7,11 +7,14 @@
 # 4. Backlog defaults to the folder name.
 # 5. Only the two ledger files exist in the non-git folder, with no .git.
 # 6. A checkout subfolder writes at git top and updates info/exclude.
+# 7. CODETEAM_LEDGER_ROOT (a lane session's ledger folder) takes a write made from another folder, and
+#    backlog names the zone after that folder.
+# 8. It takes a close made from inside a checkout too, and the checkout's ledger is untouched.
 set -u
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
       GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CEILING_DIRECTORIES \
       GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
-unset MAKEFLAGS MFLAGS MAKELEVEL MAKEOVERRIDES DIR MAKEFILES CODETEAM_ZONE CODETEAM_OWNS \
+unset MAKEFLAGS MFLAGS MAKELEVEL MAKEOVERRIDES DIR MAKEFILES CODETEAM_ZONE CODETEAM_OWNS CODETEAM_LEDGER_ROOT \
       ZONE ZONE_ROOT ZONE_TOOL ZONE_TEST ZONE_TEST_FLAGS
 # Stage 2 (v5.2) sets GROUP and CODETEAM_TEST_GROUP: children must not inherit them or their record keys change.
 # export -n keeps the outer values available to this script without exporting them.
@@ -106,6 +109,29 @@ cmp -s "$repo/.ledger.md" "$tmp/want" || add_why "git top ledger missing queued 
 [ ! -e "$repo/sub/.ledger.md" ] || add_why "ledger incorrectly written in subfolder"
 grep -qxF '/.ledger.md' "$repo/.git/info/exclude" || add_why "info/exclude lacks /.ledger.md"
 finish "6 checkout subfolder uses git top and exclude"
+
+lane="$tmp/lane"
+mkdir -p "$lane/ledger" || exit 2
+export CODETEAM_LEDGER_ROOT="$lane"
+zt "$lane/ledger" folder ledger add L1
+check_run "named-folder ledger add L1"
+printf 'L1 · queued · -\n' > "$tmp/want"
+cmp -s "$lane/.ledger.md" "$tmp/want" || add_why "the named folder's ledger lacks queued L1"
+[ ! -e "$lane/ledger/.ledger.md" ] || add_why "ledger written in the cwd, not the named folder"
+zt "$lane/ledger" folder backlog
+check_run "named-folder backlog"
+case "$out" in 'lane: now L1 (stage: queued,'*) ;; *) add_why "backlog does not name the lane folder and L1: $out";; esac
+finish "7 a named ledger folder takes a write from another folder, and backlog names it"
+
+zt "$repo/sub" repo ledger close L1
+check_run "named-folder ledger close L1 from a checkout"
+grep -Eq '^L1 · - · [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$' "$lane/.ledger-closed" 2>/dev/null || add_why "the named folder lacks the closed L1 row"
+[ -f "$lane/.ledger.md" ] && ! grep -q '^L1 · ' "$lane/.ledger.md" || add_why "the named folder's ledger missing or still holds L1"
+printf 's1 · queued · -\n' > "$tmp/want"
+cmp -s "$repo/.ledger.md" "$tmp/want" || add_why "the checkout's ledger changed"
+[ ! -e "$repo/.ledger-closed" ] || add_why "close written at the checkout's top"
+unset CODETEAM_LEDGER_ROOT
+finish "8 a named ledger folder takes a close from inside a checkout"
 
 echo "== zone-tool-ledger-folder: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

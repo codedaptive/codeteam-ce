@@ -10,14 +10,21 @@ from pathlib import Path
 
 HOME = Path(__file__).resolve().parents[2]
 LAND = str(HOME / "bin" / "codeteam-land")
+W = Path(tempfile.mkdtemp(prefix="small-three-"))
+REPO, ROOT = W / "repo", W / "team"
+fails = 0
+CG = W / "codegraph"
+CALLS = W / "codegraph.calls"
+CG.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CG_CALLS"\n'
+              'if [ -d "$3" ]; then echo present >> "$CG_CALLS"; else echo absent >> "$CG_CALLS"; fi\n'
+              'exit "${CG_EXIT:-0}"\n')
+CG.chmod(0o755)
+os.environ.update(CODETEAM_CODEGRAPH=str(CG), CG_CALLS=str(CALLS), CG_EXIT="0")
 ld = importlib.machinery.SourceFileLoader("cl", LAND)
 sp = importlib.util.spec_from_loader("cl", ld)
 cl = importlib.util.module_from_spec(sp)
 sys.modules["cl"] = cl
 ld.exec_module(cl)
-W = Path(tempfile.mkdtemp(prefix="small-three-"))
-REPO, ROOT = W / "repo", W / "team"
-fails = 0
 
 
 def t(label, cond, detail=""):
@@ -26,10 +33,14 @@ def t(label, cond, detail=""):
     fails += not cond
 
 
-def land(*args):
+def land(*args, cg_exit=0):
     e = {k: v for k, v in os.environ.items() if not k.startswith("CODETEAM_")}
-    e["CODETEAM_SESSION"] = "orc"
+    e.update(CODETEAM_SESSION="orc", CODETEAM_CODEGRAPH=str(CG), CG_CALLS=str(CALLS), CG_EXIT=str(cg_exit))
     return subprocess.run([LAND, str(W / "team.toml"), *args], capture_output=True, text=True, env=e)
+
+
+def calls():
+    return CALLS.read_text().splitlines() if CALLS.exists() else []
 
 
 (REPO / "A").mkdir(parents=True)
@@ -55,15 +66,26 @@ t("wo-cut returns a tree with its record written", r.returncode == 0 and (ROOT /
 (ROOT / "wo" / "A" / "ghost" / "f").write_text("x")
 r = land("wo-retire", "ghost")
 t("a folder with no record that is not a git worktree needs --force", r.returncode != 0 and "--force" in r.stderr, r.stderr)
+t("refused folder retirement makes no CodeGraph call", calls() == [], calls())
 r = land("wo-retire", "ghost", "--force")
 t("with --force it is removed and recorded as retired", r.returncode == 0 and not (ROOT / "wo" / "A" / "ghost").exists()
   and (ROOT / "land" / "wo" / "ghost.retired.json").exists(), r.stdout + r.stderr)
+t("forced folder retirement unregisters exactly once while the tree exists",
+  calls() == [f"project remove {ROOT / 'wo' / 'A' / 'ghost'}", "present"], calls())
+CALLS.unlink(missing_ok=True)
 subprocess.run(["git", "worktree", "add", "-q", "-b", "wo/A/half", str(ROOT / "wo" / "A" / "half"), "integration"], cwd=REPO)
 r = land("wo-retire", "half")
 t("a git tree with no record is retired like any work order, its branch archived", r.returncode == 0
   and not (ROOT / "wo" / "A" / "half").exists()
   and subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/archive/wo/half"], cwd=REPO, capture_output=True).returncode == 0,
   r.stdout + r.stderr)
+t("git worktree retirement unregisters exactly once while the tree exists",
+  calls() == [f"project remove {ROOT / 'wo' / 'A' / 'half'}", "present"], calls())
+CALLS.unlink(missing_ok=True)
+(ROOT / "wo" / "A" / "failure").mkdir(parents=True)
+r = land("wo-retire", "failure", "--force", cg_exit=1)
+t("a failing CodeGraph call does not stop retirement", r.returncode == 0 and not (ROOT / "wo" / "A" / "failure").exists()
+  and calls() == [f"project remove {ROOT / 'wo' / 'A' / 'failure'}", "present"], r.stdout + r.stderr)
 t("a name with no folder is still unknown", land("wo-retire", "nothing").returncode != 0)
 
 print("== manifests")
