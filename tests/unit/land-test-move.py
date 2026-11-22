@@ -112,7 +112,7 @@ def test_validation_move_owes_nothing():
 
 
 def test_stage3_request_explains_misfiled_tests():
-    team = SimpleNamespace(repo=Path("/fake"), landing="landing", manifest="team.toml")
+    team = SimpleNamespace(repo=Path("/fake"), landing="landing", manifest="team.toml", c=lambda key, default: default)
     with patch.object(cl, "landed_refs", return_value=[]):
         text = cl.stage3_request(team, []).lower()
     assert "wrong group" in text and "unit" in text and "finding" in text and "doc-fix" in text

@@ -60,7 +60,7 @@ t("a file only the whole-tree lane holds reaches that lane, as a package team's 
   r == ["legacy"], r)
 declared_team = team({n: v for n, v in LANES.items() if n != "legacy"})
 r = cl.reach(declared_team, str(T), ["Makefile"])
-t("when every lane declares deps, a file no lane owns reaches every zone", r == ["loop", "pipeline", "runtime"], r)
+t("when every lane declares deps, a file no lane owns reaches no zone", r == [], r)
 r = cl.reach(declared_team, str(T), ["README.md"])
 t("an unowned documentation file reaches no zone", r == [], r)
 r = cl.reach(team(reach="chain"), str(T), ["bin/codeteam-land"])

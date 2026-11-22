@@ -38,8 +38,11 @@ def part_folders(parts, cwd, home, resolve):
     under every separator, and it never starts a `cd X ||` failure chain (in `! cd X || b`, b runs only if the cd
     succeeded).
     A cd's dirs are its words apart from options and redirects (`2>&1`, `> /dev/null`). Its folders: `home` with no
-    dir; unchanged for `cd -` (OLDPWD is not tracked); else its last dir, resolved against each folder the cd ran in
-    with the caller's `resolve(path, cwd)`."""
+    dir; unchanged for `cd -` (OLDPWD is not tracked); else, for each folder the cd ran in, its last dir's logical
+    folder, then its physical one, deduplicated. The logical folder is the dir joined to the folder and normalized with
+    a leading `~` taken as `home` and no symlink resolved, so a later `cd ..` drops its last part as bash's `cd -L`
+    does; the physical one is the caller's `resolve(path, cwd)`. With a symlink to elsewhere both are kept, and every
+    later part is judged in each."""
     # held: the folders after a `cd X ||` chain while the parts that run only if the cd failed are judged;
     # wide: the folders the parts after a conditional cd widen to at the next `;`, `||` or `&`;
     # conditional: whether the cd that started the held chain came after `&&` or `||`
@@ -100,7 +103,17 @@ def _cd_targets(args, folders, home, resolve):
     dirs = [a for a in args if a == "-" or not a.startswith("-")]
     if not dirs:
         return (home,)
-    return folders if dirs[-1] == "-" else tuple(dict.fromkeys(resolve(dirs[-1], f) for f in folders))
+    if dirs[-1] == "-":
+        return folders
+    return tuple(dict.fromkeys(p for f in folders for p in (_logical(dirs[-1], f, home), resolve(dirs[-1], f))))
+
+
+def _logical(path, folder, home):
+    """The folder `cd path` reaches from `folder` as bash tracks it: joined and normalized, `~` taken as `home`, no
+    symlink resolved."""
+    if path == "~" or path.startswith("~/"):
+        path = home + path[1:]
+    return os.path.normpath(os.path.join(folder, path))
 
 
 def _is_assignment(word):

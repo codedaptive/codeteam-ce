@@ -10,13 +10,16 @@ Reads are always fine. Sessions outside codeteam (the owner's own) are never tou
 Covers Edit, Write, MultiEdit and NotebookEdit by path, and Bash commands that write (a redirect, tee, cp, mv, rm, ln,
 sed -i, git commit/add/push/checkout/reset...) and either name a harness path or run in a harness folder. A write runs
 in its git command's `-C <dir>` when given, else in each folder part_folders follows the command's `cd`s to from the
-session's cwd (a piped cd moves none; parts joined by `&&` to one behind `&&` or `||` run in its folders alone;
-part_folders has the rest, `&` and `cd X ||` included). Each part's redirect target is checked, codeteam's tools too.
+session's cwd: a cd's logical folder (as bash tracks it, so `cd link && cd ..` is back where it started) and its
+physical one, both judged (a piped cd moves none; parts joined by `&&` to one behind `&&` or `||` run in its folders
+alone; part_folders has the rest, `&` and `cd X ||` included). A newline outside quotes and here-documents separates
+commands as `;` does. Each part's redirect target is checked, codeteam's tools too.
 
 Its helpers live beside this hook, one per file: segments.py (the command's parts; a redirect glued to a word is
-split off, and the `&` or `|` of `2>&1` does not split), redirects.py (a part's words apart from its redirects, and
-the files those write), command_words.py, part_folders.py and git_folder.py. A hyphenated hook can't be imported, so
-part_folders takes its HOME folder, and both part_folders and git_folder take its cwd resolver, as arguments.
+split off, and the `&` or `|` of `2>&1` does not split), command_newlines.py (the newlines that end a command),
+redirects.py (a part's words apart from its redirects, and the files those write), command_words.py, part_folders.py
+and git_folder.py. A hyphenated hook can't be imported, so part_folders takes its HOME folder, and both part_folders
+and git_folder take its cwd resolver, as arguments.
 """
 import json
 import os

@@ -165,7 +165,8 @@ def test_checked_members_puts_each_tree_back_before_it_reads_one():
         calls = []
         with patch.object(cl, "put_back_set_merge", side_effect=lambda rec: calls.append(("put back", rec["wo"]))), \
                 patch.object(cl, "carried_check", return_value=None), \
-                patch.object(cl, "check_work_order", side_effect=lambda team, rec: calls.append(("check", rec["wo"]))
+                patch.object(cl, "other_member_heads", return_value=[], create=True), \
+                patch.object(cl, "check_work_order", side_effect=lambda team, rec, *args: calls.append(("check", rec["wo"]))
                              or ["docs/x.md"]):
             cl.checked_members(team, ["w1", "w2"])
         assert calls == [("put back", "w1"), ("put back", "w2"), ("check", "w1"), ("check", "w2")], calls

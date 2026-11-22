@@ -6,6 +6,7 @@ import sys
 
 sys.dont_write_bytecode = True          # no __pycache__ beside the hooks in production's checkout
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from command_newlines import command_newlines
 from shell_text import code_only
 
 _SEPARATORS = {";", "&&", "||", "|", "&", "|&"}
@@ -20,10 +21,12 @@ def segments(cmd: str) -> list[tuple[str, list[str], str]]:
     `seg` its words joined by one space (a word holding whitespace shell-quoted). A separator inside quotes (a
     finding's --what text quoting `a > b; c | d`) stays in its word, and an `&` or `|` that is part of a
     redirect operator (`2>&1`, `<&3`, `&>f`, `>|f`) is not a separator; a redirect glued to a word (`cat>f`) or to a
-    descriptor duplication (`2>&1>f`) is its own word. When shlex cannot read the command (an unbalanced quote, an
-    apostrophe in a heredoc body or a `#` comment, `$'it\\'s'`), a space goes wherever _gaps puts one, so a glued
-    redirect is still its own word (after an unbalanced quote code_only blanks the rest, so none is added there); the
-    text is split on every `&&`, `||`, `;`, `|` and newline, quoted or not, a newline's part taking the separator ";".
+    descriptor duplication (`2>&1>f`) is its own word. A newline that command_newlines says ends a command ends a part
+    with the separator ";", as `;` does; one in quotes or a here-document stays in its word or part. When shlex cannot
+    read the command (an unbalanced quote, an apostrophe in a heredoc body or a `#` comment, `$'it\\'s'`), a space goes
+    wherever _gaps puts one, so a glued redirect is still its own word (after an unbalanced quote code_only blanks the
+    rest, so none is added there); the text is split on every `&&`, `||`, `;`, `|` and newline, quoted or not, a
+    newline's part taking the separator ";" (a heredoc body's lines too).
     There `seg` is the piece as split, and its words are the piece split at whitespace, each with every `'` and `"`
     removed, empty words dropped: a quoted operand is split at its spaces, so `>"/opt/a b"` gives `>`, `/opt/a`, `b`."""
     try:
@@ -55,12 +58,13 @@ def _fallback(cmd):
 
 def _escape_redirects(cmd):
     """cmd with a backslash before each `&` or `|` that touches a `<` or `>` outside quotes as part of its operator
-    (`>&`, `<&`, `&>`, `>|`), so shlex reads it as a word character, and a space wherever _gaps puts one, so each
-    redirect is a word of its own. shlex keeps no positions, so this is decided on the raw text: `cd X & >f` keeps
-    its separator."""
+    (`>&`, `<&`, `&>`, `>|`), so shlex reads it as a word character, a space wherever _gaps puts one, so each redirect
+    is a word of its own, and ` ; ` for each newline that ends a command. shlex keeps no positions, so this is decided
+    on the raw text: `cd X & >f` keeps its separator."""
     code = code_only(cmd)
-    gaps = _gaps(code)
-    return "".join((" " if i in gaps else "") + ("\\" + c if _in_operator(code, i) else c) for i, c in enumerate(cmd))
+    gaps, ends = _gaps(code), command_newlines(cmd)
+    return "".join((" " if i in gaps else "") + (" ; " if i in ends else "\\" + c if _in_operator(code, i) else c)
+                   for i, c in enumerate(cmd))
 
 
 def _gaps(code):

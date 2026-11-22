@@ -12,7 +12,7 @@
 #  2. DIR=shpkg (shpkg/tests/a.sh exits 0): record PASS.
 #  3. DIR=bad (pytest fails): non-zero exit, record FAIL, output names test_bad.
 #  4. DIR=badsh (badsh/tests/b.sh exits 1): record FAIL, output names b.sh.
-#  5. DIR=docs (no tests) and DIR=nope (missing): exit 0, "no tests", docs record PASS.
+#  5. DIR=docs (no tests) and DIR=nope (missing): exit 0, "no tests", docs record NO TESTS.
 #  6. make zone-test with CODETEAM_ZONE=. and CODETEAM_OWNS listing passing entries: PASS
 #     (the ./rust leg finds no tests); with a failing entry: FAIL.
 #  7. DIR=tests: tests/c.sh runs, tests/run.sh never runs.
@@ -48,7 +48,7 @@ if [ "${CODETEAM_TEST_GROUP:-unit}" != integration ]; then
   exit 0
 fi
 unset MAKEFLAGS MFLAGS MAKELEVEL MAKEOVERRIDES DIR MAKEFILES CODETEAM_ZONE CODETEAM_OWNS \
-      ZONE ZONE_ROOT ZONE_TOOL ZONE_TEST ZONE_TEST_FLAGS CODETEAM_BUILDQ_TICKET CODETEAM_SLOT_HELD
+      ZONE ZONE_ROOT ZONE_TOOL ZONE_TEST ZONE_TEST_FLAGS ZONE_CHECK_CMD CODETEAM_BUILDQ_TICKET CODETEAM_SLOT_HELD
 # Stage 2 (v5.2) sets GROUP and CODETEAM_TEST_GROUP: children must not inherit them or their record keys change.
 # export -n keeps the outer values available to this script without exporting them.
 export -n GROUP CODETEAM_TEST_GROUP
@@ -133,7 +133,7 @@ zmake zone-test-one DIR=pkg;    expect "1 DIR=pkg passing pytest: PASS record" 0
 zmake zone-test-one DIR=shpkg;  expect "2 DIR=shpkg passing shell test: PASS record" 0 "one shpkg owns=" PASS ""
 zmake zone-test-one DIR=bad;    expect "3 DIR=bad failing pytest: FAIL record naming test_bad" nz "one bad owns=" FAIL test_bad
 zmake zone-test-one DIR=badsh;  expect "4 DIR=badsh failing shell test: FAIL record naming b.sh" nz "one badsh owns=" FAIL b.sh
-zmake zone-test-one DIR=docs;   expect "5 DIR=docs (no tests): PASS record, says no tests" 0 "one docs owns=" PASS "no tests"
+zmake zone-test-one DIR=docs;   expect "5 DIR=docs (no tests): NO TESTS record, says no tests" 0 "one docs owns=" "NO TESTS" "no tests"
 zmake zone-test-one DIR=nope;   expect "5 DIR=nope (missing): exit 0, says no tests" 0 - - "no tests"
 
 zmake zone-test CODETEAM_ZONE=. CODETEAM_OWNS=pkg:shpkg:docs:README

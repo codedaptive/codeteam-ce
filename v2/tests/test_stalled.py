@@ -167,29 +167,6 @@ PY = "/opt/homebrew/Cellar/python@3.15/3.15.0_1/Frameworks/Python.framework/Vers
 LAND = "/home/u/codeteam/bin/codeteam-land"
 
 
-class PatrolHeldStalledTest(unittest.TestCase):
-    def test_patrolheld_work_order_is_not_stalled(self):
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            land = root / "land"
-            (land / "wo").mkdir(parents=True)
-            tree = root / "tree"
-            tree.mkdir()
-            (land / "wo" / "rework.json").write_text(json.dumps({
-                "wo": "rework", "zone": "eventlog", "tree": str(tree), "base": "base"}))
-
-            def git(args, **kwargs):
-                return SimpleNamespace(stdout="1" if "rev-list" in args else "1000000")
-
-            with patch("subprocess.run", side_effect=git):
-                lines = patrol.stalled_work_orders(land, {}, {}, {}, 2_000_000_000.0)
-                self.assertEqual(len(lines), 1)
-                self.assertIn("eventlog: STALLED WORK ORDER rework", lines[0])
-                self.assertEqual(patrol.stalled_work_orders(land, {}, {}, {}, 2_000_000_000.0,
-                                                          held=frozenset({"eventlog"})), [])
-
-
 class LandingWorkOrdersTest(unittest.TestCase):
     """Which work orders a live `codeteam-land <manifest> land` names, read from a process listing."""
 

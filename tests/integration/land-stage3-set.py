@@ -27,6 +27,9 @@ class FakeTeam:
         for sub in ("wo", "reviews", "queue"):
             (self.dir / sub).mkdir()
 
+    def c(self, key, default):
+        return "OrchestratorName" if key == "orchestrator" else default
+
     wo_file = cl.Team.wo_file
     save_wo = cl.Team.save_wo
 
@@ -54,7 +57,7 @@ def test_a_set_member_names_the_others_and_their_tips():
         assert saved["with"][0]["wo"] == "agent-sync"
         assert "It lands in one step with agent-sync (zone sync, tip 35c979dc00)" in text, text
         assert "judge what it says about their code at their tips, not at landing" in text
-        whole = f"log --no-merges -p {'db598cab' + '0' * 32} {'35c979dc' + '0' * 32} --not refs/heads/landing"
+        whole = f"log -p --remerge-diff {'db598cab' + '0' * 32} {'35c979dc' + '0' * 32} --not refs/heads/landing"
         assert whole in text, text
 
 
@@ -92,9 +95,28 @@ def test_the_request_says_to_judge_own_changes_never_a_two_dot_diff_against_land
         assert "never a two-dot diff of the tip against landing" in text, text
 
 
+def test_review_questions_go_to_the_named_orchestrator_not_a_reply():
+    with tempfile.TemporaryDirectory() as d:
+        team = FakeTeam(d)
+        with patch.object(cl, "stage3_record", side_effect=lambda t, rec, **kw: row(rec)), \
+                patch.object(cl, "landed_refs", return_value=["refs/heads/landing"]):
+            text = cl.stage3_request(team, cl.queue_stage3(team, recs()[:1], {"wo": "agent-sync"}, "now")["Kong"])
+        assert "OrchestratorName" in text, text
+        assert "REQUEST" in text, text
+        assert any(phrase in text.lower() for phrase in ("reads no reply", "no reply is read", "no reply will be read")), text
+        assert "work order" in text.lower(), text
+
+
 if __name__ == "__main__":
-    test_a_set_member_names_the_others_and_their_tips()
-    test_a_set_request_says_a_finding_may_name_any_member()
-    test_a_lone_work_order_gets_no_set_line()
-    test_the_request_says_to_judge_own_changes_never_a_two_dot_diff_against_landing()
-    print("all passed")
+    import sys
+    failed = 0
+    for name, test in list(globals().items()):
+        if name.startswith("test_") and callable(test):
+            try:
+                test()
+                print(f"  PASS {name}")
+            except Exception as exc:
+                failed += 1
+                print(f"  FAIL {name}: {type(exc).__name__}: {exc}")
+    print(f"{failed} failed" if failed else "all passed")
+    sys.exit(bool(failed))

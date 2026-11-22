@@ -468,7 +468,10 @@ def test_a7_review_skip_by_record_and_trailer_not_name():
                 return "B"
             with patch.object(cl, "checked_members", return_value=[(rec, True)]), patch.object(cl, "merge_checked_base"), \
                     patch.object(cl, "changed_files", return_value=["A/value"]), patch.object(cl, "check_combined_members", return_value=(["A"], ["A"])), \
-                    patch.object(cl, "queue_notices"), patch.object(cl, "out", side_effect=out):
+                    patch.object(cl, "queue_notices"), patch.object(cl, "out", side_effect=out), \
+                    patch.object(cl, "other_member_heads", return_value=[], create=True), \
+                    patch.object(cl, "review_range", return_value=["T"]), \
+                    patch.object(cl, "review_files", return_value=["A/value"]):
                 cl.check_and_queue(team, SimpleNamespace(wo=wo), [wo])
             entry = json.loads(next((team.dir / "queue").glob("*.json")).read_text())
             assert entry.get("review") == expected, f"{wo}: names alone must never skip review"

@@ -13,17 +13,20 @@ ROOT = Path(__file__).resolve().parents[2]
 HOOK = ROOT / "share" / "claude-hooks" / "harness-guard.py"
 
 
-def decide(command, cwd=None):
+def decide(command, cwd=None, symlink=False):
     """Return the hook decision for a Bash command and cwd in a temporary acme session.
 
     {CT}, {OUT}, and {M} name the harness home, outside folder, and manifest in the command and cwd.
-    The cwd defaults to the temporary folder.
+    The cwd defaults to the temporary folder. With symlink, {CT}/link points to {OUT}/target.
     """
     with tempfile.TemporaryDirectory() as d:
         home = Path(d) / "codeteam"
         (home / "teams").mkdir(parents=True)
         outside = Path(d) / "outside"
         outside.mkdir()
+        if symlink:
+            (outside / "target").mkdir()
+            (home / "link").symlink_to(outside / "target", target_is_directory=True)
         manifest = home / "teams" / "acme.toml"
         manifest.write_text(f'product = "acme"\nworktree_root = "{Path(d) / "team-acme"}"\n')
         def expand(value):
@@ -329,6 +332,30 @@ def test_redirect_after_output_dup_into_harness_is_refused():
 
 def test_fallback_quoted_spaced_outside_redirect_is_allowed():
     assert decide('echo x >"{OUT}/a b" <<EOF\nit\'s\nEOF', cwd="{OUT}") == "allow"
+
+
+def test_link_then_parent_from_harness_refuses_commit():
+    assert decide("cd link && cd .. && git commit -m x", cwd="{CT}", symlink=True) == "deny"
+
+
+def test_link_then_parent_from_outside_refuses_commit():
+    assert decide("cd {CT}/link && cd .. && git commit -m x", cwd="{OUT}", symlink=True) == "deny"
+
+
+def test_newline_after_cd_into_harness_refuses_commit():
+    assert decide("cd {CT}\ngit commit -m x", cwd="{OUT}") == "deny"
+
+
+def test_newline_after_make_refuses_harness_removal():
+    assert decide("make -v\nrm -rf {CT}/teams", cwd="{OUT}") == "deny"
+
+
+def test_quoted_newline_is_allowed():
+    assert decide("echo 'a\nb'", cwd="{OUT}") == "allow"
+
+
+def test_heredoc_body_cd_does_not_move_following_commit():
+    assert decide("cat <<EOF\ncd {CT}\nEOF\ngit commit -m x", cwd="{OUT}") == "allow"
 
 
 if __name__ == "__main__":

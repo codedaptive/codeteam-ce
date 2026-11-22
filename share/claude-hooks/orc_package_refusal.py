@@ -84,16 +84,19 @@ def _package_below(folder: str, team: Path) -> tuple[Path, Path | None] | None:
 
 
 def _owner(walls: lane_walls.Walls, rels: tuple[str, str]) -> str | None:
-    """The lane that owns the path or else its package; ORCHESTRATOR is what refused_by says for
-    a path no lane holds, so it is no owner here, nor is the orc's own lane. Failing both, a
-    whole-repo lane (path ".") covers it, never the orc itself (load_walls' fallback when
-    team.json cannot be read)."""
+    """The lane whose area covers the path or else its package, or None when no lane does (the
+    guard names that lane, or says the package has no lane). ORCHESTRATOR is what refused_by says for
+    a path no lane holds, so it is no owner here, nor is the orc's own lane. Failing both, a lane
+    with path "." (not the orc itself; load_walls' fallback when team.json cannot be read) covers
+    it only when it is the team's one such lane: a walled "." lane's area is everything no other
+    lane holds, so with two or more no one lane covers it."""
     for rel in rels:
         who = lane_walls.refused_by(rel, walls)
         if who not in (None, lane_walls.ORCHESTRATOR, walls.lane):
             return who
-    return next((n for n, r in walls.lanes.items() if n != walls.lane
-                 and isinstance(r, dict) and str(r.get("path", "")).strip("/") == "."), None)
+    whole = [n for n, r in walls.lanes.items() if n != walls.lane
+             and isinstance(r, dict) and str(r.get("path", "")).strip("/") == "."]
+    return whole[0] if len(whole) == 1 else None
 
 
 def _refusal(real: str, m: dict, codeteam_home: str | Path) -> str | None:

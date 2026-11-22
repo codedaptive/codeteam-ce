@@ -103,6 +103,7 @@ def queued_set(kinds):
     args = SimpleNamespace(wo="a")
     output = io.StringIO()
     with patch.object(cl, "checked_members", return_value=members), \
+            patch.object(cl, "other_member_heads", return_value=[], create=True), \
             patch.object(cl, "out", side_effect=lambda tree, *args: {"repo": "base", "tree-a": "tip-a", "tree-b": "tip-b"}[tree]), \
             patch.object(cl, "merge_checked_base"), patch.object(cl, "own_base", return_value="base"), \
             patch.object(cl, "changed_files", side_effect=lambda tree, base: {"tree-a": ["src/a"], "tree-b": ["src/b"]}[tree]), \

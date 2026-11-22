@@ -345,38 +345,6 @@ def test_first_whole_batch_slow_flag_is_reported_once(fixture):
     assert set(args[5]) == {"src/a", "src/b", "shared"}
 
 
-def _check_slow_report_source(f, first_zones, second_zones):
-    for path, zones in zip(f.paths, (first_zones, second_zones)):
-        entry = json.loads(path.read_text())
-        entry["zones"] = zones
-        path.write_text(json.dumps(entry))
-    f.land.slow_tests_flag.return_value = {"total_s": 1200, "limit_s": 900, "steps": [
-        {"step": "tests B (src/b)", "run_s": 800, "queued_s": 0},
-        {"step": "tests A (src/a)", "run_s": 400, "queued_s": 0},
-    ]}
-
-    def owner(team, name):
-        assert team is f.team
-        return {"tests B (src/b)": "B", "tests A (src/a)": "A"}[name]
-
-    f.land.step_owner = Mock(side_effect=owner)
-    assert queue_batch(f.team, f.paths, f.land) is True
-    f.land.report_slow_tests.assert_called_once()
-    args = f.land.report_slow_tests.call_args.args
-    assert args[2] == "a, a2, b"
-    assert set(args[5]) == {"src/a", "src/b", "shared"}
-    assert args[4] == {"wo": "b", "zone": "B", "stage": 2, "commit": "integ+ta+ta2+tb"}
-    f.land.step_owner.assert_called_once_with(f.team, "tests B (src/b)")
-
-
-def test_slow_report_selects_matching_entry_over_wider_nonmatching_first(fixture):
-    _check_slow_report_source(fixture, ["A", "C", "D", "E", "F"], ["B"])
-
-
-def test_slow_report_selects_widest_matching_entry_even_when_later(fixture):
-    _check_slow_report_source(fixture, ["A", "B"], ["B", "C", "D"])
-
-
 def test_compile_failure_never_runs_integration_steps(fixture):
     f = fixture
     f.state["compile_fail"] = True

@@ -72,8 +72,8 @@ def test_a_tree_cut_before_the_move_counts_only_its_own_commit_after_landing_is_
         text = cl.stage3_request(team, [row])
         command = text.split("feature f): ", 1)[1].split("; codeteam-land", 1)[0]
         assert "refs/archive/landing-before-rewrite" in command, command
-        listed = subprocess.run(shlex.split(command.replace(" -p ", " --format=%H ", 1)), env=ENV, check=True,
-                                capture_output=True, text=True).stdout.split()
+        output = subprocess.run(shlex.split(command), env=ENV, check=True, capture_output=True, text=True).stdout
+        listed = [line.split()[1] for line in output.splitlines() if line.startswith("commit ")]
         assert listed == [own], listed
 
 
@@ -106,6 +106,22 @@ def test_an_ordinary_tree_is_measured_from_integration():
         own = commit(tree, "A/a", "2", "own")
         assert cl.own_base(team, tree) == base
         assert cl.review_range(team, own, []) == [own]
+
+
+def test_a_clean_merge_adds_no_review_commit_or_files():
+    with tempfile.TemporaryDirectory() as d:
+        repo, base, team = setup(Path(d))
+        sh(repo, "branch", "landing", base)
+        sh(repo, "branch", "integration", base)
+        sh(repo, "checkout", "-qb", "side")
+        side = commit(repo, "B/side", "side", "side")
+        sh(repo, "checkout", "-q", "main")
+        own = commit(repo, "A/own", "own", "own")
+        sh(repo, "merge", "-q", "--no-ff", "--no-edit", "side")
+        merge = sh(repo, "rev-parse", "HEAD")
+        assert merge not in cl.review_range(team, merge, [])
+        assert set(cl.review_range(team, merge, [])) == {side, own}
+        assert cl.review_files(team, [merge]) == []
 
 
 if __name__ == "__main__":

@@ -75,15 +75,15 @@ def test_a_clean_unit_check_does_not_answer_for_an_integration_run(zt, env, tmp_
     seen, g = checks(zt, env, tmp_path)
     assert zt.run_check(tmp_path, "pk/A", "h1", g)[0] is True
     assert zt.run_check(tmp_path, "pk/A", "h1", g)[0] is True        # the same group and code: from the cache
-    assert seen == [None]
+    assert seen == ["unit"]   # the check is told the group it builds
     env.setenv("GROUP", "integration")
     assert zt.run_check(tmp_path, "pk/A", "h1", g)[0] is True
-    assert seen == [None, "integration"]                              # run again, with the caller's GROUP
+    assert seen == ["unit", "integration"]                              # run again, with the caller's GROUP
     assert zt.run_check(tmp_path, "pk/A", "h1", g)[0] is True
-    assert seen == [None, "integration"]
+    assert seen == ["unit", "integration"]
     env.delenv("GROUP")
     zt.run_check(tmp_path, "pk/A", "h1", g)
-    assert seen == [None, "integration"]                              # unit's own clean result stands
+    assert seen == ["unit", "integration"]                              # unit's own clean result stands
 
 
 def test_a_clean_integration_check_does_not_answer_for_a_unit_run(zt, env, tmp_path):
@@ -92,7 +92,7 @@ def test_a_clean_integration_check_does_not_answer_for_a_unit_run(zt, env, tmp_p
     assert zt.run_check(tmp_path, "pk/A", "h1", g)[0] is True
     env.delenv("GROUP")
     assert zt.run_check(tmp_path, "pk/A", "h1", g)[0] is True
-    assert seen == ["integration", None]
+    assert seen == ["integration", "unit"]
 
 
 def test_an_opt_in_word_is_not_a_filter_and_names_the_tests_covered(zt):

@@ -73,7 +73,6 @@ Run each on its own, never chained with `&&` or `;`. Never `git merge`, `git pus
 |---|---|
 | Your zone's SPEC and INTERFACE | `docs/reference/` or `docs/internal/reference/` (yours to keep in step with your code) |
 | Rulings | `{{rulings}}` |
-| Settled by spec | `{{settled}}` (check before asking) |
 
 ## Start and stop
 

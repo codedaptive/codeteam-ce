@@ -41,7 +41,8 @@ def drive(on, names, current=None):
     with contextlib.ExitStack() as stack:
         for name, kwargs in {
             "entry_path": {"return_value": None}, "put_back_set_merge": {}, "carried_check": {"return_value": None},
-            "check_work_order": {"side_effect": lambda team, rec: ["a/x"] if rec["wo"] == "one" else ["b/x"]},
+            "other_member_heads": {"return_value": [], "create": True},
+            "check_work_order": {"side_effect": lambda team, rec, *args: ["a/x"] if rec["wo"] == "one" else ["b/x"]},
             "no_build_kind": {"return_value": None},
             "current_units": {"side_effect": current or (lambda team, tree, zone, files=(): on)},
             "unit_folders": {"return_value": ["a"]}, "lane_owns_join": {"return_value": "a"},
@@ -117,6 +118,7 @@ class StageTwoTests(unittest.TestCase):
         with patch.object(cl, "entry_path", return_value=None), patch.object(cl, "put_back_set_merge"), \
                 patch.object(cl, "carried_check", return_value=None), \
                 patch.object(cl, "check_work_order", side_effect=[["a/x"], ["b/x"]]), \
+                patch.object(cl, "other_member_heads", return_value=[], create=True), \
                 patch.object(cl, "no_build_kind", return_value=None), patch.object(cl, "current_units", return_value=True):
             cl.checked_members(team, ["one", "two"])
         self.assertNotIn("units_on_merge", records["one"])
@@ -144,6 +146,7 @@ class StageTwoTests(unittest.TestCase):
         with patch.object(cl, "entry_path", return_value=None), patch.object(cl, "put_back_set_merge"), \
                 patch.object(cl, "carried_check", return_value=None), \
                 patch.object(cl, "check_work_order", side_effect=[["a/x"], ["b/x"]]), \
+                patch.object(cl, "other_member_heads", return_value=[], create=True), \
                 patch.object(cl, "no_build_kind", return_value=None), \
                 patch.object(cl, "current_units", return_value=True) as current, patch.object(cl, "test_units") as units:
             self.assertEqual(cl.checked_members(team, ["one", "two"]), [(records["one"], None), (records["two"], None)])

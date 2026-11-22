@@ -79,12 +79,13 @@ class SayTest(unittest.TestCase):
         self.assertEqual(store.rows, [("creator", "codeteam", "hello"), ("creator,Kong", "kong", "hello")])
         self.assertEqual(len(inbox), 1)
 
-    def test_an_answer_to_codeteam_itself_is_still_recorded_once(self):
-        # An answer to a patrol line is not the creator's mail: recorded for no session, as before.
-        team, store, inbox = self.say("codeteam", kind="ANSWER", text="idle: nothing open")
-        self.assertEqual(store.rows, [("codeteam", "codeteam", "idle: nothing open")])
-        self.assertEqual(store.marks[-1][2], "for codeteam; no session")
-        self.assertEqual(inbox, [])
+    def test_an_idle_answer_to_codeteam_is_refused(self):
+        team, rt = FakeTeam(), SimpleNamespace(store=FakeStore(), herdr=SimpleNamespace(notify=lambda *a: None))
+        with self.assertRaises(SystemExit) as refused:
+            cli.cmd_say(team, rt, SimpleNamespace(type="ANSWER", text=["idle: nothing open"], channel="general",
+                                                  sender="Orc-Codeteam", to="codeteam"))
+        self.assertNotEqual(refused.exception.code, 0)
+        self.assertEqual((rt.store.rows, team.logged), ([], []))
 
     def test_an_answer_to_the_creator_reaches_its_inbox(self):
         # D496: 35 ANSWERs addressed to `creator` were dropped as patrol replies because they did not name the creator.

@@ -53,7 +53,10 @@ def queue(team, wo):
     with patch.object(cl, "checked_members", return_value=[(rec, True)]), patch.object(cl, "merge_checked_base"), \
             patch.object(cl, "changed_files", return_value=["A/value"]), \
             patch.object(cl, "check_combined_members", return_value=(["A"], ["A"])), \
-            patch.object(cl, "queue_notices"), patch.object(cl, "out", side_effect=out):
+            patch.object(cl, "queue_notices"), patch.object(cl, "out", side_effect=out), \
+            patch.object(cl, "other_member_heads", return_value=[], create=True), \
+            patch.object(cl, "review_range", side_effect=lambda team, tip, seen: [tip]), \
+            patch.object(cl, "review_files", return_value=["A/value"]):
         cl.check_and_queue(team, SimpleNamespace(wo=wo), [wo])
     return cl.entry_path(team, wo)
 
@@ -79,7 +82,7 @@ def test_own_changes_and_request_text():
         team = make_team(Path(tmp))
         row = {"wo": "w1", "zone": "A", "feature": "feat", "tip": "TIP", "recipient": "Kong", "seen": {"Kong": ["SEEN"]}}
         text = cl.stage3_request(team, [row])
-        assert f"git -C {team.repo} log --no-merges -p TIP --not refs/heads/landing refs/heads/integration SEEN" in text
+        assert f"git -C {team.repo} log -p --remerge-diff TIP --not refs/heads/landing refs/heads/integration SEEN" in text
         assert f"codeteam-land {team.manifest} reviewed w1" in text
         assert "finding <feature> --wo <wo>" in text
         assert "Stage 3 review before landing" in text

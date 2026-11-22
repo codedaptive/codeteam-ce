@@ -40,6 +40,9 @@ from codeteam_build_part import build_part
 from codeteam_child_command import child_command
 from codeteam_dir_paths import dir_paths
 from codeteam_kinds_mode import kinds_mode
+from codeteam_no_tests_ran import no_tests_ran
+from codeteam_passing import PASSING
+from codeteam_read_record_file import read_record_file
 from codeteam_run_planned import run_planned
 from codeteam_shell_gate import shell_skip_kind
 
@@ -365,7 +368,7 @@ def append_commit_record(root: Path, key: str, rec: dict, answered: bool = False
     if rec["commit"] is None:
         return
     entry = {field: rec[field] for field in ("commit", "clean", "group", "result", "time")}
-    entry.update(key=key, exit=rec.get("exit", 0 if rec["result"] == "PASS" else 1),
+    entry.update(key=key, exit=rec.get("exit", 0 if rec["result"] in PASSING else 1),
                  record=record_path(root, key).name)
     if answered:
         entry["answered"] = True
@@ -500,12 +503,16 @@ def cmd_test(args):
                by-name whatever its command, including landing's direct runs of a repo test folder,
                where the folder already names the kind.
     --single   one run at a time per worktree and key; a second caller waits for the first,
-               then is answered only by a matching PASS or FAIL record with the same salt and command.
+               then is answered only by a matching PASS or FAIL record with the same salt and command
+               (a NO TESTS record answers neither --single nor --cached: the run goes again).
     --timeout  accepted as --timeout SECONDS or --timeout=SECONDS and ignored; no effect since v5.2.
                CODETEAM_HANG_WINDOW (default 600 s) and CODETEAM_HANG_CPU_PCT (default 1) govern
                HUNG: no output and tree CPU below the threshold over a whole window. There is
                no absolute runtime limit. A nonzero run matching an OUT_OF_SPACE, package-resolution or build-database phrase is BROKEN unless
-               it is HUNG; neither HUNG nor BROKEN answers --cached or --single.
+               it is HUNG; neither HUNG nor BROKEN answers --cached or --single. Any other run is FAIL
+               when it exits nonzero, else NO TESTS when its whole output says no test ran or every test
+               was skipped (share/codeteam_no_tests_ran.py), else PASS. NO TESTS keeps exit 0 and answers
+               neither --cached nor --single.
     --scope    DIR: the record stands until something DIR's tests can touch changes (scope_dirs),
                not until anything in the worktree changes; `make zone-test-one` passes its DIR.
                A hit through the scope alone restamps the record with the current whole-tree
@@ -615,7 +622,9 @@ def cmd_test(args):
             label, excerpt = out_of_space
             print(f"zone-test: BROKEN ({label}): {excerpt}", flush=True)
             return rc, "BROKEN", f"{label}: {excerpt}"
-        return rc, "PASS" if rc == 0 else "FAIL", None
+        if rc != 0:
+            return rc, "FAIL", None
+        return rc, "NO TESTS" if no_tests_ran(log_path.read_text(errors="replace").splitlines()) else "PASS", None
 
     rc, result, reason = run_result()
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -687,7 +696,7 @@ def cmd_commit_record(args: list[str]) -> int:
     if not latest:
         print(f"none: no clean unit-group record at {commit}")
         return 2
-    failures = [entry for entry in latest if entry[1]["result"] != "PASS"]
+    failures = [entry for entry in latest if entry[1]["result"] not in PASSING]
     _, rec = max(failures or latest, key=lambda entry: entry[0])
     print(f"{rec['result']} {rec['time']} commit={commit} key={rec['key'] or 'zone suite'} record={rec['record']}")
     return 1 if failures else 0
@@ -695,8 +704,8 @@ def cmd_commit_record(args: list[str]) -> int:
 
 def cmd_test_status(args):
     """Every test record in this worktree (the zone suite's and each keyed run's): result, time, whether it matches
-    the current code, its counts, and for a current non-PASS its last lines. Exit 0 all current PASS,
-    1 any current non-PASS (FAIL, HUNG, TIMEOUT, BROKEN), 2 none current."""
+    the current code, its counts, and for a current result not in PASSING its last lines. Exit 0 all current PASS
+    or NO TESTS, 1 any current other result (FAIL, HUNG, TIMEOUT, BROKEN), 2 none current."""
     root = top()
     recs = sorted(root.glob(".test-record*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not recs:
@@ -713,18 +722,19 @@ def cmd_test_status(args):
         for l in rec.get("counts") or []: print(f"          {l}")
         if fresh:
             current.append(rec["result"])
-            if rec["result"] != "PASS":
+            if rec["result"] not in PASSING:
                 for l in (rec.get("tail") or [])[-20:]: print(f"          | {l}")
         if rec.get("log"): print(f"          full output: {path.with_name(rec['log'])}")
     if not current: return 2
-    return 1 if any(r != "PASS" for r in current) else 0
+    return 1 if any(r not in PASSING for r in current) else 0
 
 
 def cmd_covered(args):
     """zone-tool covered: is the code as it stands tested? Exit 0 when at least one
-    record (the zone suite's or a keyed one) PASSed on exactly this code and none
-    recorded on it failed; exit 1 otherwise, naming what is missing. push-up runs it
-    on the tree it is about to push (2026-10-25: a record for the tree before
+    record (the zone suite's or a keyed one) on exactly this code is PASS or NO TESTS and
+    none recorded on it failed; exit 1 otherwise, naming what is missing. Each covering
+    record is printed with its own result, so a NO TESTS never reads as PASS. push-up runs it
+    on the tree it is about to push (TF1, 2026-10-25: a record for the tree before
     an exchange merge passed for the merged tree, and 22 red tests sat on exchange)."""
     root = top()
     here = code_hash(root)
@@ -737,8 +747,8 @@ def cmd_covered(args):
         name = rec.get("key") or "zone suite"
         if rec.get("hash") != here:
             stale += 1
-        elif rec.get("result") == "PASS":
-            passed.append(name)
+        elif rec.get("result") in PASSING:
+            passed.append(f"{name} ({rec['result']})")
         else:
             failed.append(f"{name} ({rec.get('result')})")
     if failed:
@@ -748,7 +758,7 @@ def cmd_covered(args):
         print("not covered: no test record matches this exact code"
               + (f" ({stale} older record(s) are for code before the last change or merge)" if stale else ""))
         return 1
-    print("covered: PASS on this exact code for " + "; ".join(passed))
+    print("covered: on this exact code: " + "; ".join(passed))
     return 0
 
 
@@ -1370,14 +1380,6 @@ def claim_fallback(q, ticket, why, record):
     return True
 
 
-def _read_record(path) -> dict:
-    """The record at path as parsed JSON, or {} when it is missing or unreadable."""
-    try:
-        return json.loads(Path(path).read_text())
-    except (OSError, ValueError):
-        return {}
-
-
 def print_done(q, job):
     """A done job's log, then how long it waited in the queue and ran (a job that ran), then its summary line; for a
     job whose test was answered from an existing record (it ran nothing), the summary says so. codeteam-land records
@@ -1393,7 +1395,7 @@ def print_done(q, job):
     times = [job.get(key) for key in ("submitted", "started", "finished")]
     if not job.get("answered") and all(isinstance(t, (int, float)) for t in times):
         submitted, started, finished = times
-        built = build_part(_read_record(job["record"]))
+        built = build_part(read_record_file(job["record"]))
         print(f"zone-tool: queued {max(0, started - submitted):.0f} s, ran {max(0, finished - started):.0f} s "
               f"(job {job['ticket']}{built})")
     code = job.get("exit")
@@ -1565,7 +1567,11 @@ def run_check(root, d, tree_hash, g):
         return True, [], shown
     if cmd:
         print(f"zone-test: type-check first: {shown}", flush=True)
-        r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=dict(os.environ, DIR=d or "."))
+        # The check builds only the group this run proves: with GROUP unset, a product's make check built every
+        # test group (unit, integration, validation) before a unit run, three Xcode builds where one was needed.
+        env = dict(os.environ, DIR=d or ".")
+        env.setdefault("GROUP", test_group())
+        r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=env)
         ok = r.returncode == 0
         tail = (r.stdout + r.stderr).strip().splitlines()[-40:]
     else:
@@ -1618,6 +1624,7 @@ def guard_run(root, key, tree_hash, joined):
                 narrower = bool(k2[1]) and k2[1] != d and (d in (".", "") or k2[1].startswith(d.rstrip("/") + "/")) \
                     and k2[1] in named
                 wider = bool(k2[1]) and not k2[2] and k2[1] != d and (k2[1] in (".", "") or d.startswith(k2[1].rstrip("/") + "/"))
+                # Only PASS unlocks: a NO TESTS filtered run ran none of the failing tests, so it proves nothing.
                 if ((k2[1] == d and k2[2]) or narrower or wider) and r2.get("result") == "PASS" and \
                         _key_groups(r2.get("key") or "") == _key_groups(key) and \
                         dt.datetime.fromisoformat(r2["time"]) > since:
@@ -1695,8 +1702,8 @@ def cmd_job_submit(args):
     [--cached] [--single] -- <command>
 
     Queue `zone-tool test` with these options for the class C. Prints the ticket and returns; with --wait waits
-    like `job wait` (0: no limit; auto: wait_seconds) and exits 0 when the test passed, 1 when it ran and did
-    not, 4 still waiting, 3 broken. When the runner stops beating while the job is queued, the test runs here.
+    like `job wait` (0: no limit; auto: wait_seconds) and exits 0 when the test passed or ran no test (NO
+    TESTS), 1 when it ran and did not pass, 4 still waiting, 3 broken. When the runner stops beating while the job is queued, the test runs here.
     A record that answers --cached or --single is printed as `zone-tool test` prints it, with no job.
     Inside a running job (CODETEAM_BUILDQ_TICKET) the test just runs here.
     --timeout S and --timeout=S pass through unchanged and have no effect since v5.2."""

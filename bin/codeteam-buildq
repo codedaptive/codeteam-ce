@@ -59,6 +59,8 @@ import codeteam_team_slot
 CLASSES = ("land", "full", "post", "pre", "dev")  # start order: a class earlier here is offered a start first
 SHARES = {"land": (2, 0), "full": (1, 1), "post": (1, 2), "pre": (1, 2), "dev": (1, 0)}   # (guaranteed, ceiling); 0 = none
 DEFAULT_BUDGET = 6
+QUICK_MAX = 4          # jobs that take seconds, started beside the budget
+QUICK_WALL_S = 60
 # Scheduling priority by class (nice): the gate first, leads' own builds last (2026-11-09).
 CLASS_NICE = {"land": 0, "full": 2, "post": 5, "pre": 5, "dev": 10}
 # A hung run job gets SIGKILL this many seconds after TERM, on a later decision; the runner never sleeps for it.
@@ -585,8 +587,23 @@ class Runner:
         ok = lambda j: codeteam_startable.startable(j, busy, guard.hold, warm_held, job_port)  # noqa: E731
         if (job := codeteam_team_slot.team_slot(jobs, CLASSES, ok)) is not None:
             return job, "team"
-        job = codeteam_class_pick.class_pick({cls: self.head(cls, jobs, ok) for cls in CLASSES}, running, cfg)
+        # The quick lane: up to QUICK_MAX jobs that take seconds start outside the budget, so
+        # an 11 s cargo build no longer waits 22 minutes behind 3-minute Xcode builds. Quick: a cargo build (slot
+        # jobs keep no history; they typically run in seconds), or a run job whose recorded median wall time is under
+        # QUICK_WALL_S. Quick jobs neither count against the budget nor are counted by the shared pool.
+        if sum(1 for j in running if j.get("guarantee") == "quick") < QUICK_MAX:
+            quick = [j for j in jobs if j.get("state") == "queued" and ok(j) and self.is_quick(j)]
+            if quick:
+                return min(quick, key=lambda j: j.get("submitted") or 0), "quick"
+        pool = [j for j in running if j.get("guarantee") != "quick"]
+        job = codeteam_class_pick.class_pick({cls: self.head(cls, jobs, ok) for cls in CLASSES}, pool, cfg)
         return None if job is None else (job, None)
+
+    def is_quick(self, job: dict) -> bool:
+        if job.get("kind") == "slot":
+            return job.get("tool") == "cargo"
+        rows = self.history.recent(hkey(job))
+        return len(rows) >= 3 and median(r["wall_seconds"] for r in rows) < QUICK_WALL_S
 
     def start_jobs(self, cfg: Config, guard: Guard) -> None:
         while (picked := self.next_job(cfg, guard)) is not None:

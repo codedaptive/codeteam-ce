@@ -46,7 +46,6 @@ Run each on its own, never chained with `&&` or `;`; never plain git for these s
 | What | Where |
 |---|---|
 | Rulings | `{{rulings}}` |
-| Settled by spec | `{{settled}}` (check before asking) |
 | House rules | `CLAUDE.md`, `.claude/rules/` |
 
 ## Branches

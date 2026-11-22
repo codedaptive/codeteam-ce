@@ -15,6 +15,37 @@ def resolve(path, cwd):
     return posixpath.normpath(posixpath.join(cwd, path))
 
 
+def resolve_links(path, cwd):
+    links = {"/ct/link": "/outside/target", "/home/user/link": "/outside/target"}
+    cwd = links.get(cwd, cwd)
+    path = path.replace("~", "/home/user", 1) if path.startswith("~/") else path
+    joined = posixpath.normpath(posixpath.join(cwd, path))
+    return links.get(joined, joined)
+
+
+def test_cd_through_link_then_parent_keeps_logical_parent():
+    parts = [("cd link", ["cd", "link"], "&&"), ("cd ..", ["cd", ".."], "&&"),
+             ("pwd", ["pwd"], "")]
+    assert list(part_folders(parts, "/ct", "/home/user", resolve_links)) == [
+        ("cd link", ["cd", "link"], ("/ct",)),
+        ("cd ..", ["cd", ".."], ("/ct/link", "/outside/target")),
+        ("pwd", ["pwd"], ("/ct", "/outside")),
+    ]
+
+
+def test_plain_cd_deduplicates_logical_and_physical_folders():
+    parts = [("cd plain", ["cd", "plain"], ";"), ("pwd", ["pwd"], "")]
+    assert list(part_folders(parts, "/ct", "/home/user", resolve_links)) == [
+        ("cd plain", ["cd", "plain"], ("/ct",)), ("pwd", ["pwd"], ("/ct/plain",))]
+
+
+def test_cd_expands_tilde_in_logical_folder():
+    parts = [("cd ~/link", ["cd", "~/link"], ";"), ("pwd", ["pwd"], "")]
+    assert list(part_folders(parts, "/ct", "/home/user", resolve_links)) == [
+        ("cd ~/link", ["cd", "~/link"], ("/ct",)),
+        ("pwd", ["pwd"], ("/home/user/link", "/outside/target"))]
+
+
 def test_parts_without_cd_all_use_the_original_folder():
     parts = [("pwd", ["pwd"], ";"), ("git status", ["git", "status"], "")]
     assert list(part_folders(parts, "/work", "/home/user", resolve)) == [

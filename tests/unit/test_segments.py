@@ -72,6 +72,43 @@ def test_redirect_contract(command, expected):
     assert segments(command) == expected
 
 
+def test_newline_separates_cd_and_commit():
+    assert segments("cd X\ngit commit") == [
+        ("cd X", ["cd", "X"], ";"), ("git commit", ["git", "commit"], "")]
+
+
+def test_newline_inside_quotes_stays_in_one_part():
+    assert [(words, sep) for _, words, sep in segments("echo 'a\nb'")] == [
+        (["echo", "a\nb"], "")]
+
+
+def test_heredoc_body_stays_in_part_before_following_command():
+    assert segments("cat <<EOF\ncd X\nEOF\ngit commit") == [
+        ("cat <<EOF cd X EOF", ["cat", "<<EOF", "cd", "X", "EOF"], ";"),
+        ("git commit", ["git", "commit"], "")]
+
+
+def test_backslash_newline_keeps_one_part():
+    assert len(segments("a \\\nb")) == 1
+
+
+def test_newline_after_and_preserves_separator():
+    assert segments("a &&\nb") == [("a", ["a"], "&&"), ("b", ["b"], "")]
+
+
+def test_newline_after_pipe_preserves_separator():
+    assert segments("a |\nb") == [("a", ["a"], "|"), ("b", ["b"], "")]
+
+
+def test_newline_after_semicolon_preserves_separator():
+    assert segments("a;\nb") == [("a", ["a"], ";"), ("b", ["b"], "")]
+
+
+@pytest.mark.parametrize("command", ["a\n", "\na", "\n\na\n\n"], ids=["trailing", "leading", "blank-lines"])
+def test_leading_trailing_and_blank_lines_add_no_parts(command):
+    assert segments(command) == segments("a") == [("a", ["a"], "")]
+
+
 def test_fallback_heredoc_splits_glued_redirect():
     assert segments("cat>/opt/x <<EOF\nit's\nEOF") == [
         ('cat >/opt/x <<EOF', ['cat', '>/opt/x', '<<EOF'], ';'),

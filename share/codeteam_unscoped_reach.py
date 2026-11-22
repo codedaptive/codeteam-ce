@@ -17,14 +17,17 @@ from codeteam_lock_reach import lock_changed_folders
 
 def unscoped_reach(tree, path: str, base: str | None, docs: tuple[str, ...],
                    owners: Callable[[str], set[str]]) -> set[str] | None:
-    """The zones `path`, a changed file in no zone's scope, reaches: set() for a document (a `docs` suffix); for a
-    Cargo.lock, the owners of the workspace folders whose packages it changes between `base` and HEAD. None, for the
-    caller to answer every zone, for any other file and whenever a lock's reach is not known: no base, the lock
-    missing at either side, no workspace manifest beside it, a lock that does not parse, or a reached folder no zone
-    holds."""
+    """The zones `path`, a changed file in no zone's scope, reaches: set() for a document (a `docs` suffix) and for any
+    other file that is not a Cargo.lock (2026-11-21: an integration run tests the changed kit and the kits
+    that touch it, never every kit; a root file that a kit does depend on says so in [land.contracts], which the
+    caller adds). For a Cargo.lock, the owners of the workspace folders whose packages it changes between `base` and
+    HEAD. None, for the caller to answer every zone, only when a lock's reach is not known: no base, the lock missing
+    at either side, no workspace manifest beside it, a lock that does not parse, or a reached folder no zone holds."""
     if path.endswith(docs):
         return set()
-    if os.path.basename(path) != "Cargo.lock" or base is None:
+    if os.path.basename(path) != "Cargo.lock":
+        return set()
+    if base is None:
         return None
     sides = [subprocess.run(["git", "show", f"{rev}:{path}"], cwd=tree, capture_output=True, text=True)
              for rev in (base, "HEAD")]

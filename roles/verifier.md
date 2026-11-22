@@ -45,7 +45,6 @@ Record each run's mode, ref, commit and results in your ledger. A defect in prod
 | What | Where |
 |---|---|
 | Rulings | `{{rulings}}` |
-| Settled by spec | `{{settled}}` (check before asking) |
 | House rules | `CLAUDE.md`, `.claude/rules/` |
 
 ## Start and stop

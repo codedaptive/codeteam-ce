@@ -167,9 +167,11 @@ def test_land_entry_pending_review_refuses_before_any_git_or_record_read():
 def test_review_range_excludes_both_branches_and_this_reviewers_seen_tips():
     with tempfile.TemporaryDirectory() as tmp:
         team = team_at(Path(tmp))
-        with patch.object(cl, "out", return_value="new\n") as out:
+        with patch.object(cl, "own_commits", return_value=["new"], create=True) as own, \
+                patch.object(cl, "landed_refs", return_value=["refs/heads/landing", "refs/heads/integration"]), \
+                patch.object(cl, "out", return_value="old\n"):
             assert cl.review_range(team, "TIP", ["K1", "K2"]) == ["new"]
-        assert out.call_args.args == (team.repo, "rev-list", "--no-merges", "TIP", "--not", "refs/heads/landing", "refs/heads/integration", "K1", "K2")
+        own.assert_called_once_with(team.repo, ["TIP", "--not", "refs/heads/landing", "refs/heads/integration", "K1", "K2"])
 
 
 def test_findings_cannot_be_resubmitted_without_a_new_commit():

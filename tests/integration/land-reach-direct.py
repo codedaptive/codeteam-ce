@@ -44,7 +44,7 @@ t("change X: X, B (calls X) and R (its rust/ calls X); not A (calls B)", r == ["
 r = cl.reach(team, str(T), ["kits/B/Sources/a.swift"])
 t("change B: B and A", r == ["A", "B"], r)
 r = cl.reach(team, str(T), ["Makefile"])
-t("a file in no zone reaches every zone with something in the tree", r == ["A", "B", "R", "X"], r)
+t("a file in no zone reaches no zone", r == [], r)
 team.cfg["reach"] = "chain"
 r = cl.reach(team, str(T), ["libs/X/Sources/a.swift"])
 t('reach = "chain" follows through again: A too', r == ["A", "B", "R", "X"], r)

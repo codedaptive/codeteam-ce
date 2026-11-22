@@ -13,29 +13,34 @@ IDLE_MIN = 60                   # no session of the team has worked for this lon
 QUIET = ("idle", "done", "absent")
 
 
+def _record(f):
+    """The JSON object in record file f, or None when it cannot be read or is not an object."""
+    try:
+        rec = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
 def _open_work(land_dir, held=frozenset()):
-    """(work orders open and not queued, queued landings held by land-hold), from the landing tool's records. The
-    landing tool's own docs- and revert- work orders are left out, as stalled_work_orders does, and so is a work order
-    whose zone the user holds (team/held/<lane>): that lane is stopped on purpose. A held landing still counts:
-    the landing tool runs it, not the lane."""
+    """(work orders open and not queued, queued landings held by land-hold), from the landing tool's records; a record
+    that cannot be read or is not a JSON object (_record) is skipped. The landing tool's own docs- and revert- work
+    orders are left out, as stalled_work_orders does, and so is a work order whose zone the user holds
+    (team/held/<lane>): that lane is stopped on purpose. A held landing still counts: the landing tool runs it,
+    not the lane."""
     land = Path(land_dir)
     orders = 0
     for f in land.glob("wo/*.json"):
         if f.name.endswith((".landed.json", ".retired.json")):
             continue
-        try:
-            rec = json.loads(f.read_text())
-        except (OSError, ValueError):
-            continue
-        if (not rec.get("queued") and rec.get("zone") not in held
+        rec = _record(f)
+        if (rec is not None and not rec.get("queued") and rec.get("zone") not in held
                 and not str(rec.get("wo", f.stem)).startswith(("docs-", "revert-"))):
             orders += 1
     holds = 0
     for f in land.glob("queue/*.json"):
-        try:
-            holds += bool(json.loads(f.read_text()).get("hold"))
-        except (OSError, ValueError):
-            continue
+        rec = _record(f)
+        holds += bool(rec is not None and rec.get("hold"))
     return orders, holds
 
 

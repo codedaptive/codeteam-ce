@@ -170,7 +170,7 @@ def run_stage2(team, records, check=(["cli"], ["cli"])):
     """check_and_queue over the two records; check is check_combined_members' answer, or the exception it raises."""
     with contextlib.ExitStack() as stack:
         for name, value in {"checked_members": [(r, None) for r in records], "out": "abcdefghijk",
-                            "merge_checked_base": None, "changed_files": [], "own_base": "base", "now": "NOW",
+                            "merge_checked_base": None, "other_member_heads": [], "changed_files": [], "own_base": "base", "now": "NOW",
                             "queue_notices": None, "queue_entry": {"review": "pending"},
                             "stage3_request": "review"}.items():
             stack.enter_context(patch.object(cl, name, return_value=value))

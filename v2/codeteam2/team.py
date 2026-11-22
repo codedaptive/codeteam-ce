@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .idle_exit import IDLE_EXIT_H
+from .launch_env import launch_env
 
 V2_DIR = Path(__file__).resolve().parent.parent
 CT_HOME = V2_DIR.parent
@@ -139,7 +140,7 @@ class Team:
         self.backup_min = float(self.cfg.get("backup_min", 60))
         # Mail waiting when a session starts goes in its first prompt.
         self.mail_in_first_prompt = bool(self.cfg.get("mail_in_first_prompt", True))
-        # Claude Code's unattended retry mode: waits out 429/529 and usage limits by itself.
+        # Claude Code's unattended retry mode: waits out 429/529 and usage limits within RETRY_ENV's budgets.
         self.retry_watchdog = bool(self.cfg.get("retry_watchdog", True))
 
     # ------------------------------------------------------------------ sessions
@@ -434,7 +435,7 @@ Lanes tell their orchestrator, then carry on with the product. Writes to the har
                       "turn." if mail else
                       "When the work is done, or waiting on someone else, end your turn.")
             flags += ["--session-id", sid, first + tail]
-        env = {k: t.expand(v) for k, v in {**v1.SESSION_ENV_DEFAULTS, **t.env}.items()}
+        env = {k: t.expand(v) for k, v in launch_env(v1.SESSION_ENV_DEFAULTS, t.env).items()}
         env.update({
             "TMPDIR": f"{t.scratchpad(s.key)}/", "CLAUDE_CODE_TMPDIR": str(t.scratchpad(s.key)),
             "GIT_AUTHOR_NAME": display, "GIT_COMMITTER_NAME": display,
@@ -451,8 +452,8 @@ Lanes tell their orchestrator, then carry on with the product. Writes to the har
             else:
                 env[k] = t.expand(v)
         if self.retry_watchdog:
-            # Claude Code's unattended retry mode waits out 429/529 errors and usage limits itself
-            # (v1 typed a resume line after a backoff instead).
+            # Claude Code's unattended retry mode waits out 429/529 errors and usage limits itself, each for at
+            # most RETRY_ENV's budget (3 min); then the turn ends on the error.
             env["CLAUDE_CODE_RETRY_WATCHDOG"] = "1"
         if s.kind == "lane":
             r = team["lanes"][s.key]

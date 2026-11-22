@@ -32,7 +32,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .herdr import HerdrError
-from .say_unknown import unknown_names
+from .say_refusal import say_refusal
 from .scheduler import READY, Runtime, last_mids
 from .store import RUNTIME
 from .team import CODETEAM2, OWNER, WORKSPACE, Team, v1
@@ -192,16 +192,24 @@ def forward(team, rt, a, kind, name, manifest, text):
 CREATOR_INBOX = WORKSPACE / "team-codeteam" / "creator-inbox.log"
 
 
-def for_creator(a, kind, name, text):
-    """A message to `codeteam` or `creator` that is meant for codeteam's builder (the creator): every kind, except an
-    ANSWER to `codeteam` that is a reply to the patrol. It goes to one inbox file and a notice for the owner (2026-11-08:
-    an orchestrator sent the creator 25 messages that reached no one; 2026-11-15: 35 ANSWERs addressed to
-    `creator` were still dropped as patrol replies). True when it was taken."""
-    if name.strip().lower() not in ("codeteam", "creator") or a.sender == "codeteam":
+def creator_takes(a, kind, name, text):
+    """True when a message to `name` is meant for codeteam's builder (the creator): to `codeteam` or `creator`, not
+    from the tool itself, every kind except an ANSWER to `codeteam` that neither comes from a designer nor names the
+    creator (2026-11-15: 35 ANSWERs addressed to `creator` were dropped as replies to the tool). It decides
+    only: for_creator writes the inbox, and say_refusal refuses a session's message that neither it nor another
+    team takes."""
+    low = name.strip().lower()
+    if low not in ("codeteam", "creator") or a.sender == "codeteam":
         return False
-    if (kind == "ANSWER" and name.strip().lower() == "codeteam" and not a.sender.startswith("Designer-")
-            and "creator" not in text.lower()):
-        return False                # an answer to a patrol line or an idle check: recorded as before
+    return not (kind == "ANSWER" and low == "codeteam" and not a.sender.startswith("Designer-")
+                and "creator" not in text.lower())
+
+
+def for_creator(a, kind, name, text):
+    """Writes a message creator_takes to the creator's inbox file; cmd_say then records it and sends the owner a notice
+    (2026-11-08: an orchestrator sent the creator 25 messages that reached no one). True when it was taken."""
+    if not creator_takes(a, kind, name, text):
+        return False
     CREATOR_INBOX.parent.mkdir(parents=True, exist_ok=True)
     with open(CREATOR_INBOX, "a") as f:
         f.write(f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M')} | {a.sender} | {kind} | {' '.join(text.split())}\n")
@@ -264,11 +272,9 @@ def cmd_say(team, rt, a):
         return
     # TO may list several sessions (v1: `Nagatha,Kong`): one message each (found in the factory smoke run).
     names = [n.strip() for n in a.to.split(",") if n.strip()] or [a.to]
-    unknown = unknown_names(team, names, sender, a.channel, lambda n: other_team(team, n, kind) is not None)
-    if unknown:
-        sys.exit(f"codeteam2 say: no session named {', '.join(unknown)} in team {team.product}, so this would reach "
-                 f"no one; nothing was sent. For a session of another team, give that team's manifest: "
-                 f"codeteam2 say <its manifest> {a.channel} {a.sender} {kind} <name> \"<text>\"")
+    if refusal := say_refusal(team, a, kind, names, sender, lambda n: other_team(team, n, kind) is not None,
+                              lambda n: creator_takes(a, kind, n, text)):
+        sys.exit(refusal)
     targets = []
     for n in list(names):
         m = other_team(team, n, kind)
@@ -289,7 +295,8 @@ def cmd_say(team, rt, a):
                   f"inbox ({CREATOR_INBOX}) | {text}")
             continue
         if n.lower() == "codeteam":
-            continue            # an answer to codeteam itself (an idle check): recorded, delivered to no session
+            continue            # from a sender that is not a session (the tool, a nudge): recorded, delivered to no
+                                # session; a session's message here was refused by say_refusal
         s = team.resolve_recipient(n, a.channel)
         if sender and s.key == sender.key:
             continue            # never the sender (v1's rule): a designer's "idle" came back to it

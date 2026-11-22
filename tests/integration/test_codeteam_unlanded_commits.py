@@ -67,6 +67,59 @@ def test_a_detached_head_is_read_where_it_stands(repo):
     assert unlanded_commits(str(repo), "landing") == [first]
 
 
+def resolved_merge(repo):
+    (repo / "base").write_text("base\n")
+    git(repo, "add", "base")
+    git(repo, "commit", "-qm", "prepare conflict")
+    git(repo, "branch", "-f", "landing", "HEAD")
+    git(repo, "checkout", "-qb", "side")
+    (repo / "base").write_text("side\n")
+    git(repo, "commit", "-qam", "side")
+    git(repo, "checkout", "-q", "work")
+    (repo / "base").write_text("work\n")
+    git(repo, "commit", "-qam", "work")
+    result = subprocess.run(["git", "-C", str(repo), *IDENTITY, "merge", "--no-ff", "side"], capture_output=True)
+    assert result.returncode != 0
+    (repo / "base").write_text("resolved\n")
+    git(repo, "add", "base")
+    git(repo, "commit", "-qm", "resolution")
+    return git(repo, "rev-parse", "HEAD")
+
+
+def test_hand_resolved_merge_counts(repo):
+    merge = resolved_merge(repo)
+    assert unlanded_commits(str(repo), "landing")[0] == merge
+
+
+def test_other_orders_carried_check_still_refuses_shared_commits(repo, tmp_path):
+    from types import SimpleNamespace
+    from codeteam_carried_check import carried_check
+
+    merge = resolved_merge(repo)
+    tree = tmp_path / "carrying"
+    git(repo, "worktree", "add", "-qb", "carrying", str(tree), merge)
+    commit(tree, "extra")
+    other = {"wo": "resolved", "tree": str(repo)}
+    member = {"wo": "carrying", "tree": str(tree)}
+    refusal = carried_check(SimpleNamespace(landing="landing"), [member], lambda _: [(None, other)], lambda *_: None)
+    assert refusal is not None and "resolved" in refusal and "--with resolved" in refusal
+    assert merge[:10] in refusal
+
+
+def test_unrelated_order_does_not_carry_a_hand_resolved_merge(repo, tmp_path):
+    from types import SimpleNamespace
+    from codeteam_carried_check import carried_check
+
+    resolved_merge(repo)
+    other_tree = tmp_path / "unrelated"
+    git(repo, "worktree", "add", "-qb", "unrelated", str(other_tree), "landing")
+    commit(other_tree, "unrelated-change")
+    resolved = {"wo": "resolved", "tree": str(repo)}
+    unrelated = {"wo": "unrelated", "tree": str(other_tree)}
+    assert carried_check(SimpleNamespace(landing="landing"), [unrelated],
+                         lambda _: [(None, resolved)], lambda *_: None) is None
+
+
 def test_no_tree_or_a_gone_one_holds_nothing(repo):
     commit(repo, "one")
     assert unlanded_commits(None, "landing") == []

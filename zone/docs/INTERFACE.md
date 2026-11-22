@@ -129,7 +129,7 @@ These fields belong to the test record, not the queue job:
 | `commit` str or null | Full HEAD commit SHA at the start of the run; null when there is no HEAD |
 | `clean` bool | At the start of the run, HEAD exists, no tracked path has staged or unstaged changes against HEAD, and there are no untracked non-ignored files except bookkeeping names `.test-record.json`, `.ledger.md`, `.ledger-closed`, `.comment-review` and names starting `.test-record`. `ZONE_HASH_IGNORE` does not exempt tracked changes or untracked files from this check |
 | `group` str | `CODETEAM_TEST_GROUP`, stripped; unset or empty means `unit` |
-| `result` str | `PASS` (exit 0), `FAIL` (nonzero exit without an out-of-space match), `HUNG` (the hang rule stopped the tree, exit 124), or `BROKEN` (nonzero exit and output containing, case-insensitively, `no space left on device`, `database or disk is full`, or `out of space`, unless HUNG). Only `PASS` and `FAIL` can answer `--cached` or `--single`; `test-status` treats every current non-PASS, including records with `TIMEOUT`, as a failure |
+| `result` str | `PASS` (exit 0), `NO TESTS` (exit 0, and the run's whole output says no test ran or every test was skipped, by `share/codeteam_no_tests_ran.py`: no line shows a test ran and one line is a no-tests signal, which is test-one's `<dir>: no tests`, pytest's `no tests ran`, a cargo `test result:` line with `0 passed; 0 failed`, or a pytest summary with skipped above 0; a test ran when a line other than test-one's own counts passed or failed above 0, or reads XCTest's `Executed N tests` or Swift Testing's `Test run with N tests` with N of 1 or more, or when a test-one leg that is not pytest finishes ok or FAIL; one leg that ran outweighs an empty one), `FAIL` (nonzero exit without an out-of-space match), `HUNG` (the hang rule stopped the tree, exit 124), or `BROKEN` (nonzero exit and output containing, case-insensitively, `no space left on device`, `database or disk is full`, or `out of space`, unless HUNG). Only `PASS` and `FAIL` can answer `--cached` or `--single`; `NO TESTS` never does, so the run goes again. `commit-record`, `test-status`, `covered` and landing's record check count `NO TESTS` as passing and show it as itself; `test-status` treats every other current result, including records with `TIMEOUT`, as a failure |
 | `reason` str or null | `HUNG`: a `hung:` reason naming silent seconds, CPU seconds and the threshold; `BROKEN`: `out of space: <first matching output line>`, stripped, cut to at most 200 characters around the matched phrase; null for other results. This is distinct from the queue job's `reason` |
 
 `--timeout N` and `--timeout=N` are accepted and ignored, with no effect since v5.2. There is no absolute runtime
@@ -161,7 +161,7 @@ Usage: `zone-tool commit-record <commit> [--key K]`.
 Every finished `test` run with a commit appends one JSON line to
 `<git_dir(root)>/zone-test-commits.jsonl`, in this worktree's own git directory, not in the working tree or the
 common git directory of linked worktrees. Each line has `commit`, `clean`, `group`, `key`, `result`, `exit`, `time`
-and `record` (the record's file name). Results include PASS, FAIL, HUNG and BROKEN.
+and `record` (the record's file name). Results include PASS, NO TESTS, FAIL, HUNG and BROKEN; NO TESTS has exit 0 and counts as passing.
 
 A matching cached or single-run record also appends a line with `answered: true` when the tree is clean now and the
 record's group (missing means `unit`) equals the current group. This applies both to `test` and to `job submit`'s
@@ -174,8 +174,8 @@ The lookup resolves `<commit>` with `git rev-parse --verify <commit>^{commit}` a
 with `clean: true` and `group: "unit"`. With `--key K`, only that key counts; K is normalized as for `test --key`
 (`" ".join(K.split())`). File order decides the newest eligible line per key, not timestamps.
 
-- Exit 0 when every key's newest line is PASS; print the newest PASS.
-- Exit 1 when any key's newest line is non-PASS; print the newest non-PASS among those lines.
+- Exit 0 when every key's newest line is PASS or NO TESTS; print the newest of those lines.
+- Exit 1 when any key's newest line is neither; print the newest such line.
 - Both use one line: `<result> <time> commit=<sha> key=<key or "zone suite"> record=<file>`.
 - Exit 2 when no eligible line exists, or the commit does not resolve; print
   `none: no clean unit-group record at <sha or the given text>`.
@@ -234,7 +234,7 @@ once the runner marks it running.
 | `tool` str | run: absolute path of the `zone-tool` that submitted; slot: the wrapped tool's name |
 | `record_mtime` float or null | run: the record's mtime just before the start (null if none); a record counts as this run's only when it is newer |
 | `exit` int or null | the process's exit; null for a slot job and for an adopted job that ended without one |
-| `result` str or null | the record's `result` (`PASS`, `FAIL`, `HUNG`, `BROKEN`; existing `TIMEOUT` records still read). `BROKEN` denotes an out-of-space phrase match as described above; it never answers `--cached` |
+| `result` str or null | the record's `result` (`PASS`, `NO TESTS`, `FAIL`, `HUNG`, `BROKEN`; existing `TIMEOUT` records still read). `NO TESTS` exits 0, a run whose whole output says no test ran or every test was skipped; it counts as passing for commit-record, test-status, covered and landing, and never answers `--cached` or `--single`. `BROKEN` denotes an out-of-space phrase match as described above; it never answers `--cached` |
 | `reason` str or null | why `broken`, `"fallback: ..."` when the submitter ran it itself, or `"hung: ..."` for a run job the backstop stopped |
 | `fallback` bool | the submitter ran it itself because the queue was unavailable |
 | `answered` bool | only on a `done` run job that `zone-tool test` answered from an existing record instead of running (`--cached` or `--single` found one): true. Its `result` and `exit` are that record's, and the history gets no line |

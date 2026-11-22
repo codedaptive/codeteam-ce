@@ -109,6 +109,22 @@ def test_outside_team_and_repo_is_allowed(team, tmp_path):
     assert team.refuse(folder / "src/x.rs", team.manifest, team.home) is None
 
 
+def test_unowned_package_with_multiple_whole_repo_lanes_has_no_lane(tmp_path):
+    root = tmp_path / "team"
+    repo = tmp_path / "repo"
+    (root / "team").mkdir(parents=True)
+    (repo / ".git").mkdir(parents=True)
+    (root / "team" / "team.json").write_text(json.dumps({"lanes": {
+        "alpha": {"path": ".", "owns": ["src/a"]},
+        "beta": {"path": ".", "owns": ["src/b"]},
+    }}))
+    manifest = tmp_path / "team.toml"
+    manifest.write_text(f"worktree_root = {json.dumps(str(root))}\nrepo = {json.dumps(str(repo))}\n")
+    folder = package(repo, "crates/cli")
+    reason = orc_package_refusal.orc_package_refusal(folder / "src/main.rs", manifest, tmp_path / "home")
+    assert "`crates/cli` has no lane" in reason
+
+
 @pytest.mark.parametrize("contents", [None, "invalid = [\n"])
 def test_missing_or_invalid_manifest_is_allowed(team, contents):
     folder = package(team.repo)

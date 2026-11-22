@@ -103,7 +103,10 @@ def test_public_api_and_security_changes_queue_for_review() -> None:
                              "git": SimpleNamespace(returncode=0)}
             for name, result in collaborators.items():
                 stack.enter_context(patch.object(cl, name, return_value=result))
-            stack.enter_context(patch.object(cl, "out", side_effect=lambda repo, *a: "A/auth/store.rs" if a[0] == "diff-tree" else "tip"))
+            stack.enter_context(patch.object(cl, "out", return_value="tip"))
+            stack.enter_context(patch.object(cl, "other_member_heads", return_value=[], create=True))
+            stack.enter_context(patch.object(cl, "review_range", return_value=["tip"]))
+            stack.enter_context(patch.object(cl, "review_files", return_value=["A/auth/store.rs"]))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             cl.cmd_land(team, SimpleNamespace(wo="api", with_=[], untested=False))
         entry = json.loads(next((directory / "queue").iterdir()).read_text())

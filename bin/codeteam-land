@@ -74,6 +74,7 @@ from codeteam_nested_crate import nested_crate_root
 from codeteam_host_reservation import HostReservation
 from codeteam_owning_zone import owning_zone
 from codeteam_documents_only import documents_only
+from codeteam_passing import PASSING
 from codeteam_carried_check import carried_check
 from codeteam_codegraph_unregister import codegraph_unregister
 from codeteam_idle_candidate import idle_candidate
@@ -94,17 +95,19 @@ from codeteam_zone_steps import zone_steps
 from codeteam_diff_plus_lines import diff_plus_lines
 from codeteam_merged_base import merged_base
 from codeteam_merged_landing import merged_landing
+from codeteam_own_commits import own_commits
 from codeteam_slow_drop import drop_slow
 from codeteam_slow_repeat import REPEAT_HOURS, reported_repeat
 from codeteam_unscoped_reach import unscoped_reach
 from codeteam_kinds_switch import kinds_by_name
+from codeteam_remove_dead_stages import remove_dead_stages
+from codeteam_stage_row import stage_row
 from codeteam_unit_record_refusal import unit_record_refusal
 from codeteam_loose_owned_tests import loose_owned_tests
 from codeteam_recheck_batch import recheck_batch
 from codeteam_batch_row import batch_row
 from codeteam_batch_owner import batch_owner
 from codeteam_itest_lock import itest_lock
-from codeteam_fifo_lock import fifo_lock
 from codeteam_open_test_findings import open_test_findings
 from codeteam_add_recheck_commit import add_recheck_commit
 from codeteam_step_zone import step_zone
@@ -1300,13 +1303,13 @@ def entry_path(team, wo):
     return None
 
 
-def check_work_order(team: Team, rec: dict) -> list[str]:
+def check_work_order(team: Team, rec: dict, others: Iterable[str] = ()) -> list[str]:
     """Refuse edits outside the zone before spending a build slot or merging integration. The zone guard's own
     exceptions hold here too: the zone's reference docs, and a lock file anywhere unless the manifest's
     orchestrator_owns names it, so a work order can commit the lock its build regenerates."""
     if out(rec["tree"], "status", "--porcelain", "--untracked-files=no"):
         die(f"{rec['wo']}: the tree has uncommitted changes; commit them first")
-    files = work_order_files(team, rec)
+    files = work_order_files(team, rec, others)
     if not files and not declares_doc_level(team, rec):
         die(f"{rec['wo']}: nothing to land: no change against {team.integration}. A work order that only states a "
             "document's level lands with `Doc-Level: <repo path> <level>` in its own commit.")
@@ -1339,9 +1342,34 @@ def declares_doc_level(team: Team, rec: dict) -> bool:
                for path in named)
 
 
-def work_order_files(team: Team, rec: dict) -> list[str]:
-    own = set(review_files(team, review_range(team, out(rec["tree"], "rev-parse", "HEAD"), [])))
-    return [file for file in changed_files(rec["tree"], team.integration) if file in own]
+def work_order_files(team: Team, rec: dict, others: Iterable[str] = ()) -> list[str]:
+    """The net change's files that its own commits touch; commits reachable from another set member's HEAD in
+    others are that member's, not this one's."""
+    return _own_files(team, rec, changed_files(rec["tree"], team.integration), others)
+
+
+def _own_files(team: Team, rec: dict, files: list[str], others: Iterable[str]) -> list[str]:
+    """Of files, in order, those that rec's own commits touch: its HEAD's commits less those reachable from others."""
+    own = set(review_files(team, review_range(team, out(rec["tree"], "rev-parse", "HEAD"), list(others))))
+    return [file for file in files if file in own]
+
+
+def other_member_heads(records: list[dict], rec: dict) -> list[str]:
+    """The HEADs of the set's other members, read from their trees, less any that contains rec's HEAD. When rec's
+    HEAD is an ancestor of (or equal to) another member's, that member holds all rec's commits; excluding them would
+    leave rec none of its own and refuse it "nothing to land"."""
+    heads = [out(other["tree"], "rev-parse", "HEAD") for other in records if other["wo"] != rec["wo"]]
+    if not heads:
+        return []
+    head = out(rec["tree"], "rev-parse", "HEAD")
+    return [h for h in heads if git(rec["tree"], "merge-base", "--is-ancestor", head, h, check=False).returncode]
+
+
+def set_member_files(team: Team, rec: dict, others: list[str]) -> list[str]:
+    """The member's net change against its own base; in a set, only the files its own commits touch, so another
+    member's commits it merged are not counted as its files."""
+    files = changed_files(rec["tree"], own_base(team, rec["tree"]))
+    return _own_files(team, rec, files, others) if others else files
 
 
 def lane_test_key(zone: str, group: str) -> str:
@@ -2012,7 +2040,8 @@ def checked_members(team: Team, names: list[str]) -> list[tuple[dict, str | None
     by_name = kinds_by_name(getattr(team, "m", {}).get("env", {}))
     try:
         for rec in records:
-            files = check_work_order(team, rec)     # no files: a Doc-Level declaration only, which tests nothing
+            # no files: a Doc-Level declaration only, which tests nothing
+            files = check_work_order(team, rec, other_member_heads(records, rec))
             no_build = no_build_kind(team, rec, files)
             if (by_name or alone) and not no_build:
                 _prove_units(team, rec, files, by_name, alone)
@@ -2147,11 +2176,13 @@ def stamp_members(team: Team, a, members: list[tuple[dict, str | None]], names: 
 
 def check_and_queue(team: Team, a, names: list[str]) -> None:
     members = checked_members(team, names)
+    # Read before merge_checked_base moves the first member's HEAD, which would break other_member_heads' ancestor skip.
+    others = {rec["wo"]: other_member_heads([r for r, _ in members], rec) for rec, _ in members}
     try:
         base = out(team.repo, "rev-parse", team.integration)
         merge_checked_base(team, members[0][0], base, members[0][1], test=len(members) == 1)
         for rec, _ in members:
-            rec.update(base=base, tip=out(rec["tree"], "rev-parse", "HEAD"), files=changed_files(rec["tree"], own_base(team, rec["tree"])))
+            rec.update(base=base, tip=out(rec["tree"], "rev-parse", "HEAD"), files=set_member_files(team, rec, others[rec["wo"]]))
         zones, reached = check_combined_members(team, members, base)
         rows = members[0][0].get("stage2") or []
         flag = slow_tests_flag(rows)
@@ -2376,10 +2407,10 @@ def duplicate_rulings(tree):
 
 
 def records_pass(text):
-    """True when the step's output names zone-test records and every one of them is a PASS (a gate once marked
-    three zones FAIL whose zone-test runs each ended PASS with a record, at load ~100)."""
-    recs = re.findall(r"zone-test: (PASS|FAIL) \(exit \d+\); record (\S+\.json)", text)
-    if not recs or any(r != "PASS" for r, _ in recs):
+    """True when the step's output names zone-test records and every one of them, summary and record, is in PASSING (PASS or NO TESTS) (a gate marked three zones FAIL whose zone-test runs each ended PASS
+    with a record, at load ~100)."""
+    recs = re.findall(r"zone-test: (PASS|FAIL|NO TESTS) \(exit \d+\); record (\S+\.json)", text)
+    if not recs or any(r not in PASSING for r, _ in recs):
         return False
     # Nothing may have failed after the last record (e.g. an `A && B` step whose B died before its record).
     after = text[text.rfind("; record "):].split("\n", 1)[1] if "\n" in text[text.rfind("; record "):] else ""
@@ -2387,7 +2418,7 @@ def records_pass(text):
         return False                    # only blank lines may follow the last record
     for _, path in recs:
         try:
-            if json.loads(Path(path).read_text()).get("result") != "PASS":
+            if json.loads(Path(path).read_text()).get("result") not in PASSING:
                 return False
         except (OSError, ValueError):
             return False
@@ -2433,11 +2464,11 @@ def stopped_by(outcome: str, text: str) -> str | None:
 
 
 def step_outcome(rc: int, text: str) -> str:
-    # Nested zone-tool stderr can leak into the output, so use the last recognized HUNG, PASS, FAIL or BROKEN
+    # Nested zone-tool stderr can leak into the output, so use the last recognized HUNG, PASS, FAIL, BROKEN or NO TESTS
     # verdict as the outer verdict rather than treating an earlier nested HUNG as decisive.
     last_verdict = None
     for line in text.splitlines():
-        verdict = re.match(r"zone-test: (HUNG(?=$|:| \()|(?:PASS|FAIL|BROKEN)(?=$|[ :(]))", line.strip())
+        verdict = re.match(r"zone-test: (HUNG(?=$|:| \()|(?:PASS|FAIL|BROKEN|NO TESTS)(?=$|[ :(]))", line.strip())
         if verdict:
             last_verdict = verdict[1]
     if rc == 124 or last_verdict == "HUNG":
@@ -2860,7 +2891,11 @@ def own_base(team: Team, tree, tip: str = "HEAD") -> str:
 
 
 def review_range(team: Team, tip: str, seen: list[str]) -> list[str]:
-    return out(team.repo, "rev-list", "--no-merges", tip, "--not", *landed_refs(team, team.repo), *seen).splitlines()
+    """The tip's own commits, hand-resolved merges included, less landed refs and the reviewer's seen tips."""
+    try:
+        return own_commits(team.repo, [tip, "--not", *landed_refs(team, team.repo), *seen])
+    except subprocess.CalledProcessError as e:     # never an empty range: stage3_record would read it as tool-made
+        die(f"{' '.join(e.cmd)} failed in {team.repo}:\n{e.stdout}{e.stderr}", 1)
 
 
 def tool_made_reason(rec: dict, messages: list[str]) -> str | None:
@@ -2875,8 +2910,10 @@ def stage3_reviewers(team: Team) -> list[str]:
 
 
 def review_files(team: Team, commits: list[str]) -> list[str]:
+    """Each commit's own files, in order: a merge's are its hand resolution's (remerge diff; diff-tree lists none)."""
     return list(dict.fromkeys(file for commit in commits for file in
-                             out(team.repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit).splitlines()))
+                             out(team.repo, "show", "--remerge-diff", "--no-renames", "--format=", "--name-only",
+                                 commit).splitlines()))
 
 
 def stage3_record(team: Team, rec: dict, members: list[dict] | None = None) -> dict:
@@ -2995,13 +3032,13 @@ def stage3_request(team: Team, items: list[dict]) -> str:
     trees = "; ".join(f"{row['wo']}: {row['tree']}" for row in items if row.get("tree"))
     for row in items:
         seen = row["seen"].get(row["recipient"], [])
-        command = shlex.join(["git", "-C", str(team.repo), "log", "--no-merges", "-p", row["tip"], "--not",
+        command = shlex.join(["git", "-C", str(team.repo), "log", "-p", "--remerge-diff", row["tip"], "--not",
                               *landed, *seen])
         line = (f"{row['wo']} (zone {row['zone']}, feature {row['feature']}): {command}; "
                 f"codeteam-land {team.manifest} reviewed {row['wo']}")
         if row.get("with"):
             others = ", ".join(f"{o['wo']} (zone {o['zone']}, tip {o['tip'][:10]})" for o in row["with"])
-            whole = shlex.join(["git", "-C", str(team.repo), "log", "--no-merges", "-p", row["tip"],
+            whole = shlex.join(["git", "-C", str(team.repo), "log", "-p", "--remerge-diff", row["tip"],
                                 *(o["tip"] for o in row["with"]), "--not", *landed])
             line += (f". It lands in one step with {others} (land --with): judge what it says about their code at "
                      f"their tips, not at landing. The set's commits together: {whole}. A finding may name any member "
@@ -3020,6 +3057,8 @@ def stage3_request(team: Team, items: list[dict]) -> str:
             "--where <file:line> --severity 1|2|3 --kind <kind> --what <text>. "
             "Then run `reviewed` for each work order in every case: with findings filed it sends them to the zone's "
             "coordinator, with none the work order lands. The lead fixes findings in the same tree and runs land again. "
+            "codeteam, the tool, reads no reply to this REQUEST: a question, or a review that cannot finish without a "
+            f"ruling, goes to {team.c('orchestrator', 'orc')} as a REQUEST naming the work order. "
             "A security finding (--kind security) holds nothing: it goes to the orchestrator at once as a "
             "fix-forward for the owning zone, and the work order lands if nothing else is found. "
             "A comment or doc finding is not filed: fix it yourself in the work order's tree"
@@ -3183,7 +3222,7 @@ def notify_owners(team, started):
                             f"passed integration check)" for x in todo)
             lines.append(f"feature {fr['feature']} round {rnd['n']}: {wos}; findings file {findings_path(team, fr['feature'])}")
         return (f"Review after landing ({len(sel)} feature{'s' if len(sel) > 1 else ''}): " + " | ".join(lines) +
-                f". Diff of one work order: git -C {team.repo} log --no-merges -p <base>..refs/landed/<wo>. "
+                f". Diff of one work order: git -C {team.repo} log -p --remerge-diff <base>..refs/landed/<wo>. "
                 "Read the findings file first; to agree with an "
                 f"entry: codeteam-land {m} finding <feature> --same-as <id>. New finding: codeteam-land {m} finding <feature> "
                 f"--wo <wo> [--wo <wo2>] --zone <zone> --where <file:line> --severity 1|2|3 --kind <kind> --what <text> "
@@ -4793,7 +4832,8 @@ def recheck_result(team: Team, tree: Path, row: dict) -> dict:
     compile step passed; its logs kept; the slow-tests flag on it when its test steps ran over the limit."""
     compile, tests = recheck_steps(team, tree, row["zones"], row.get("files", []))
     env = team_env(team, "integration")
-    results = step_results(tree, compile, env, concurrent=False, keep_text=True, group="compile")
+    results = step_results(tree, compile, env, concurrent=bool(getattr(team, "c", lambda key, default=None: default)("compile_concurrent", False)), keep_text=True,
+                           group="compile")
     if all(result["outcome"] == "PASS" for result in results):
         results.extend(step_results(tree, tests, env, keep_text=True, group="integration"))
     keep_recheck_logs(team, row["M"], results)
@@ -5246,12 +5286,10 @@ def run_land_check(team: Team, a: dict, h: str, group: str) -> dict:
            f"{shlex.quote(toolchain_cmd(a))} {toolchain_fp(a)}")
     if a.get("local"):
         cmd = cmd.replace("~/bin/land-check", "sh .git/land-check", 1)
-        # Validation measures performance: serialize local suites, waiters served first come, first served.
-        lockf = HERE.parent / "run" / "validation-local.lock"
-        lockf.parent.mkdir(parents=True, exist_ok=True)
-        with fifo_lock(lockf):
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                               env=dict(team_env(team, group=None), **a.get("remote_env", {})))
+        # No machine-wide lock: each repo's local suite starts when it has a commit to validate (2026-11-20;
+        # a test proves an outcome, never how fast, rule 11, so suites of different repos need not wait on each other).
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           env=dict(team_env(team, group=None), **a.get("remote_env", {})))
     else:
         r = ssh(a, cmd)
     line = (r.stdout.strip().splitlines() or [""])[-1]
@@ -5969,7 +6007,7 @@ def stage_admit(stage: str, name: str, qdir: Path | None = None,
     with restart_lock(qdir if qdir is not None else buildq_dir()) as rdir:
         stages = rdir / "stages"
         stages.mkdir(exist_ok=True)
-        remove_dead_stages(stages)
+        remove_dead_stages(stages, stage_alive)
         row = {"stage": stage, "name": name, "pid": os.getpid(), "started": now()}
         if holds:
             for other in stage_holders(rdir, *holds):
@@ -6009,27 +6047,18 @@ def stage_wos(row: dict) -> list[str]:
 
 def stage_holders(rdir: Path, team_key: str, wos: list[str], alive: Callable[[int], bool] = stage_alive) -> list[dict]:
     """The live admissions of other processes for team_key that hold any of wos; a dead one is skipped here and
-    removed at admission (stage_admit). A record from an older version has no team and counts for every team."""
+    removed at admission (stage_admit), and a record that is no valid admission (stage_row) is skipped. A record from
+    from before teams were recorded has no team and counts for every team."""
     held = []
     for path in sorted((rdir / "stages").glob("*.json")):
         try:
-            row = json.loads(path.read_text())
+            row = stage_row(path.read_text())
         except FileNotFoundError:
             continue                    # A stage may finish during the scan.
-        if (row.get("team", team_key) == team_key and row["pid"] != os.getpid() and set(stage_wos(row)) & set(wos)
+        if (row is not None and row.get("team", team_key) == team_key and row["pid"] != os.getpid() and set(stage_wos(row)) & set(wos)
                 and alive(row["pid"])):
             held.append(row)
     return held
-
-
-def remove_dead_stages(stages: Path) -> None:
-    for path in stages.glob("*.json"):
-        try:
-            row = json.loads(path.read_text())
-        except FileNotFoundError:
-            continue                    # A stage may finish during the scan.
-        if not stage_alive(row["pid"]):
-            path.unlink(missing_ok=True)
 
 
 def save_buildq_restart(rdir: Path, request: dict) -> None:
@@ -6368,7 +6397,7 @@ def move_backlog(team: Team, base: str, old: str) -> None:
             pending.append((path, row))
     if not pending:
         return
-    commands = [f"zone {row['zone']}: " + shlex.join(["git", "-C", str(team.repo), "log", "--no-merges", "-p",
+    commands = [f"zone {row['zone']}: " + shlex.join(["git", "-C", str(team.repo), "log", "-p", "--remerge-diff",
                 f"{row['from']}..{row['to']}", "--", *team.zones[row["zone"]]]) +
                 f"; codeteam-land {team.manifest} finding v54-backlog-{row['zone']} --zone {row['zone']} "
                 "--where <file:line> --severity 1|2|3 --kind <kind> --what <text>; "

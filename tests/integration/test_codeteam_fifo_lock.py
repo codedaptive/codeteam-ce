@@ -1,4 +1,5 @@
-"""share/codeteam_fifo_lock.py and run_land_check's local tier with real processes on a temp lock (D592): waiters take
+"""share/codeteam_fifo_lock.py with real processes on a temp lock, and run_land_check's local tier taking no lock
+: waiters take
 the lock in arrival order, a killed waiter's ticket is removed and does not block the rest, a plain-flock holder (older
 code) and a ticket holder exclude each other, a file in the tickets folder that is not a ticket is ignored and kept,
 and an error inside the hold removes the ticket. Real processes, flock and files are not pure, and the subject is
@@ -119,18 +120,16 @@ def finish(process):
     assert process.returncode == 0, f"child failed: stdout={stdout!r}, stderr={stderr!r}"
 
 
-def test_local_land_check_serves_queued_waiters_in_arrival_order(tmp_path, children):
+def test_local_land_check_takes_no_machine_lock(tmp_path, children):
+    """A local Stage 6 suite does not wait on another repo's: with the old machine lock held,
+    run_land_check's local tier still runs its suite at once and leaves no ticket."""
     (tmp_path / "bin").mkdir()
     lock = tmp_path / "run" / "validation-local.lock"
-    tickets = lock.parent / (lock.name + ".tickets")
     with plain_lock(lock):
-        for name in ("1", "2", "3"):
-            child = start(children, LAND_WAITER, LAND, tmp_path, name)
-            ticket_for(tickets, child, timeout=10)
-    for child in children:
+        child = start(children, LAND_WAITER, LAND, tmp_path, "1")
         finish(child)
-    assert (tmp_path / "order").read_text().splitlines() == ["1", "2", "3"]
-    assert list(tickets.iterdir()) == []
+    assert (tmp_path / "order").read_text().splitlines() == ["1"]
+    assert not (lock.parent / (lock.name + ".tickets")).exists()
 
 
 def test_killed_waiter_is_removed_and_the_next_waiter_runs(tmp_path, children):

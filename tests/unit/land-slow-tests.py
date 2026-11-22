@@ -238,6 +238,7 @@ def run_stage2(team, records, check=(["cli"], ["cli"])):
                             "queue_notices": None, "queue_entry": {"review": "pending"},
                             "stage3_request": "review"}.items():
             stack.enter_context(patch.object(cl, name, return_value=value))
+        stack.enter_context(patch.object(cl, "other_member_heads", return_value=[], create=True))
         stack.enter_context(patch.object(cl, "check_combined_members",
                                          **({"side_effect": check} if isinstance(check, BaseException) else {"return_value": check})))
         stack.enter_context(patch.object(cl, "Lock", return_value=contextlib.nullcontext()))

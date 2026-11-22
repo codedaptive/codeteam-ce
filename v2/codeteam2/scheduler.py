@@ -50,6 +50,7 @@ from . import screen as screen_mod
 from .clean_idle_lane import clean_idle_lane
 from .exited_idle_lanes import exited_idle_lanes
 from .herdr import Herdr, HerdrError
+from .run_watchdogs import run_watchdogs
 from .starving_lane import starving_lane
 from .store import FLAG_NO_TURN_NOTED, RUNTIME, Store
 from .team import CODETEAM2, Session, Team
@@ -902,17 +903,29 @@ class Runtime:
         return queued
 
     def message_text(self, s: Session, msgs):
-        """The prompt for one runtime command (typed as is) or for one or more messages."""
+        """The prompt for one runtime command (typed as is) or for one or more messages. Messages close with the
+        line to answer their sender, except when every sender is `codeteam`: the tool reads no reply (a session's
+        message to `codeteam` that nobody would receive is refused by `say`), so that line says a verdict or
+        result is recorded by the command the message names, and, for any session but the orchestrator, that a
+        question or a review that cannot finish without a ruling goes to the orchestrator as a REQUEST naming the
+        work order."""
         if isinstance(msgs, dict) or hasattr(msgs, "keys"):
             msgs = [msgs]
         if msgs[0]["kind"] == RUNTIME:
             return msgs[0]["body"]
         senders = {m["sender"] for m in msgs}
-        to = senders.pop() if len(senders) == 1 else "<to>"
-        say = f"{CODETEAM2} say {self.team.t.manifest} general {s.display} ANSWER {to}"
+        say = f"{CODETEAM2} say {self.team.t.manifest} general {s.display}"
         parts = [f"{prompt_header(m)}\n{m['body']}" for m in msgs]
         head = "[codeteam] " + ("" if len(msgs) == 1 else f"{len(msgs)} messages for you, oldest first:\n\n")
-        return head + "\n\n".join(parts) + f"\n(Reply or report with: {say} \"<text>\")"
+        body = head + "\n\n".join(parts)
+        if senders == {"codeteam"}:
+            ask = "" if s.key == "orc" else (
+                f" A question, or a review that cannot finish without a ruling, goes to {self.team.t.orc_name()} as "
+                f"a REQUEST naming the work order: {say} REQUEST {self.team.t.orc_name()} \"<text>\"")
+            return body + (f"\n(codeteam, the tool, reads no reply: a verdict or result is recorded by the command "
+                           f"the message names, if it names one.{ask})")
+        to = senders.pop() if len(senders) == 1 else "<to>"
+        return body + f"\n(Reply or report with: {say} ANSWER {to} \"<text>\")"
 
     def deliver(self, s: Session, mids, st):
         mids = (mids,) if isinstance(mids, int) else tuple(mids)
@@ -1162,8 +1175,8 @@ class Runtime:
                             "draft_since": None, "draft_alerted": False})
             if rec.get("close_pane_at") and now >= rec["close_pane_at"] and not self._waits():
                 self._close_exited_pane(k, rec, s, obs[k][1], now)
-                if was == "working" and s in READY:
-                    self.check_api_error(k, rec)
+            if was == "working" and s in READY:
+                self.check_api_error(k, rec)
             # Recover delivered first-prompt mail only when no newer start owns it; dropped mail stays dropped.
             if rec.get("startup_mids") and s == "absent" and now - (rec.get("starting_at") or 0) >= START_GRACE_S:
                 self._put_back_startup_mail(k, rec)
@@ -1260,6 +1273,7 @@ class Runtime:
             except Exception as e:          # a refresh is an economy: it never stops the loop
                 self.log(f"refresh_idle: {type(e).__name__}: {e}")
         self.patrol(status, st, now)
+        run_watchdogs(self, status, st, now)
         self.disk_watch(st, now)
         self.backup(st, now)
         self.show_in_herdr(obs, waiting_n, st)
@@ -1267,9 +1281,10 @@ class Runtime:
         return acts, status
 
     def check_api_error(self, key, rec):
-        """A turn that ended on an API error (with Claude Code's own retries spent): tell the owner and leave a
-        note for the orchestrator's next prompt, once per episode. The session is otherwise idle and
-        takes mail as usual."""
+        """A turn that ended on an API error (with Claude Code's own retries spent), seen on the tick its
+        status goes from working to idle or done: tell the owner and leave a note for the orchestrator's next prompt,
+        once per episode. The session is otherwise idle and takes mail as usual; when the error is one a model
+        success elsewhere shows has passed, api_recovery_pass types `continue` to it."""
         s = self.team.session(key) if hasattr(self.team, "session") else None
         if not s:
             return

@@ -1,11 +1,13 @@
 """TEAM IDLE WITH WORK: patrol's line for a whole team stopped with open work, which wakes the orchestrator and tells
 the owner once per episode.
 
-unit tests (the unit group): TeamIdleTest and PatrolHeldTeamIdleTest run team_idle alone, over landing records in a temp
-folder and sessions that are plain dicts; PatrolUnitTest runs Runtime.patrol with patrol.findings and patrol.record
-faked; FindingsUnitTest and PatrolHeldFindingsTest run patrol.findings with its collaborators faked.
-integration tests (integration_only, the integration group):
-TeamIdleRecordTest joins team_idle with patrol.record's dedup, PatrolTellsOwnerTest joins
+The unit group: TeamIdleTest runs team_idle alone, over landing records it writes in a temp folder (real files, so
+by rule 11 an integration test still in the unit group; its two non-object record tests are integration_only) and
+sessions that are plain dicts; ZUTs: PatrolUnitTest runs
+Runtime.patrol with patrol.findings and patrol.record faked; FindingsUnitTest runs patrol.findings with its
+collaborators faked. The held-lane tests are in test_team_idle_patrol_held.py.
+ZITs (integration_only, the integration group; codeteam-jj
+): TeamIdleRecordTest joins team_idle with patrol.record's dedup, PatrolTellsBobTest joins
 Runtime.patrol with the real patrol.record, and FindingsTest joins patrol.findings with the real team_idle."""
 import json
 import sys
@@ -43,6 +45,31 @@ class LandFolder:
 
 
 class TeamIdleTest(LandFolder, unittest.TestCase):
+    @integration_only
+    def test_non_object_work_order_records_are_skipped(self):
+        self.wo("rework")
+        for value in ([], "x", 3):
+            with self.subTest(value=value):
+                (self.land / "wo" / "bad.json").write_text(json.dumps(value))
+                try:
+                    line = self.line({"Orc": "idle"}, {"Orc": {"state_since": HOUR_AGO}})
+                except AttributeError as exc:
+                    self.fail(f"non-object work order was not skipped: {exc}")
+                self.assertTrue(line.startswith("TEAM IDLE WITH WORK:"))
+
+    @integration_only
+    def test_non_object_queue_records_are_skipped(self):
+        self.wo("queued", queued="now")
+        self.entry("held", hold=True)
+        for value in ([], "x", 3):
+            with self.subTest(value=value):
+                (self.land / "queue" / "bad.json").write_text(json.dumps(value))
+                try:
+                    line = self.line({"Orc": "idle"}, {"Orc": {"state_since": HOUR_AGO}})
+                except AttributeError as exc:
+                    self.fail(f"non-object queue entry was not skipped: {exc}")
+                self.assertTrue(line.startswith("TEAM IDLE WITH WORK:"))
+
     def test_a_team_idle_an_hour_with_an_open_work_order_is_reported(self):
         self.wo("rework")
         out = self.line({"Orc": "idle", "eventlog": "absent"},
@@ -107,28 +134,6 @@ class TeamIdleTest(LandFolder, unittest.TestCase):
         self.wo("rework")
         self.assertIsNone(self.line({}, {}))
         self.assertIsNone(self.line({"Orc": "idle"}, {}))
-
-
-class PatrolHeldTeamIdleTest(LandFolder, unittest.TestCase):
-    def test_patrolheld_only_held_order_is_not_open_work(self):
-        self.wo("rework")
-        status, st = {"Orc": "idle"}, {"Orc": {"state_since": HOUR_AGO}}
-        self.assertIsNotNone(team_idle(status, st, NOW, self.land))
-        self.assertIsNone(team_idle(status, st, NOW, self.land, held=frozenset({"eventlog"})))
-
-    def test_patrolheld_unheld_order_remains_open_work(self):
-        self.wo("one", zone="eventlog")
-        self.wo("two", zone="other")
-        out = team_idle({"Orc": "idle"}, {"Orc": {"state_since": HOUR_AGO}}, NOW, self.land,
-                        held=frozenset({"eventlog"}))
-        self.assertTrue(out.startswith("TEAM IDLE WITH WORK:"))
-
-    def test_patrolheld_landing_hold_remains_open_work(self):
-        self.wo("squash", queued="2026-11-15T04:39:00-06:00")
-        self.entry("squash", hold=True)
-        out = team_idle({"Orc": "idle"}, {"Orc": {"state_since": HOUR_AGO}}, NOW, self.land,
-                        held=frozenset({"eventlog"}))
-        self.assertTrue(out.startswith("TEAM IDLE WITH WORK:"))
 
 
 @integration_only
@@ -256,83 +261,6 @@ class FindingsUnitTest(FindingsTeam, unittest.TestCase):
             lines, asked = self.findings_with(team)
             self.assertNotIn("TEAM IDLE WITH WORK: fake", lines)
             self.assertEqual(asked, [])
-
-
-class PatrolHeldFindingsTest(unittest.TestCase):
-    def setUp(self):
-        from unittest.mock import patch
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        root = Path(self.tmp.name)
-        (root / "land" / "wo").mkdir(parents=True)
-        self.held = {"alpha"}
-        self.team = SimpleNamespace(t=SimpleNamespace(root=root, lab=False, m={}), dir=root,
-                                    manifest="fake.toml", team_json=lambda: {"lanes": {"alpha": {}}},
-                                    held=lambda k: k in self.held)
-        self.store = SimpleNamespace(pending=lambda held=True: [])
-        self.work = ([['r', 'x', '-']], [], [], 0, ['r1'])
-        self.lane = patch("codeteam2.team.v1.lane_work", side_effect=lambda *a: self.work)
-        self.lane.start()
-        self.addCleanup(self.lane.stop)
-        for target, result in (("codeteam2.team.v1.branch_leftovers", ([], [], [], 0, 0, 0)),
-                               ("codeteam2.patrol.running_lands", set()),
-                               ("codeteam2.patrol.waiting_reviews", []),
-                               ("codeteam2.patrol.stalled_work_orders", []),
-                               ("codeteam2.patrol.team_idle", None)):
-            p = patch(target, return_value=result)
-            p.start()
-            self.addCleanup(p.stop)
-
-    def lines(self, status):
-        return patrol.findings(self.team, status, {"alpha": {"state_since": NOW - 7200}}, self.store, NOW)
-
-    def test_patrolheld_awake_lane_has_no_idle_with_work(self):
-        self.held.clear()
-        self.assertTrue(any("alpha: IDLE WITH WORK" in line for line in self.lines({"alpha": "idle"})))
-        self.held.add("alpha")
-        self.assertFalse(any("alpha: IDLE WITH WORK" in line for line in self.lines({"alpha": "idle"})))
-
-    def test_patrolheld_absent_lane_has_no_asleep_with_work(self):
-        self.held.clear()
-        self.assertTrue(any("alpha: ASLEEP WITH WORK" in line for line in self.lines({})))
-        self.held.add("alpha")
-        self.assertFalse(any("alpha: ASLEEP WITH WORK" in line for line in self.lines({})))
-
-    def test_patrolheld_lane_has_no_dead_lead_or_parked_rows(self):
-        self.work = ([['r', 'x', '-']], [], ['r1'], 2, [])
-        self.held.clear()
-        lines = self.lines({"alpha": "idle"})
-        self.assertTrue(any("alpha: DEAD LEAD" in line for line in lines))
-        self.assertTrue(any("alpha: 2 ledger row(s) past queued" in line for line in lines))
-        self.held.add("alpha")
-        lines = self.lines({"alpha": "idle"})
-        self.assertFalse(any("alpha: DEAD LEAD" in line or "past queued" in line for line in lines))
-
-    def test_patrolheld_lane_has_no_serial_line(self):
-        self.work = ([['r', 'x', '-']], [], [], 0, ['r1', 'r2'])
-        self.held.clear()
-        self.assertTrue(any("alpha: SERIAL" in line for line in self.lines({"alpha": "working"})))
-        self.held.add("alpha")
-        self.assertFalse(any("alpha: SERIAL" in line for line in self.lines({"alpha": "working"})))
-
-    def test_patrolheld_removing_hold_restores_line_next_round(self):
-        first = self.lines({})
-        self.held.clear()
-        second = self.lines({})
-        self.assertFalse(any("alpha: ASLEEP WITH WORK" in line for line in first))
-        self.assertTrue(any("alpha: ASLEEP WITH WORK" in line for line in second))
-
-    def test_patrolheld_findings_passes_held_to_stalled_check(self):
-        from unittest.mock import patch
-        with patch.object(patrol, "stalled_work_orders", return_value=[]) as stalled:
-            self.lines({})
-        self.assertEqual(stalled.call_args.kwargs.get("held"), frozenset({"alpha"}))
-
-    def test_patrolheld_findings_passes_held_to_team_idle(self):
-        from unittest.mock import patch
-        with patch.object(patrol, "team_idle", return_value=None) as idle:
-            self.lines({})
-        self.assertEqual(idle.call_args.kwargs.get("held"), frozenset({"alpha"}))
 
 
 @integration_only

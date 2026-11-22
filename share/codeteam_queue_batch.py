@@ -52,7 +52,9 @@ def _run_steps(team, land, tree: Path, items: list[tuple[Path, dict]], run: dict
     (team.dir / CHECKOUT_MARKER).unlink(missing_ok=True)
     compile_steps, test_steps = land.recheck_steps(team, tree, _union(items, "zones"), _union(items, "files"))
     env = land.team_env(team, "integration")
-    results = land.step_results(tree, compile_steps, env, concurrent=False, keep_text=True, group="compile")
+    # a team whose check steps build in separate folders runs them side by side ([land] compile_concurrent).
+    results = land.step_results(tree, compile_steps, env, concurrent=bool(getattr(team, "c", lambda key, default=None: default)("compile_concurrent", False)),
+                                keep_text=True, group="compile")
     if all(result["outcome"] == "PASS" for result in results):
         results.extend(land.step_results(tree, test_steps, env, keep_text=True, group="integration"))
     for result in results:
@@ -107,8 +109,9 @@ def _tested(team, land, group: list[tuple[Path, dict]], run: dict) -> tuple[bool
 
 
 def _report_slow(team, land, items: list[tuple[Path, dict]], run: dict) -> None:
-    """The whole batch's slow-tests flag, every work order in the head, the batch's files, and as source the
-    work order and zone of the entry that brought the slowest step into the run (batch_slow_entry)."""
+    """The whole batch's slow-tests flag; for items, the entries that were tested (queue_batch's kept, so an
+    entry bounced before the test is not among them), their work orders in the head and their files; and as source
+    the work order and zone of the tested entry that brought the slowest step into the run (batch_slow_entry)."""
     flag = land.slow_tests_flag(run["results"])
     chosen = batch_slow_entry(flag, [entry for _, entry in items], lambda name: land.step_owner(team, name))
     land.report_slow_tests(team, flag,
@@ -128,5 +131,5 @@ def queue_batch(team, paths: list[Path], land) -> bool:
         passed, kept = _tested(team, land, items, run)
         if not kept:
             return not run.get("checkout_failed")
-        _report_slow(team, land, items, run)
+        _report_slow(team, land, kept, run)
         return (batch_landed if passed else batch_verdict)(team, land, kept, run)

@@ -123,10 +123,22 @@ def warm_lock():
         return None
 
 
+def slot_class():
+    """The build queue class of a gated build: the landing tool's builds (CODETEAM_LANDING=1, set by its team
+    env) are class land, or full for a validation run, so a repo's own check script that calls swift or xcodebuild
+    is not queued behind every team's development builds (2026-11-22: a landing batch's build waited as
+    number 45 among dev jobs, 47 minutes). CODETEAM_SLOT_CLASS overrides; everything else stays dev."""
+    if os.environ.get("CODETEAM_SLOT_CLASS"):
+        return os.environ["CODETEAM_SLOT_CLASS"]
+    if os.environ.get("CODETEAM_LANDING") == "1":
+        return "full" if os.environ.get("CODETEAM_TEST_GROUP") == "validation" else "land"
+    return "dev"
+
+
 def write_job(q, name, args):
     worktree = build_worktree()
     ticket = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    job = {"ticket": ticket, "kind": "slot", "class": "dev", "key": f"slot {name}", "command": [name, *args],
+    job = {"ticket": ticket, "kind": "slot", "class": slot_class(), "key": f"slot {name}", "command": [name, *args],
            "worktree": worktree, "env": {}, "session": os.environ.get("CODETEAM_SESSION") or None,
            "team": next((p for p in Path(worktree).parts if p.startswith("team-")), None) if worktree else None,
            "submitted": time.time(), "started": None, "finished": None, "pid": os.getpid(), "state": "queued",
